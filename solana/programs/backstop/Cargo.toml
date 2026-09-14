@@ -21,8 +21,8 @@ custom-heap = []
 custom-panic = []
 
 [dependencies]
-anchor-lang = "=1.0.2"
-anchor-spl = { version = "=1.0.2", features = ["token", "token_2022"] }
+anchor-lang = "=1.1.2"
+anchor-spl = { version = "=1.1.2", features = ["token", "token_2022"] }
 safu-core = { path = "../../../crates/safu-core" }
 
 [lints.rust]
