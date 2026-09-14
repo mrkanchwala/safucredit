@@ -1,0 +1,146 @@
+# CI — added 2026-09-14 (Stocklana plan, P2 step 2).
+#
+# Evidential, not just hygienic: a judge or reviewer can click through to a green run instead of taking
+# "the tests pass" on trust. Runs every gate the local build runs:
+#   - safu-core: fmt, clippy, unit + property + golden-vector tests, and the wasm32v1-none (Stellar) build
+#   - verdict: the Python mirror asserted against the same golden vectors
+#   - solana: both programs built to SBF, then clippy and the LiteSVM suites against those binaries
+#   - audit: the dependency gate, which re-derives its own ignore list from the dependency graph
+#
+# Runs on every branch, so a change is proven green before it reaches main.
+# `--locked` everywhere: a stale Cargo.lock fails instead of silently resolving something untested.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# Read-only token. Nothing here writes to the repository.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  core:
+    name: safu-core
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/safu-core
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/safu-core -> target
+
+      # rustup reads the repo's rust-toolchain.toml, so this should always print the pinned version.
+      - name: Toolchain in use
+        run: rustc --version && cargo --version
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Tests (unit, property, golden vectors)
+        run: cargo test --locked
+
+      - name: wasm32v1-none build (the Stellar target)
+        run: cargo build --release --target wasm32v1-none --locked
+
+  verdict:
+    name: verdict (pytest, golden vectors)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Pinned to the version the suite was verified with locally. The mirror itself has no dependencies.
+      - name: Install pytest
+        run: python -m pip install pytest==9.1.1
+
+      - name: Run
+        run: python -m pytest -q
+
+  solana:
+    name: Solana programs (SBF + LiteSVM)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: solana
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: solana -> target
+
+      # Official Anza installer, pinned to the version the programs are built and tested with locally.
+      # The Anchor CLI is deliberately not installed: the tests need only the compiled programs.
+      - name: Install Solana CLI 3.1.10
+        working-directory: .
+        run: |
+          curl -sSfL https://release.anza.xyz/v3.1.10/install -o solana-install.sh
+          sh solana-install.sh
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Toolchain in use
+        run: solana --version && cargo build-sbf --version
+
+      # Build each program from ITS OWN manifest. A workspace-wide `cargo build-sbf` unifies features:
+      # backstop depends on stock_vault with `no-entrypoint`, which then switches on for stock_vault
+      # itself and produces an ~900-byte program with no entrypoint (found 2026-09-14).
+      - name: Build programs to SBF
+        run: |
+          cargo build-sbf --manifest-path programs/stock_vault/Cargo.toml -- --locked
+          cargo build-sbf --manifest-path programs/backstop/Cargo.toml -- --locked
+
+      # Guard against that failure mode directly, so it is named in the log rather than surfacing as
+      # dozens of unrelated-looking test failures.
+      - name: Programs are not empty
+        run: |
+          for so in target/deploy/stock_vault.so target/deploy/backstop.so; do
+            size=$(stat -c %s "$so")
+            echo "$so: $size bytes"
+            if [ "$size" -lt 100000 ]; then
+              echo "::error::$so is only $size bytes: built without an entrypoint (feature unification?)"
+              exit 1
+            fi
+          done
+
+      - name: Format
+        run: cargo fmt --check
+
+      # Clippy compiles the tests, which embed the built programs, so it runs after the SBF build.
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: LiteSVM tests
+        run: cargo test --locked
+
+  audit:
+    name: dependency audit gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: solana -> target
+
+      # Pinned to the version the gate was written and negative-tested against.
+      - name: Install cargo-audit 0.22.2
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      # The script, not bare `cargo audit`: it proves every ignored advisory is still dev-only.
+      - name: Audit gate
+        run: bash solana/scripts/audit-gate.sh
