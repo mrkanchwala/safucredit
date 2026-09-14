@@ -265,3 +265,39 @@ def test_sign_verdict_refuses_a_ref_after_sample_past_the_window(tmp_path):
             now=liquidated_at + MAX_AFTER_WAIT_SECS + 1,
             recordings_dir=recdir,
         )
+
+
+def test_sign_verdict_follows_a_shortened_devnet_wait(tmp_path):
+    # The backstop's min_after_wait_secs is admin-settable (phase 5); the engine must match it.
+    liquidated_at = 1_000_000_000
+    rows = [_row(liquidated_at - 60, 100.0, "a"), _row(liquidated_at + 60, 60.0, "b")]
+    recdir = _write_recording(tmp_path, "AAPLX", rows)
+    kwargs = dict(
+        liquidation_record=_pk(7),
+        borrower=_pk(8),
+        liquidated_at=liquidated_at,
+        symbol="AAPLX",
+        oracle_key=Keypair(),
+        now=liquidated_at + 60,
+        recordings_dir=recdir,
+    )
+    with pytest.raises(VerdictEngineError):
+        sign_verdict(**kwargs)  # default 1 h floor: too early
+    sv = sign_verdict(**kwargs, min_after_wait_secs=60)
+    assert sv.args.after_ts == liquidated_at + 60
+
+
+@pytest.mark.parametrize("bad", [0, -1, 4 * 86_400])
+def test_sign_verdict_refuses_an_out_of_range_wait(tmp_path, bad):
+    recdir = _write_recording(tmp_path, "AAPLX", [_row(1_000_000_000, 100.0, "a")])
+    with pytest.raises(VerdictEngineError):
+        sign_verdict(
+            liquidation_record=_pk(7),
+            borrower=_pk(8),
+            liquidated_at=1_000_000_000,
+            symbol="AAPLX",
+            oracle_key=Keypair(),
+            now=1_000_100_000,
+            recordings_dir=recdir,
+            min_after_wait_secs=bad,
+        )

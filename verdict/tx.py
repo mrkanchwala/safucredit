@@ -33,6 +33,7 @@ ED25519_PROGRAM_ID = Pubkey.from_string("Ed25519SigVerify11111111111111111111111
 CONFIG_SEED = b"bconfig"
 BACKER_SEED = b"backer"
 CLAIM_SEED = b"claim"
+REVOKE_SEED = b"revoke"
 BORROWER_CLAIMS_SEED = b"bclaims"
 
 SUBMIT_FACTS_DISCRIMINATOR = hashlib.sha256(b"global:submit_facts").digest()[:8]
@@ -128,6 +129,14 @@ class SubmitFactsAccounts:
         return Pubkey.find_program_address([BACKER_SEED, bytes(self.payout)], self.program_id)[0]
 
 
+def revoked_pda(args: FactsArgs, program_id: Pubkey = BACKSTOP_PROGRAM_ID) -> Pubkey:
+    """Admin revocation marker for this exact (liquidation_record, evidence_hash). Always passed;
+    it only exists on-chain if the admin revoked this attestation, and then submit_facts refuses."""
+    return Pubkey.find_program_address(
+        [REVOKE_SEED, bytes(args.liquidation_record), args.evidence_hash], program_id
+    )[0]
+
+
 def submit_facts_instruction(args: FactsArgs, accounts: SubmitFactsAccounts) -> Instruction:
     """Anchor `submit_facts` call. Account order matches SubmitFacts<'info> in
     solana/programs/backstop/src/lib.rs exactly -- Anchor resolves accounts positionally, so
@@ -143,6 +152,7 @@ def submit_facts_instruction(args: FactsArgs, accounts: SubmitFactsAccounts) -> 
         AccountMeta(existing_claim, is_signer=False, is_writable=False),
         AccountMeta(accounts.claim_pda(), is_signer=False, is_writable=True),
         AccountMeta(accounts.payout_backer_pda(), is_signer=False, is_writable=False),
+        AccountMeta(revoked_pda(args, accounts.program_id), is_signer=False, is_writable=False),
         AccountMeta(INSTRUCTIONS_SYSVAR_ID, is_signer=False, is_writable=False),
         AccountMeta(SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
     ]

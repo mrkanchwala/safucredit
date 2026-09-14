@@ -23,7 +23,15 @@ pub mod stock_vault {
     /// Only the program's upgrade authority may initialize, so nobody watching the deploy can call it
     /// first and take admin. Initialize before any `--final`: a program with no upgrade authority can
     /// never be initialized.
-    pub fn initialize_config(ctx: Context<InitializeConfig>, feed_authority: Pubkey) -> Result<()> {
+    pub fn initialize_config(
+        ctx: Context<InitializeConfig>,
+        feed_authority: Pubkey,
+        cluster_tag: u8,
+    ) -> Result<()> {
+        require!(
+            cluster_tag <= CLUSTER_MAINNET,
+            VaultError::InvalidClusterTag
+        );
         let config = &mut ctx.accounts.config;
         config.version = ACCOUNT_VERSION;
         config.admin = ctx.accounts.admin.key();
@@ -32,7 +40,8 @@ pub mod stock_vault {
         config.bump = ctx.bumps.config;
         config.pool_liquidator = Pubkey::default();
         config.fallback_grace_secs = DEFAULT_FALLBACK_GRACE_SECS;
-        config.reserved = [0; 24];
+        config.cluster_tag = cluster_tag;
+        config.reserved = [0; 23];
         Ok(())
     }
 
@@ -60,10 +69,12 @@ pub mod stock_vault {
         Ok(())
     }
 
-    /// How long a position must be liquidatable before outside liquidators may act. Bounded 1 min to 1 day.
+    /// How long a position must be liquidatable before outside liquidators may act. Bounded 1 min (5 min on
+    /// mainnet, eng review A5) to 1 day.
     pub fn set_fallback_grace(ctx: Context<AdminOnly>, secs: i64) -> Result<()> {
+        let min = min_fallback_grace_secs(ctx.accounts.config.cluster_tag);
         require!(
-            (MIN_FALLBACK_GRACE_SECS..=MAX_FALLBACK_GRACE_SECS).contains(&secs),
+            (min..=MAX_FALLBACK_GRACE_SECS).contains(&secs),
             VaultError::InvalidFallbackGrace
         );
         ctx.accounts.config.fallback_grace_secs = secs;

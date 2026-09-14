@@ -418,6 +418,20 @@ fn init_config_ix(admin: &Pubkey, feed: &Pubkey) -> Instruction {
 }
 
 fn init_config_ix_with(admin: &Pubkey, feed: &Pubkey, program_data: Pubkey) -> Instruction {
+    init_config_ix_cluster(
+        admin,
+        feed,
+        program_data,
+        stock_vault::state::CLUSTER_DEVNET,
+    )
+}
+
+fn init_config_ix_cluster(
+    admin: &Pubkey,
+    feed: &Pubkey,
+    program_data: Pubkey,
+    cluster_tag: u8,
+) -> Instruction {
     Instruction {
         program_id: stock_vault::ID,
         accounts: stock_vault::accounts::InitializeConfig {
@@ -430,6 +444,7 @@ fn init_config_ix_with(admin: &Pubkey, feed: &Pubkey, program_data: Pubkey) -> I
         .to_account_metas(None),
         data: stock_vault::instruction::InitializeConfig {
             feed_authority: *feed,
+            cluster_tag,
         }
         .data(),
     }
@@ -2918,6 +2933,44 @@ fn only_the_admin_registers_the_pool_and_sets_the_grace_within_bounds() {
     }
     env.ok(&[set_fallback_grace_ix(&admin.pubkey(), 600)], &[&admin]);
     assert_eq!(env.config_state().fallback_grace_secs, 600);
+}
+
+#[test]
+fn mainnet_never_lets_the_fallback_grace_drop_below_five_minutes() {
+    let mut env = base_uninitialized();
+    let admin = env.admin.insecure_clone();
+    let feed = env.feed.pubkey();
+    assert_program_error(
+        env.send(
+            &[init_config_ix_cluster(
+                &admin.pubkey(),
+                &feed,
+                programdata(&stock_vault::ID),
+                3,
+            )],
+            &[&admin],
+        ),
+        VaultError::InvalidClusterTag,
+    );
+    env.ok(
+        &[init_config_ix_cluster(
+            &admin.pubkey(),
+            &feed,
+            programdata(&stock_vault::ID),
+            stock_vault::state::CLUSTER_MAINNET,
+        )],
+        &[&admin],
+    );
+    assert_eq!(
+        env.config_state().cluster_tag,
+        stock_vault::state::CLUSTER_MAINNET
+    );
+    assert_program_error(
+        env.send(&[set_fallback_grace_ix(&admin.pubkey(), 299)], &[&admin]),
+        VaultError::InvalidFallbackGrace,
+    );
+    env.ok(&[set_fallback_grace_ix(&admin.pubkey(), 300)], &[&admin]);
+    assert_eq!(env.config_state().fallback_grace_secs, 300);
 }
 
 #[test]

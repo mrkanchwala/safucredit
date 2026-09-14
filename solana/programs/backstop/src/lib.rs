@@ -71,47 +71,117 @@ fn roll_liq_day(config: &mut BackstopConfig, now: i64) {
 /// Attempts to admit `claim` (already priced, `claim.loss` set) against `config`'s current caps
 /// and solvency. Never errors on "doesn't fit" — over any limit queues rather than rejects
 /// (LOCKED verdict spec); returns whether it was admitted.
+///
+/// Reads `claim.streamed` as "already paid, not to be re-reserved" (phase 4: an overridden claim
+/// carrying a prior `Active` claim's `streamed` forward). For every ordinary caller
+/// (`submit_facts`, `unlock_claim`, `try_release_queued`) `claim.streamed` is always 0 at this
+/// point — a claim cannot stream before its first admission — so this is a strict, provably
+/// backward-compatible generalisation, not a behaviour change for the existing paths.
 fn try_admit(config: &mut BackstopConfig, claim: &mut Claim, now: i64) -> Result<bool> {
     roll_admission_day(config, now);
     let loss = claim.loss;
+    let already_streamed = claim.streamed;
+    let remaining = loss.saturating_sub(already_streamed);
     let cap_bps = admission_cap_bps(config.reserved_total, config.cash);
     let admission_cap =
         safu_core::apply_bps(config.cash, cap_bps).map_err(|_| VerdictError::MathOverflow)?;
+    // The per-claim cap bounds the claim's total size, not just what remains to be reserved: a
+    // correction that already paid most of a claim still represents a claim of its full size.
     let per_claim_cap = safu_core::apply_bps(config.cash, config.per_claim_cap_bps)
         .map_err(|_| VerdictError::MathOverflow)?;
     let fits = loss <= per_claim_cap
         && config
             .admitted_today
-            .checked_add(loss)
+            .checked_add(remaining)
             .is_some_and(|v| v <= admission_cap)
         && config
             .reserved_total
-            .checked_add(loss)
+            .checked_add(remaining)
             .is_some_and(|v| v <= config.cash);
     if fits {
         config.reserved_total = config
             .reserved_total
-            .checked_add(loss)
+            .checked_add(remaining)
             .ok_or(VerdictError::MathOverflow)?;
         config.admitted_today = config
             .admitted_today
-            .checked_add(loss)
+            .checked_add(remaining)
             .ok_or(VerdictError::MathOverflow)?;
         claim.status = ClaimStatus::Active;
         claim.admitted_at = now;
+        // Phase 5: the config's timings at admission are frozen onto the claim (forward-only).
         claim.cooldown_end = now
-            .checked_add(COOLDOWN_SECS)
+            .checked_add(config.cooldown_secs)
             .ok_or(VerdictError::MathOverflow)?;
         claim.stream_end = claim
             .cooldown_end
-            .checked_add(STREAM_SECS)
+            .checked_add(config.stream_secs)
             .ok_or(VerdictError::MathOverflow)?;
+        claim.inactivity_secs = config.inactivity_secs;
+        // Default: vesting is measured from `cooldown_end` itself, identical to before this field
+        // existed. `approve_override` shifts this backward when carrying `streamed` forward.
+        claim.vest_origin = claim.cooldown_end;
         claim.snapshot_cash = config.cash;
         claim.last_activity_ts = now;
         Ok(true)
     } else {
         claim.status = ClaimStatus::Queued;
         Ok(false)
+    }
+}
+
+/// Pairwise role separation (LOCKED verdict spec: "admin ≠ oracle ≠ co-signer, at init and on
+/// every setter"). Checked after every mutation to any of the three, so no setter can leave the
+/// config in a state initialization itself would have refused.
+fn require_distinct_roles(admin: Pubkey, verdict_oracle: Pubkey, co_signer: Pubkey) -> Result<()> {
+    require!(
+        admin != verdict_oracle && admin != co_signer && verdict_oracle != co_signer,
+        VerdictError::RoleCollision
+    );
+    Ok(())
+}
+
+/// Eng review A5: per-cluster bounds on every claim timing. Localnet/devnet may go to one second so the
+/// demo runs in minutes; mainnet keeps floors no admin can undercut. Ceilings are the LOCKED spec values
+/// (inactivity: one year), so an admin can only ever make a claim resolve faster than the spec, never
+/// hold a borrower's money longer.
+fn require_claim_timing(
+    cluster_tag: u8,
+    gate_secs: i64,
+    cooldown_secs: i64,
+    stream_secs: i64,
+    inactivity_secs: i64,
+    min_after_wait_secs: i64,
+) -> Result<()> {
+    let mainnet = cluster_tag == verdict::CLUSTER_MAINNET;
+    let floor = |mainnet_min: i64| {
+        if mainnet {
+            mainnet_min
+        } else {
+            TEST_CLUSTER_MIN_SECS
+        }
+    };
+    require!(
+        (floor(MAINNET_MIN_GATE_SECS)..=DEFAULT_GATE_SECS).contains(&gate_secs)
+            && (floor(MAINNET_MIN_COOLDOWN_SECS)..=DEFAULT_COOLDOWN_SECS).contains(&cooldown_secs)
+            && (floor(MAINNET_MIN_STREAM_SECS)..=DEFAULT_STREAM_SECS).contains(&stream_secs)
+            && (floor(MAINNET_MIN_INACTIVITY_SECS)..=MAX_INACTIVITY_SECS)
+                .contains(&inactivity_secs)
+            && (floor(MAINNET_MIN_MIN_AFTER_WAIT_SECS)..=DEFAULT_MIN_AFTER_WAIT_SECS)
+                .contains(&min_after_wait_secs),
+        VerdictError::InvalidParams
+    );
+    // An admitted claim can't be pulled before its cooldown ends, and every pull resets the inactivity
+    // clock; an inactivity window no longer than the cooldown would expire claims nobody could collect.
+    require!(inactivity_secs > cooldown_secs, VerdictError::InvalidParams);
+    Ok(())
+}
+
+fn min_resale_floor_secs(cluster_tag: u8) -> i64 {
+    if cluster_tag == verdict::CLUSTER_MAINNET {
+        MAINNET_MIN_RESALE_FLOOR_SECS
+    } else {
+        MIN_RESALE_FLOOR_SECS
     }
 }
 
@@ -127,6 +197,7 @@ pub mod backstop {
     pub fn initialize_backstop(
         ctx: Context<InitializeBackstop>,
         verdict_oracle: Pubkey,
+        co_signer: Pubkey,
         cluster_tag: u8,
         per_claim_cap_bps: u32,
         withdraw_delay_secs: i64,
@@ -139,10 +210,16 @@ pub mod backstop {
             (0..=30 * 86_400).contains(&withdraw_delay_secs),
             VerdictError::InvalidParams
         );
+        require_distinct_roles(ctx.accounts.admin.key(), verdict_oracle, co_signer)?;
+        require!(
+            cluster_tag <= verdict::CLUSTER_MAINNET,
+            VerdictError::InvalidParams
+        );
         let config = &mut ctx.accounts.config;
         config.version = ACCOUNT_VERSION;
         config.admin = ctx.accounts.admin.key();
         config.verdict_oracle = verdict_oracle;
+        config.co_signer = co_signer;
         config.cluster_tag = cluster_tag;
         config.bump = ctx.bumps.config;
         config.usdc_mint = ctx.accounts.usdc_mint.key();
@@ -162,7 +239,47 @@ pub mod backstop {
         config.resale_floor_secs = DEFAULT_RESALE_FLOOR_SECS;
         config.fee_share_bps = DEFAULT_FEE_SHARE_BPS;
         config.min_pool_repay = DEFAULT_MIN_POOL_REPAY;
+        config.gate_secs = DEFAULT_GATE_SECS;
+        config.cooldown_secs = DEFAULT_COOLDOWN_SECS;
+        config.stream_secs = DEFAULT_STREAM_SECS;
+        config.inactivity_secs = DEFAULT_INACTIVITY_SECS;
+        config.min_after_wait_secs = DEFAULT_MIN_AFTER_WAIT_SECS;
         config.reserved = [0; 16];
+        Ok(())
+    }
+
+    /// Phase 5 (A5): sets every claim timing at once, bounded per cluster by `require_claim_timing`.
+    /// Forward-only: a held claim keeps the `releasable_at` it was given at submission, and an admitted
+    /// claim keeps the cooldown, stream and inactivity window it was admitted under.
+    pub fn set_claim_timing(
+        ctx: Context<AdminOnly>,
+        gate_secs: i64,
+        cooldown_secs: i64,
+        stream_secs: i64,
+        inactivity_secs: i64,
+        min_after_wait_secs: i64,
+    ) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        require_claim_timing(
+            config.cluster_tag,
+            gate_secs,
+            cooldown_secs,
+            stream_secs,
+            inactivity_secs,
+            min_after_wait_secs,
+        )?;
+        config.gate_secs = gate_secs;
+        config.cooldown_secs = cooldown_secs;
+        config.stream_secs = stream_secs;
+        config.inactivity_secs = inactivity_secs;
+        config.min_after_wait_secs = min_after_wait_secs;
+        emit!(ClaimTimingSet {
+            gate_secs,
+            cooldown_secs,
+            stream_secs,
+            inactivity_secs,
+            min_after_wait_secs,
+        });
         Ok(())
     }
 
@@ -170,8 +287,20 @@ pub mod backstop {
     /// to be recoverable on-chain: without this, replacing it would need a program upgrade.
     /// Claims already submitted stay valid; unsubmitted facts signed by the old key stop verifying.
     pub fn set_verdict_oracle(ctx: Context<AdminOnly>, verdict_oracle: Pubkey) -> Result<()> {
-        ctx.accounts.config.verdict_oracle = verdict_oracle;
+        let config = &mut ctx.accounts.config;
+        require_distinct_roles(config.admin, verdict_oracle, config.co_signer)?;
+        config.verdict_oracle = verdict_oracle;
         emit!(VerdictOracleRotated { verdict_oracle });
+        Ok(())
+    }
+
+    /// Rotates the 2-of-2 override co-signer (phase 4). Same recoverability rationale as
+    /// `set_verdict_oracle`: a leaked co-signer key must be replaceable without a program upgrade.
+    pub fn set_co_signer(ctx: Context<AdminOnly>, co_signer: Pubkey) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        require_distinct_roles(config.admin, config.verdict_oracle, co_signer)?;
+        config.co_signer = co_signer;
+        emit!(CoSignerRotated { co_signer });
         Ok(())
     }
 
@@ -222,7 +351,8 @@ pub mod backstop {
             VerdictError::InvalidParams
         );
         require!(
-            (MIN_RESALE_FLOOR_SECS..=MAX_RESALE_FLOOR_SECS).contains(&resale_floor_secs),
+            (min_resale_floor_secs(ctx.accounts.config.cluster_tag)..=MAX_RESALE_FLOOR_SECS)
+                .contains(&resale_floor_secs),
             VerdictError::InvalidParams
         );
         require!(
@@ -247,7 +377,9 @@ pub mod backstop {
     /// leaked oracle key.
     pub fn set_admin(ctx: Context<AdminOnly>, admin: Pubkey) -> Result<()> {
         require_keys_neq!(admin, Pubkey::default(), VerdictError::InvalidParams);
-        ctx.accounts.config.admin = admin;
+        let config = &mut ctx.accounts.config;
+        require_distinct_roles(admin, config.verdict_oracle, config.co_signer)?;
+        config.admin = admin;
         Ok(())
     }
 
@@ -411,6 +543,8 @@ pub mod backstop {
         bc.market = ctx.accounts.market.key();
         bc.borrower = ctx.accounts.borrower.key();
         bc.open = Pubkey::default();
+        bc.penalty_since = 0;
+        bc.penalty_until = 0;
         bc.reserved = [0; 32];
         Ok(())
     }
@@ -438,7 +572,7 @@ pub mod backstop {
 
         let record = &ctx.accounts.liquidation_record;
         require!(
-            (MIN_AFTER_WAIT_SECS..=MAX_AFTER_WAIT_SECS)
+            (ctx.accounts.config.min_after_wait_secs..=MAX_AFTER_WAIT_SECS)
                 .contains(&args.after_ts.saturating_sub(record.ts)),
             VerdictError::InvalidAfterWindow
         );
@@ -450,6 +584,14 @@ pub mod backstop {
             &config.verdict_oracle,
             &message,
         )?;
+
+        // Phase 4: a specific signed-but-not-yet-submitted attestation the admin revoked. Presence
+        // alone is the signal — never deserialized, the seeds already bind it to this exact
+        // (liquidation_record, evidence_hash) pair.
+        require!(
+            *ctx.accounts.revoked.owner != crate::ID,
+            VerdictError::AttestationRevoked
+        );
 
         let record = &ctx.accounts.liquidation_record;
         require_keys_eq!(
@@ -481,7 +623,8 @@ pub mod backstop {
             VerdictError::SelfDealtLiquidation
         );
 
-        // D2: the frozen payout address can never be a privileged role.
+        // D2: the frozen payout address can never be a privileged role. Roles (LOCKED verdict
+        // spec): "borrower and payout wallet can't be any role".
         require_keys_neq!(
             record.payout,
             ctx.accounts.config.key(),
@@ -492,6 +635,26 @@ pub mod backstop {
             record.payout,
             config.verdict_oracle,
             VerdictError::PrivilegedPayout
+        );
+        require_keys_neq!(
+            record.payout,
+            config.co_signer,
+            VerdictError::PrivilegedPayout
+        );
+        require_keys_neq!(
+            ctx.accounts.borrower.key(),
+            config.admin,
+            VerdictError::PrivilegedBorrower
+        );
+        require_keys_neq!(
+            ctx.accounts.borrower.key(),
+            config.verdict_oracle,
+            VerdictError::PrivilegedBorrower
+        );
+        require_keys_neq!(
+            ctx.accounts.borrower.key(),
+            config.co_signer,
+            VerdictError::PrivilegedBorrower
         );
         // A4, applied to the payout rather than the borrower: whoever actually receives the money
         // cannot also share in what they are being paid from.
@@ -565,12 +728,27 @@ pub mod backstop {
         claim.last_pull_day = 0;
         claim.pulled_today = 0;
         claim.last_activity_ts = 0;
-        claim.reserved = [0; 24];
+        claim.suspended = false;
+        claim.suspended_since = 0;
+        claim.suspended_secs = 0;
+        claim.vest_origin = 0;
+        claim.inactivity_secs = 0;
+        claim.reserved = [0; 8];
+
+        // Phase 4: "no coverage on new loans for 365 days" — a liquidation whose debt-weighted
+        // loan age falls inside the penalty window is denied, visibly, same as every other
+        // wrongfulness check here. The lower bound excludes loans that predate the penalty
+        // entirely (see `BorrowerClaims::penalty_since` doc comment).
+        let bc_penalty = &ctx.accounts.borrower_claims;
+        let penalty_active = bc_penalty.penalty_since <= record.borrow_age_ts
+            && record.borrow_age_ts < bc_penalty.penalty_until;
 
         let deny = if !price_was_wrong {
             Some(deny_reason::PRICE_NOT_WRONG)
         } else if !move_did_not_hold {
             Some(deny_reason::MOVE_HELD)
+        } else if penalty_active {
+            Some(deny_reason::PENALTY_ACTIVE)
         } else if loss == 0 {
             Some(deny_reason::ZERO_LOSS)
         } else {
@@ -584,10 +762,11 @@ pub mod backstop {
         } else {
             claim.loss = loss;
             claim.deny_reason = deny_reason::NONE;
+            let gate_secs = ctx.accounts.config.gate_secs;
             let loan_age = record.ts.saturating_sub(record.borrow_age_ts);
-            if loan_age < GATE_SECS {
+            if loan_age < gate_secs {
                 claim.status = ClaimStatus::PendingTime;
-                claim.releasable_at = record.borrow_age_ts.saturating_add(GATE_SECS);
+                claim.releasable_at = record.borrow_age_ts.saturating_add(gate_secs);
             } else {
                 let config = &mut ctx.accounts.config;
                 try_admit(config, claim, now)?;
@@ -613,6 +792,7 @@ pub mod backstop {
     pub fn unlock_claim(ctx: Context<UpdateClaim>) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         let claim = &mut ctx.accounts.claim;
+        require!(!claim.suspended, VerdictError::ClaimSuspended);
         require!(
             claim.status == ClaimStatus::PendingTime,
             VerdictError::WrongClaimStatus
@@ -632,6 +812,7 @@ pub mod backstop {
     pub fn try_release_queued(ctx: Context<UpdateClaim>) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         let claim = &mut ctx.accounts.claim;
+        require!(!claim.suspended, VerdictError::ClaimSuspended);
         require!(
             claim.status == ClaimStatus::Queued,
             VerdictError::WrongClaimStatus
@@ -650,14 +831,16 @@ pub mod backstop {
     pub fn expire_queued(ctx: Context<UpdateClaim>) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         let claim = &mut ctx.accounts.claim;
+        require!(!claim.suspended, VerdictError::ClaimSuspended);
         require!(
             claim.status == ClaimStatus::Queued,
             VerdictError::WrongClaimStatus
         );
-        require!(
-            now.saturating_sub(claim.liquidated_at) > CLAIM_WINDOW_SECS,
-            VerdictError::NotYetExpired
-        );
+        // `suspended_secs` discounts every second this claim ever spent frozen, so a suspension
+        // genuinely stops this clock rather than merely delaying when it is checked.
+        let elapsed = now.saturating_sub(claim.liquidated_at);
+        let effective = elapsed.saturating_sub(claim.suspended_secs).max(0);
+        require!(effective > CLAIM_WINDOW_SECS, VerdictError::NotYetExpired);
         claim.status = ClaimStatus::Expired;
         emit!(ClaimStatusChanged {
             claim: claim.key(),
@@ -666,17 +849,20 @@ pub mod backstop {
         Ok(())
     }
 
-    /// An `Active` claim with no pull for `INACTIVITY_EXPIRY_SECS` returns its unpaid remainder to
+    /// An `Active` claim with no pull for its admitted `inactivity_secs` returns its unpaid remainder to
     /// the backstop by simply un-reserving it — nothing was ever transferred for that remainder.
     pub fn expire_stale(ctx: Context<UpdateClaim>) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         let claim = &mut ctx.accounts.claim;
+        require!(!claim.suspended, VerdictError::ClaimSuspended);
         require!(
             claim.status == ClaimStatus::Active,
             VerdictError::WrongClaimStatus
         );
+        let elapsed = now.saturating_sub(claim.last_activity_ts);
+        let effective = elapsed.saturating_sub(claim.suspended_secs).max(0);
         require!(
-            now.saturating_sub(claim.last_activity_ts) >= INACTIVITY_EXPIRY_SECS,
+            effective >= claim.inactivity_secs,
             VerdictError::NotYetStale
         );
         let remaining = claim.loss.saturating_sub(claim.streamed);
@@ -695,20 +881,26 @@ pub mod backstop {
     pub fn claim_stream(ctx: Context<ClaimStream>) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         let claim = &mut ctx.accounts.claim;
+        require!(!claim.suspended, VerdictError::ClaimSuspended);
         require!(
             claim.status == ClaimStatus::Active,
             VerdictError::WrongClaimStatus
         );
         require!(now >= claim.cooldown_end, VerdictError::CooldownNotElapsed);
 
-        let elapsed = now.saturating_sub(claim.cooldown_end).max(0);
-        let vested = if elapsed >= STREAM_SECS {
+        // `vest_origin` defaults to `cooldown_end` (identical to before this field existed); an
+        // override that carried a prior `streamed` amount forward shifts it backward so vesting
+        // resumes from where it left off instead of re-streaming the paid portion again.
+        let elapsed = now.saturating_sub(claim.vest_origin).max(0);
+        // Phase 5: the stream length this claim was admitted under, not the config's current value.
+        let stream_secs = claim.stream_end.saturating_sub(claim.cooldown_end);
+        let vested = if elapsed >= stream_secs {
             claim.loss
         } else {
             u64::try_from(mul_div_floor(
                 claim.loss as u128,
                 elapsed as u128,
-                STREAM_SECS as u128,
+                stream_secs as u128,
             )?)
             .map_err(|_| VerdictError::MathOverflow)?
         };
@@ -1197,6 +1389,277 @@ pub mod backstop {
         });
         Ok(())
     }
+
+    // ---------------------------------------------------------------- phase 4: overrides
+
+    /// Admin-only. Cancels a held (`PendingTime`), `Queued`, or `Active` claim with a public
+    /// reason code (LOCKED verdict spec). An `Active` claim's unstreamed reservation is released
+    /// exactly as it would be on expiry. The 365-day no-coverage penalty applies only if real
+    /// money had actually left the pool for this claim (`streamed > 0`) — catching a mistake
+    /// before any payout moved costs the borrower nothing.
+    pub fn cancel_claim(ctx: Context<CancelClaim>, reason_code: u16) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let claim = &mut ctx.accounts.claim;
+        require!(
+            matches!(
+                claim.status,
+                ClaimStatus::PendingTime | ClaimStatus::Queued | ClaimStatus::Active
+            ),
+            VerdictError::ClaimNotCancellable
+        );
+        let penalize = claim.status == ClaimStatus::Active && claim.streamed > 0;
+        if claim.status == ClaimStatus::Active {
+            let unreserved = claim.loss.saturating_sub(claim.streamed);
+            let config = &mut ctx.accounts.config;
+            config.reserved_total = config.reserved_total.saturating_sub(unreserved);
+        }
+        claim.status = ClaimStatus::Cancelled;
+        // Reused, not a new field: on a Cancelled claim this slot holds the admin's public
+        // cancellation reason rather than one of the `deny_reason::` wrongfulness codes — the
+        // status itself disambiguates which meaning applies.
+        claim.deny_reason = reason_code;
+        let claim_key = claim.key();
+
+        if penalize {
+            let bc = &mut ctx.accounts.borrower_claims;
+            bc.penalty_since = now;
+            bc.penalty_until = now
+                .checked_add(PENALTY_LOCK_SECS)
+                .ok_or(VerdictError::MathOverflow)?;
+        }
+
+        emit!(ClaimCancelled {
+            claim: claim_key,
+            reason_code,
+            penalized: penalize,
+        });
+        Ok(())
+    }
+
+    /// Admin-only. Freezes a claim: every permissionless progression instruction (`unlock_claim`,
+    /// `try_release_queued`, `expire_queued`, `expire_stale`, `claim_stream`) refuses while
+    /// suspended.
+    pub fn suspend_claim(ctx: Context<SuspendClaim>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let claim = &mut ctx.accounts.claim;
+        require!(!claim.status.is_terminal(), VerdictError::WrongClaimStatus);
+        require!(!claim.suspended, VerdictError::AlreadySuspended);
+        claim.suspended = true;
+        claim.suspended_since = now;
+        emit!(ClaimSuspendChanged {
+            claim: claim.key(),
+            suspended: true,
+        });
+        Ok(())
+    }
+
+    /// Admin-only. Un-freezes a claim, folding the just-ended suspension's duration into
+    /// `suspended_secs` so `expire_queued`/`expire_stale` never count time this claim spent
+    /// suspended (LOCKED verdict spec: "expiry clocks stop while suspended and reset on
+    /// unsuspend").
+    pub fn unsuspend_claim(ctx: Context<SuspendClaim>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let claim = &mut ctx.accounts.claim;
+        require!(claim.suspended, VerdictError::NotSuspended);
+        let paused = now.saturating_sub(claim.suspended_since).max(0);
+        claim.suspended_secs = claim.suspended_secs.saturating_add(paused);
+        claim.suspended = false;
+        claim.suspended_since = 0;
+        emit!(ClaimSuspendChanged {
+            claim: claim.key(),
+            suspended: false,
+        });
+        Ok(())
+    }
+
+    /// Admin-only. Marks one specific signed-but-not-yet-submitted attestation revoked, so a
+    /// leaked-oracle-key scenario has an on-chain block even before anyone tries to submit it.
+    pub fn revoke_attestation(
+        ctx: Context<RevokeAttestation>,
+        liquidation_record: Pubkey,
+        evidence_hash: [u8; 32],
+    ) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let revoked = &mut ctx.accounts.revoked;
+        revoked.version = ACCOUNT_VERSION;
+        revoked.bump = ctx.bumps.revoked;
+        revoked.liquidation_record = liquidation_record;
+        revoked.evidence_hash = evidence_hash;
+        revoked.revoked_at = now;
+        revoked.reserved = [0; 16];
+        emit!(AttestationRevokedEvent {
+            liquidation_record,
+            evidence_hash,
+        });
+        Ok(())
+    }
+
+    /// Permissionless. Opens the 2-of-2 override request for one liquidation, ahead of the first
+    /// `approve_override` call.
+    pub fn open_override(ctx: Context<OpenOverride>) -> Result<()> {
+        let req = &mut ctx.accounts.override_request;
+        req.version = ACCOUNT_VERSION;
+        req.bump = ctx.bumps.override_request;
+        req.liquidation_record = ctx.accounts.liquidation_record.key();
+        req.ref_at_liq = 0;
+        req.admin_approver = None;
+        req.co_signer_approver = None;
+        req.executed = false;
+        req.reserved = [0; 16];
+        Ok(())
+    }
+
+    /// Admin or co-signer only. The 2-of-2 override (LOCKED verdict spec): each approver submits
+    /// the same `ref_at_liq` once; the second matching, current-key approval executes. Skips
+    /// checks (a)/(b)/(c) and the 60-day gate. Never skips: record + borrower match, the
+    /// issuer-action exclusion, one payout per liquidation (a `Completed` claim is refused), the
+    /// on-chain loss formula, the per-claim cap, or solvency — `ref_at_liq` is supplied, not the
+    /// loss itself, and the loss is still computed on-chain via `safu_core::wrongful_loss`, then
+    /// still run through `try_admit`'s cap/solvency logic exactly like an ordinary admission.
+    /// A prior `Active` claim's unstreamed reservation is released and its `streamed` carried
+    /// forward, so the correction can never pay out on top of what already streamed.
+    pub fn approve_override(ctx: Context<ApproveOverride>, ref_at_liq: u64) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let admin = ctx.accounts.config.admin;
+        let co_signer = ctx.accounts.config.co_signer;
+        let caller = ctx.accounts.caller.key();
+        require!(
+            caller == admin || caller == co_signer,
+            VerdictError::CallerNotAdminOrCoSigner
+        );
+
+        let record = &ctx.accounts.liquidation_record;
+        require_keys_eq!(
+            record.market,
+            ctx.accounts.market.key(),
+            VerdictError::RecordMismatch
+        );
+        require_keys_eq!(
+            record.borrower,
+            ctx.accounts.claim.borrower,
+            VerdictError::RecordMismatch
+        );
+        require_keys_eq!(
+            ctx.accounts.claim.liquidation_record,
+            record.key(),
+            VerdictError::RecordMismatch
+        );
+        require!(!record.issuer_halt, VerdictError::IssuerHaltedLiquidation);
+        require!(
+            ctx.accounts.claim.status != ClaimStatus::Completed,
+            VerdictError::ClaimAlreadyCompleted
+        );
+
+        require_keys_neq!(
+            record.payout,
+            ctx.accounts.config.key(),
+            VerdictError::PrivilegedPayout
+        );
+        require_keys_neq!(record.payout, admin, VerdictError::PrivilegedPayout);
+        require_keys_neq!(
+            record.payout,
+            ctx.accounts.config.verdict_oracle,
+            VerdictError::PrivilegedPayout
+        );
+        require_keys_neq!(record.payout, co_signer, VerdictError::PrivilegedPayout);
+        let backer_info = ctx.accounts.payout_backer.to_account_info();
+        if !backer_info.data_is_empty() {
+            require_keys_eq!(
+                *backer_info.owner,
+                crate::ID,
+                VerdictError::BorrowerIsABacker
+            );
+            let data = backer_info.try_borrow_data()?;
+            let backer = Backer::try_deserialize(&mut &data[..])?;
+            require!(
+                backer.shares == 0 && backer.withdraw_shares == 0,
+                VerdictError::BorrowerIsABacker
+            );
+        }
+
+        let req = &mut ctx.accounts.override_request;
+        require!(!req.executed, VerdictError::OverrideAlreadyExecuted);
+        require_keys_eq!(
+            req.liquidation_record,
+            record.key(),
+            VerdictError::RecordMismatch
+        );
+        if req.admin_approver.is_none() && req.co_signer_approver.is_none() {
+            req.ref_at_liq = ref_at_liq;
+        } else {
+            require!(
+                req.ref_at_liq == ref_at_liq,
+                VerdictError::OverrideParamsMismatch
+            );
+        }
+        if caller == admin {
+            req.admin_approver = Some(caller);
+        }
+        if caller == co_signer {
+            req.co_signer_approver = Some(caller);
+        }
+
+        // Bound to the CURRENT admin/co_signer, not whoever approved earlier: a rotation between
+        // the two approvals correctly un-readies a stale approval rather than letting it carry
+        // over silently.
+        let ready = req.admin_approver == Some(admin) && req.co_signer_approver == Some(co_signer);
+        if !ready {
+            return Ok(());
+        }
+
+        let loss = safu_core::loss::wrongful_loss(
+            record.seized_raw,
+            record.collateral_decimals,
+            record.multiplier_fp,
+            ref_at_liq,
+            record.debt_repaid,
+        )
+        .map_err(|_| VerdictError::MathOverflow)?;
+        require!(loss > 0, VerdictError::ZeroAmount);
+
+        let claim_status = ctx.accounts.claim.status;
+        let carried_streamed = if claim_status == ClaimStatus::Active {
+            ctx.accounts.claim.streamed
+        } else {
+            0
+        };
+        if claim_status == ClaimStatus::Active {
+            let unreserved = ctx
+                .accounts
+                .claim
+                .loss
+                .saturating_sub(ctx.accounts.claim.streamed);
+            ctx.accounts.config.reserved_total = ctx
+                .accounts
+                .config
+                .reserved_total
+                .saturating_sub(unreserved);
+        }
+        ctx.accounts.claim.loss = loss;
+        ctx.accounts.claim.deny_reason = deny_reason::NONE;
+        ctx.accounts.claim.streamed = carried_streamed;
+
+        let claim = &mut ctx.accounts.claim;
+        let config = &mut ctx.accounts.config;
+        try_admit(config, claim, now)?;
+        if claim.status == ClaimStatus::Active && carried_streamed > 0 {
+            let stream_secs = claim.stream_end.saturating_sub(claim.cooldown_end);
+            let shift = (carried_streamed as i128 * stream_secs as i128 / loss as i128) as i64;
+            claim.vest_origin = claim.vest_origin.saturating_sub(shift);
+        }
+        let claim_key = claim.key();
+        let claim_status = claim.status;
+
+        ctx.accounts.override_request.executed = true;
+
+        emit!(ClaimOverridden {
+            claim: claim_key,
+            ref_at_liq,
+            loss,
+            status: claim_status,
+        });
+        Ok(())
+    }
 }
 
 #[derive(Accounts)]
@@ -1356,6 +1819,11 @@ pub struct SubmitFacts<'info> {
     /// decoded and required to hold nothing (A4, applied to the payout rather than the borrower).
     #[account(seeds = [BACKER_SEED, liquidation_record.payout.as_ref()], bump)]
     pub payout_backer: UncheckedAccount<'info>,
+
+    /// CHECK: phase 4 — existence alone (owner == this program) means `revoke_attestation`
+    /// marked this exact (liquidation_record, evidence_hash) pair revoked; never deserialized.
+    #[account(seeds = [REVOKE_SEED, args.liquidation_record.as_ref(), args.evidence_hash.as_ref()], bump)]
+    pub revoked: UncheckedAccount<'info>,
 
     /// CHECK: address-constrained to the instructions sysvar; read only through the checked loaders.
     #[account(address = solana_instructions_sysvar::ID)]
@@ -1570,6 +2038,79 @@ pub struct AbsorbInterest<'info> {
     pub usdc_token_program: Interface<'info, TokenInterface>,
 }
 
+// ------------------------------------------------------------------------- phase 4: overrides
+
+#[derive(Accounts)]
+pub struct CancelClaim<'info> {
+    pub admin: Signer<'info>,
+    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump, has_one = admin @ VerdictError::Unauthorized)]
+    pub config: Box<Account<'info, BackstopConfig>>,
+    #[account(mut, seeds = [CLAIM_SEED, claim.liquidation_record.as_ref()], bump = claim.bump, has_one = market)]
+    pub claim: Box<Account<'info, Claim>>,
+    pub market: Box<Account<'info, stock_vault::state::Market>>,
+    #[account(mut, seeds = [BORROWER_CLAIMS_SEED, market.key().as_ref(), claim.borrower.as_ref()], bump = borrower_claims.bump)]
+    pub borrower_claims: Box<Account<'info, BorrowerClaims>>,
+}
+
+#[derive(Accounts)]
+pub struct SuspendClaim<'info> {
+    pub admin: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump, has_one = admin @ VerdictError::Unauthorized)]
+    pub config: Box<Account<'info, BackstopConfig>>,
+    #[account(mut, seeds = [CLAIM_SEED, claim.liquidation_record.as_ref()], bump = claim.bump)]
+    pub claim: Box<Account<'info, Claim>>,
+}
+
+#[derive(Accounts)]
+#[instruction(liquidation_record: Pubkey, evidence_hash: [u8; 32])]
+pub struct RevokeAttestation<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump, has_one = admin @ VerdictError::Unauthorized)]
+    pub config: Box<Account<'info, BackstopConfig>>,
+    #[account(
+        init,
+        payer = admin,
+        space = 8 + RevokedAttestation::INIT_SPACE,
+        seeds = [REVOKE_SEED, liquidation_record.as_ref(), evidence_hash.as_ref()],
+        bump,
+    )]
+    pub revoked: Box<Account<'info, RevokedAttestation>>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct OpenOverride<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub liquidation_record: Box<Account<'info, stock_vault::state::LiquidationRecord>>,
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + OverrideRequest::INIT_SPACE,
+        seeds = [OVERRIDE_SEED, liquidation_record.key().as_ref()],
+        bump,
+    )]
+    pub override_request: Box<Account<'info, OverrideRequest>>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ApproveOverride<'info> {
+    pub caller: Signer<'info>,
+    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, BackstopConfig>>,
+    pub market: Box<Account<'info, stock_vault::state::Market>>,
+    pub liquidation_record: Box<Account<'info, stock_vault::state::LiquidationRecord>>,
+    #[account(mut, seeds = [CLAIM_SEED, liquidation_record.key().as_ref()], bump = claim.bump, has_one = market)]
+    pub claim: Box<Account<'info, Claim>>,
+    #[account(mut, seeds = [OVERRIDE_SEED, liquidation_record.key().as_ref()], bump = override_request.bump)]
+    pub override_request: Box<Account<'info, OverrideRequest>>,
+    /// CHECK: the payout address's Backer PDA — same A4 pattern as `SubmitFacts`.
+    #[account(seeds = [BACKER_SEED, liquidation_record.payout.as_ref()], bump)]
+    pub payout_backer: UncheckedAccount<'info>,
+}
+
 #[event]
 pub struct VerdictOracleRotated {
     pub verdict_oracle: Pubkey,
@@ -1653,4 +2194,45 @@ pub struct InventoryWrittenOff {
 pub struct InterestAbsorbedEvent {
     pub market: Pubkey,
     pub credited: u64,
+}
+
+#[event]
+pub struct ClaimTimingSet {
+    pub gate_secs: i64,
+    pub cooldown_secs: i64,
+    pub stream_secs: i64,
+    pub inactivity_secs: i64,
+    pub min_after_wait_secs: i64,
+}
+
+#[event]
+pub struct CoSignerRotated {
+    pub co_signer: Pubkey,
+}
+
+#[event]
+pub struct ClaimCancelled {
+    pub claim: Pubkey,
+    pub reason_code: u16,
+    pub penalized: bool,
+}
+
+#[event]
+pub struct ClaimSuspendChanged {
+    pub claim: Pubkey,
+    pub suspended: bool,
+}
+
+#[event]
+pub struct AttestationRevokedEvent {
+    pub liquidation_record: Pubkey,
+    pub evidence_hash: [u8; 32],
+}
+
+#[event]
+pub struct ClaimOverridden {
+    pub claim: Pubkey,
+    pub ref_at_liq: u64,
+    pub loss: u64,
+    pub status: ClaimStatus,
 }

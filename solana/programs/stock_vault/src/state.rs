@@ -31,8 +31,11 @@ pub struct VaultConfig {
     pub pool_liquidator: Pubkey,
     /// How long a position must have been liquidatable before an outside liquidator may act. 900 s.
     pub fallback_grace_secs: i64,
-    /// Taken from the old 64 reserved bytes (32 + 8), so the account size is unchanged (U4).
-    pub reserved: [u8; 24],
+    /// Which cluster this deployment is on (0 localnet, 1 devnet, 2 mainnet), set once at initialize with no
+    /// setter. Selects the time floors (eng review A5): mainnet may never shorten the grace below 5 min.
+    pub cluster_tag: u8,
+    /// Taken from the old 64 reserved bytes (32 + 8 + 1), so the account size is unchanged (U4).
+    pub reserved: [u8; 23],
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq, InitSpace)]
@@ -47,6 +50,21 @@ pub struct RateParams {
 pub const DEFAULT_FALLBACK_GRACE_SECS: i64 = 900;
 pub const MIN_FALLBACK_GRACE_SECS: i64 = 60;
 pub const MAX_FALLBACK_GRACE_SECS: i64 = 86_400;
+/// Eng review A5: on mainnet the pool's head start can never drop below 5 minutes.
+pub const MAINNET_MIN_FALLBACK_GRACE_SECS: i64 = 300;
+
+/// Same numbering as the backstop's `verdict::CLUSTER_*` (asserted in the backstop's unit tests).
+pub const CLUSTER_LOCALNET: u8 = 0;
+pub const CLUSTER_DEVNET: u8 = 1;
+pub const CLUSTER_MAINNET: u8 = 2;
+
+pub fn min_fallback_grace_secs(cluster_tag: u8) -> i64 {
+    if cluster_tag == CLUSTER_MAINNET {
+        MAINNET_MIN_FALLBACK_GRACE_SECS
+    } else {
+        MIN_FALLBACK_GRACE_SECS
+    }
+}
 
 /// How long a tightening of the liquidation terms takes to reach existing loans (U3, founder 2026-09-14).
 /// Loosening applies at once. A constant, not a parameter: an admin must not be able to set it to zero.

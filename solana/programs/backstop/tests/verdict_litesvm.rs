@@ -20,7 +20,7 @@ use backstop::{
     errors::VerdictError,
     state::{
         BackstopConfig, BorrowerClaims, Claim, ClaimStatus, ACCOUNT_VERSION, BORROWER_CLAIMS_SEED,
-        CLAIM_SEED, CONFIG_SEED,
+        CLAIM_SEED, CONFIG_SEED, REVOKE_SEED,
     },
     verdict::{encode_message, FactsArgs, CLUSTER_DEVNET, CLUSTER_MAINNET, MAX_VERDICT_TTL_SECS},
 };
@@ -121,6 +121,7 @@ fn setup(cluster_tag: u8) -> Env {
         version: ACCOUNT_VERSION,
         admin: payer.pubkey(),
         verdict_oracle: oracle.pubkey(),
+        co_signer: Pubkey::new_unique(),
         cluster_tag,
         bump,
         // Token fields are unused by these tests: nothing here moves USDC. `cash` is set generous
@@ -142,6 +143,11 @@ fn setup(cluster_tag: u8) -> Env {
         resale_floor_secs: 4 * 86_400,
         fee_share_bps: 1_000,
         min_pool_repay: 10 * USDC,
+        gate_secs: 60 * 86_400,
+        cooldown_secs: 7 * 86_400,
+        stream_secs: 45 * 86_400,
+        inactivity_secs: 100 * 86_400,
+        min_after_wait_secs: 3_600,
         reserved: [0; 16],
     };
     set_state(&mut svm, config_pda, backstop::ID, &config);
@@ -186,6 +192,8 @@ fn setup(cluster_tag: u8) -> Env {
         market: market_key,
         borrower,
         open: Pubkey::default(),
+        penalty_since: 0,
+        penalty_until: 0,
         reserved: [0; 32],
     };
     set_state(&mut svm, bc_pda, backstop::ID, &bc);
@@ -277,6 +285,11 @@ fn submit_ix(env: &Env, record_key: Pubkey, a: &FactsArgs) -> Instruction {
             claim: claim_pda(&record_key),
             payout_backer: Pubkey::find_program_address(
                 &[backstop::state::BACKER_SEED, env.borrower.as_ref()],
+                &backstop::ID,
+            )
+            .0,
+            revoked: Pubkey::find_program_address(
+                &[REVOKE_SEED, record_key.as_ref(), a.evidence_hash.as_ref()],
                 &backstop::ID,
             )
             .0,

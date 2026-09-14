@@ -81,4 +81,27 @@ pub enum VerdictError {
     NothingToBuy,
     #[msg("Inventory account does not belong to the market supplied")]
     MarketMismatch,
+    // --- phase 4: overrides ---------------------------------------------------------------------
+    #[msg("admin, verdict_oracle and co_signer must all be distinct")]
+    RoleCollision,
+    #[msg("Borrower cannot be a privileged role")]
+    PrivilegedBorrower,
+    #[msg("This attestation was revoked before submission")]
+    AttestationRevoked,
+    #[msg("Claim is not in a cancellable status")]
+    ClaimNotCancellable,
+    #[msg("Claim is already suspended")]
+    AlreadySuspended,
+    #[msg("Claim is not suspended")]
+    NotSuspended,
+    #[msg("This claim is suspended")]
+    ClaimSuspended,
+    #[msg("Caller is neither the admin nor the co-signer")]
+    CallerNotAdminOrCoSigner,
+    #[msg("Override parameters do not match the pending request")]
+    OverrideParamsMismatch,
+    #[msg("This override request has already executed")]
+    OverrideAlreadyExecuted,
+    #[msg("A completed claim cannot be overridden")]
+    ClaimAlreadyCompleted,
 }

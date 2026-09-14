@@ -221,6 +221,14 @@ mod tests {
     }
 
     #[test]
+    fn cluster_numbering_matches_the_vault() {
+        // Both programs pick their per-cluster time floors from their own copy of the tag.
+        assert_eq!(CLUSTER_LOCALNET, stock_vault::state::CLUSTER_LOCALNET);
+        assert_eq!(CLUSTER_DEVNET, stock_vault::state::CLUSTER_DEVNET);
+        assert_eq!(CLUSTER_MAINNET, stock_vault::state::CLUSTER_MAINNET);
+    }
+
+    #[test]
     fn message_is_exactly_178_bytes_and_starts_with_domain() {
         let m = encode_message(&Pubkey::new_from_array([1; 32]), CLUSTER_DEVNET, &args());
         assert_eq!(m.len(), MESSAGE_LEN);

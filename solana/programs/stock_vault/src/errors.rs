@@ -56,6 +56,8 @@ pub enum VaultError {
     InvalidPoolLiquidator,
     #[msg("Fallback grace period is outside its bounds")]
     InvalidFallbackGrace,
+    #[msg("Cluster tag must be localnet (0), devnet (1) or mainnet (2)")]
+    InvalidClusterTag,
 }
 
 impl From<safu_core::CoreError> for VaultError {

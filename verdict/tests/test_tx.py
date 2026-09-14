@@ -31,11 +31,13 @@ from tx import (  # noqa: E402
     CONFIG_SEED,
     ED25519_PROGRAM_ID,
     INSTRUCTIONS_SYSVAR_ID,
+    REVOKE_SEED,
     SUBMIT_FACTS_DISCRIMINATOR,
     SYSTEM_PROGRAM_ID,
     SubmitFactsAccounts,
     build_submit_facts_instructions,
     ed25519_instruction,
+    revoked_pda,
     submit_facts_instruction,
 )
 
@@ -155,10 +157,12 @@ def test_seeds_match_the_rust_source():
     assert 'pub const BACKER_SEED: &[u8] = b"backer";' in BACKSTOP_STATE_RS
     assert 'pub const CLAIM_SEED: &[u8] = b"claim";' in BACKSTOP_STATE_RS
     assert 'pub const BORROWER_CLAIMS_SEED: &[u8] = b"bclaims";' in BACKSTOP_STATE_RS
+    assert 'pub const REVOKE_SEED: &[u8] = b"revoke";' in BACKSTOP_STATE_RS
     assert CONFIG_SEED == b"bconfig"
     assert BACKER_SEED == b"backer"
     assert CLAIM_SEED == b"claim"
     assert BORROWER_CLAIMS_SEED == b"bclaims"
+    assert REVOKE_SEED == b"revoke"
 
 
 def test_program_id_matches_declare_id():
@@ -194,7 +198,7 @@ def _accounts(**overrides) -> SubmitFactsAccounts:
     return SubmitFactsAccounts(**base)
 
 
-def test_submit_facts_instruction_has_eleven_accounts_in_spec_order():
+def test_submit_facts_instruction_has_twelve_accounts_in_spec_order():
     accs = _accounts()
     from engine import FactsArgs
 
@@ -208,7 +212,7 @@ def test_submit_facts_instruction_has_eleven_accounts_in_spec_order():
         deadline=1,
     )
     ix = submit_facts_instruction(args, accs)
-    assert len(ix.accounts) == 11
+    assert len(ix.accounts) == 12
     assert ix.accounts[0].pubkey == accs.payer
     assert ix.accounts[0].is_signer is True
     assert ix.accounts[1].pubkey == accs.config_pda()
@@ -219,8 +223,10 @@ def test_submit_facts_instruction_has_eleven_accounts_in_spec_order():
     assert ix.accounts[6].pubkey == accs.payer  # existing_claim defaults to payer
     assert ix.accounts[7].pubkey == accs.claim_pda()
     assert ix.accounts[8].pubkey == accs.payout_backer_pda()
-    assert ix.accounts[9].pubkey == INSTRUCTIONS_SYSVAR_ID
-    assert ix.accounts[10].pubkey == SYSTEM_PROGRAM_ID
+    assert ix.accounts[9].pubkey == revoked_pda(args)
+    assert ix.accounts[9].is_writable is False
+    assert ix.accounts[10].pubkey == INSTRUCTIONS_SYSVAR_ID
+    assert ix.accounts[11].pubkey == SYSTEM_PROGRAM_ID
     assert ix.data[:8] == SUBMIT_FACTS_DISCRIMINATOR
     assert len(ix.data) == 8 + 32 + 32 + 8 + 8 + 8 + 32 + 8  # discriminator + FactsArgs Borsh body
 
@@ -294,3 +300,24 @@ def test_build_submit_facts_instructions_end_to_end(tmp_path):
         ed_ix.data, own_index=0, expected_signer=bytes(oracle.pubkey()), expected_message=signed.message
     )
     assert facts_ix.data[:8] == SUBMIT_FACTS_DISCRIMINATOR
+
+
+def test_revoked_pda_is_bound_to_both_the_record_and_the_evidence_hash():
+    from engine import FactsArgs
+
+    def args(record: Pubkey, evidence: bytes) -> FactsArgs:
+        return FactsArgs(
+            liquidation_record=record,
+            borrower=_pk(2),
+            ref_at_liq=1,
+            ref_after=1,
+            after_ts=1,
+            evidence_hash=evidence,
+            deadline=1,
+        )
+
+    base = revoked_pda(args(_pk(1), bytes(32)))
+    expected = Pubkey.find_program_address([REVOKE_SEED, bytes(_pk(1)), bytes(32)], BACKSTOP_PROGRAM_ID)[0]
+    assert base == expected
+    assert revoked_pda(args(_pk(3), bytes(32))) != base
+    assert revoked_pda(args(_pk(1), b"\x01" + bytes(31))) != base

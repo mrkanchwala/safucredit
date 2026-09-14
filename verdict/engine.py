@@ -201,21 +201,28 @@ def sign_verdict(
     ttl_secs: int = 3_600,
     now: int | None = None,
     recordings_dir: Path = RECORDINGS_DIR,
+    min_after_wait_secs: int = MIN_AFTER_WAIT_SECS,
 ) -> SignedVerdict:
     """Builds and signs one FactsArgs payload for a liquidation.
 
     Does not evaluate wrongfulness -- see module docstring. Raises VerdictEngineError if the
-    MIN_AFTER_WAIT_SECS floor has not elapsed yet, if no ref_after sample has been recorded past
+    min_after_wait_secs floor has not elapsed yet, if no ref_after sample has been recorded past
     it (retry later), or if the first available sample past the floor is already outside
     MAX_AFTER_WAIT_SECS (escalate rather than submit a payload the program will reject).
+
+    min_after_wait_secs must equal the backstop config's current `min_after_wait_secs` (admin-settable,
+    1 h default and mainnet floor; devnet may be seconds so the demo runs in minutes). The engine holds
+    no RPC connection, so the caller passes it.
     """
+    if min_after_wait_secs <= 0 or min_after_wait_secs >= MAX_AFTER_WAIT_SECS:
+        raise VerdictEngineError(f"min_after_wait_secs {min_after_wait_secs} is outside (0, {MAX_AFTER_WAIT_SECS})")
     now = now if now is not None else int(datetime.now(UTC).timestamp())
-    min_after_ts = liquidated_at + MIN_AFTER_WAIT_SECS
+    min_after_ts = liquidated_at + min_after_wait_secs
     max_after_ts = liquidated_at + MAX_AFTER_WAIT_SECS
     if now < min_after_ts:
         raise VerdictEngineError(
             f"only {now - liquidated_at}s since the liquidation; the on-chain gate needs at "
-            f"least {MIN_AFTER_WAIT_SECS}s before ref_after can be sampled"
+            f"least {min_after_wait_secs}s before ref_after can be sampled"
         )
 
     sample_at_liq = reference_at(symbol, liquidated_at, recordings_dir=recordings_dir)

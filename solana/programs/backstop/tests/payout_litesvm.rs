@@ -17,10 +17,11 @@ use backstop::{
     errors::VerdictError,
     state::{
         Backer, BackstopConfig, BadDebtCover, BorrowerClaims, Claim, ClaimStatus, InterestAbsorbed,
-        Inventory, BACKER_SEED, BAD_DEBT_SEED, BORROWER_CLAIMS_SEED, CLAIM_SEED, CONFIG_SEED,
-        INTEREST_SEED, INVENTORY_SEED, INVENTORY_VAULT_SEED, USDC_VAULT_SEED as B_USDC_VAULT_SEED,
+        Inventory, OverrideRequest, RevokedAttestation, BACKER_SEED, BAD_DEBT_SEED,
+        BORROWER_CLAIMS_SEED, CLAIM_SEED, CONFIG_SEED, INTEREST_SEED, INVENTORY_SEED,
+        INVENTORY_VAULT_SEED, OVERRIDE_SEED, REVOKE_SEED, USDC_VAULT_SEED as B_USDC_VAULT_SEED,
     },
-    verdict::{encode_message, FactsArgs, CLUSTER_DEVNET},
+    verdict::{encode_message, FactsArgs, CLUSTER_DEVNET, CLUSTER_MAINNET},
 };
 use litesvm::LiteSVM;
 use solana_keypair::Keypair;
@@ -91,6 +92,7 @@ struct Env {
     feed: Keypair,
     issuer: Keypair,
     oracle: Keypair,
+    co_signer: Keypair,
     alice: Keypair,
     coll_mint: Pubkey,
     usdc_mint: Pubkey,
@@ -136,6 +138,23 @@ impl Env {
     fn claim_pda(&self, record: &Pubkey) -> Pubkey {
         bpda(&[CLAIM_SEED, record.as_ref()])
     }
+    fn revoked_pda(&self, record: &Pubkey, evidence_hash: &[u8; 32]) -> Pubkey {
+        bpda(&[REVOKE_SEED, record.as_ref(), evidence_hash.as_ref()])
+    }
+    fn override_pda(&self, record: &Pubkey) -> Pubkey {
+        bpda(&[OVERRIDE_SEED, record.as_ref()])
+    }
+    fn override_state(&self, record: &Pubkey) -> OverrideRequest {
+        let a = self.svm.get_account(&self.override_pda(record)).unwrap();
+        OverrideRequest::try_deserialize(&mut a.data.as_slice()).unwrap()
+    }
+    fn revoked_state(&self, record: &Pubkey, evidence_hash: &[u8; 32]) -> RevokedAttestation {
+        let a = self
+            .svm
+            .get_account(&self.revoked_pda(record, evidence_hash))
+            .unwrap();
+        RevokedAttestation::try_deserialize(&mut a.data.as_slice()).unwrap()
+    }
     fn inventory(&self, market: &Pubkey) -> Pubkey {
         bpda(&[INVENTORY_SEED, market.as_ref()])
     }
@@ -168,6 +187,25 @@ impl Env {
             .send_transaction(tx)
             .map(|_| ())
             .map_err(|e| format!("{:?} | logs: {:?}", e.err, e.meta.logs))
+    }
+
+    /// Sends and returns (compute units consumed, serialized legacy transaction size in bytes).
+    fn send_measured(&mut self, ixs: &[Instruction], signers: &[&Keypair]) -> (u64, usize) {
+        let msg = Message::new_with_blockhash(
+            ixs,
+            Some(&signers[0].pubkey()),
+            &self.svm.latest_blockhash(),
+        );
+        let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), signers).unwrap();
+        // Wire size: short-vec signature count (1 byte below 128) + 64 per signature + message.
+        let size = 1 + 64 * tx.signatures.len() + tx.message.serialize().len();
+        let meta = self.svm.send_transaction(tx).unwrap_or_else(|e| {
+            panic!(
+                "measured transaction failed: {:?} | {:?}",
+                e.err, e.meta.logs
+            )
+        });
+        (meta.compute_units_consumed, size)
     }
 
     fn ok(&mut self, ixs: &[Instruction], signers: &[&Keypair]) {
@@ -542,6 +580,18 @@ impl Env {
         ref_at_liq: u64,
         ref_after: u64,
     ) -> [Instruction; 2] {
+        let after_ts = self.now + 3_600;
+        self.submit_facts_ixs_after(record, borrower, ref_at_liq, ref_after, after_ts)
+    }
+
+    fn submit_facts_ixs_after(
+        &mut self,
+        record: &Pubkey,
+        borrower: &Pubkey,
+        ref_at_liq: u64,
+        ref_after: u64,
+        after_ts: i64,
+    ) -> [Instruction; 2] {
         if self
             .svm
             .get_account(&self.borrower_claims_pda(borrower))
@@ -561,7 +611,7 @@ impl Env {
             borrower: *borrower,
             ref_at_liq,
             ref_after,
-            after_ts: self.now + 3_600,
+            after_ts,
             evidence_hash: [7; 32],
             deadline: self.now + 600,
         };
@@ -579,6 +629,7 @@ impl Env {
                 existing_claim: existing_arg,
                 claim: self.claim_pda(record),
                 payout_backer: self.backer(borrower),
+                revoked: self.revoked_pda(record, &args.evidence_hash),
                 instructions_sysvar: IX_SYSVAR,
                 system_program: SYSTEM,
             },
@@ -648,6 +699,118 @@ impl Env {
                 usdc_token_program: TOKEN_CLASSIC,
             },
             backstop::instruction::ClaimStream {},
+        )
+    }
+    fn cancel_claim_ix(
+        &self,
+        admin: &Pubkey,
+        record: &Pubkey,
+        borrower: &Pubkey,
+        reason_code: u16,
+    ) -> Instruction {
+        self.b_ix(
+            backstop::accounts::CancelClaim {
+                admin: *admin,
+                config: self.b_config(),
+                claim: self.claim_pda(record),
+                market: self.market(),
+                borrower_claims: self.borrower_claims_pda(borrower),
+            },
+            backstop::instruction::CancelClaim { reason_code },
+        )
+    }
+    fn suspend_claim_ix(&self, admin: &Pubkey, record: &Pubkey) -> Instruction {
+        self.b_ix(
+            backstop::accounts::SuspendClaim {
+                admin: *admin,
+                config: self.b_config(),
+                claim: self.claim_pda(record),
+            },
+            backstop::instruction::SuspendClaim {},
+        )
+    }
+    fn unsuspend_claim_ix(&self, admin: &Pubkey, record: &Pubkey) -> Instruction {
+        self.b_ix(
+            backstop::accounts::SuspendClaim {
+                admin: *admin,
+                config: self.b_config(),
+                claim: self.claim_pda(record),
+            },
+            backstop::instruction::UnsuspendClaim {},
+        )
+    }
+    fn revoke_attestation_ix(
+        &self,
+        admin: &Pubkey,
+        record: &Pubkey,
+        evidence_hash: [u8; 32],
+    ) -> Instruction {
+        self.b_ix(
+            backstop::accounts::RevokeAttestation {
+                admin: *admin,
+                config: self.b_config(),
+                revoked: self.revoked_pda(record, &evidence_hash),
+                system_program: SYSTEM,
+            },
+            backstop::instruction::RevokeAttestation {
+                liquidation_record: *record,
+                evidence_hash,
+            },
+        )
+    }
+    fn set_claim_timing_ix(&self, admin: &Pubkey, t: [i64; 5]) -> Instruction {
+        self.b_ix(
+            backstop::accounts::AdminOnly {
+                admin: *admin,
+                config: self.b_config(),
+            },
+            backstop::instruction::SetClaimTiming {
+                gate_secs: t[0],
+                cooldown_secs: t[1],
+                stream_secs: t[2],
+                inactivity_secs: t[3],
+                min_after_wait_secs: t[4],
+            },
+        )
+    }
+    fn set_co_signer_ix(&self, admin: &Pubkey, co_signer: Pubkey) -> Instruction {
+        self.b_ix(
+            backstop::accounts::AdminOnly {
+                admin: *admin,
+                config: self.b_config(),
+            },
+            backstop::instruction::SetCoSigner { co_signer },
+        )
+    }
+    fn open_override_ix(&self, payer: &Pubkey, record: &Pubkey) -> Instruction {
+        self.b_ix(
+            backstop::accounts::OpenOverride {
+                payer: *payer,
+                liquidation_record: *record,
+                override_request: self.override_pda(record),
+                system_program: SYSTEM,
+            },
+            backstop::instruction::OpenOverride {},
+        )
+    }
+    fn approve_override_ix(
+        &self,
+        caller: &Pubkey,
+        record: &Pubkey,
+        borrower: &Pubkey,
+        ref_at_liq: u64,
+    ) -> Instruction {
+        self.b_ix(
+            backstop::accounts::ApproveOverride {
+                caller: *caller,
+                config: self.b_config(),
+                market: self.market(),
+                liquidation_record: *record,
+                claim: self.claim_pda(record),
+                override_request: self.override_pda(record),
+                payout_backer: self.backer(borrower),
+            },
+            backstop::instruction::ApproveOverride { ref_at_liq },
         )
     }
     fn open_inventory_ix(&self, payer: &Pubkey) -> Instruction {
@@ -772,7 +935,8 @@ fn base_uninitialized() -> Env {
     clock.unix_timestamp = NOW;
     svm.set_sysvar(&clock);
 
-    let (admin, feed, issuer, oracle, alice) = (
+    let (admin, feed, issuer, oracle, co_signer, alice) = (
+        Keypair::new(),
         Keypair::new(),
         Keypair::new(),
         Keypair::new(),
@@ -793,6 +957,7 @@ fn base_uninitialized() -> Env {
         feed,
         issuer,
         oracle,
+        co_signer,
         alice,
         coll_mint: coll.pubkey(),
         usdc_mint: usdc.pubkey(),
@@ -826,6 +991,7 @@ impl Env {
             },
             backstop::instruction::InitializeBackstop {
                 verdict_oracle: self.oracle.pubkey(),
+                co_signer: self.co_signer.pubkey(),
                 cluster_tag: CLUSTER_DEVNET,
                 per_claim_cap_bps: CAP_BPS,
                 withdraw_delay_secs: 86_400,
@@ -880,6 +1046,7 @@ fn with_loan() -> Env {
         },
         stock_vault::instruction::InitializeConfig {
             feed_authority: feed.pubkey(),
+            cluster_tag: CLUSTER_DEVNET,
         },
     );
     env.ok(&[vcfg], &[&admin]);
@@ -2409,4 +2576,776 @@ fn absorb_interest_credits_cash_and_a_donation_is_never_counted() {
     env.warp(1);
     let ix2 = env.absorb_interest_ix();
     assert_program_error(env.send(&[ix2], &[&admin]), VerdictError::ZeroAmount);
+}
+
+// ------------------------------------------------------------------ phase 4: roles + overrides
+
+/// Liquidated loan old enough to skip the gate, pool backed with 1M USDC. Returns (record key,
+/// record state).
+fn liquidated_for_claims() -> (Env, Pubkey, LiquidationRecord) {
+    let mut env = with_loan();
+    env.back(1_000_000 * USDC);
+    env.warp(GATE_SECS + 86_400);
+    env.reanchor_price();
+    liquidate(&mut env, None, 75);
+    let record = env.record_state(0);
+    let record_key = env.record(0);
+    (env, record_key, record)
+}
+
+fn funded_co_signer(env: &mut Env) -> Keypair {
+    let co = env.co_signer.insecure_clone();
+    env.svm.airdrop(&co.pubkey(), 1_000_000_000).unwrap();
+    co
+}
+
+fn overwrite_borrower_claims(env: &mut Env, borrower: &Pubkey, bc: &BorrowerClaims) {
+    let pda = env.borrower_claims_pda(borrower);
+    let mut account = env.svm.get_account(&pda).unwrap();
+    let mut data = Vec::new();
+    bc.try_serialize(&mut data).unwrap();
+    account.data = data;
+    env.svm.set_account(pda, account).unwrap();
+}
+
+#[test]
+fn initialize_refuses_overlapping_roles() {
+    let mut env = base_uninitialized();
+    let admin = env.admin.insecure_clone();
+    let init_with = |env: &Env, oracle: Pubkey, co_signer: Pubkey| {
+        env.b_ix(
+            backstop::accounts::InitializeBackstop {
+                admin: admin.pubkey(),
+                program: backstop::ID,
+                program_data: programdata(&backstop::ID),
+                config: env.b_config(),
+                usdc_mint: env.usdc_mint,
+                usdc_vault: env.b_vault(),
+                usdc_token_program: TOKEN_CLASSIC,
+                system_program: SYSTEM,
+            },
+            backstop::instruction::InitializeBackstop {
+                verdict_oracle: oracle,
+                co_signer,
+                cluster_tag: CLUSTER_DEVNET,
+                per_claim_cap_bps: CAP_BPS,
+                withdraw_delay_secs: 86_400,
+            },
+        )
+    };
+    let (oracle, co) = (env.oracle.pubkey(), env.co_signer.pubkey());
+    for (o, c) in [
+        (admin.pubkey(), co),
+        (oracle, admin.pubkey()),
+        (oracle, oracle),
+    ] {
+        let ix = init_with(&env, o, c);
+        assert_program_error(env.send(&[ix], &[&admin]), VerdictError::RoleCollision);
+    }
+    let ix = init_with(&env, oracle, co);
+    env.ok(&[ix], &[&admin]);
+    let config = env.config_state();
+    assert_eq!(config.co_signer, co);
+}
+
+#[test]
+fn every_role_setter_refuses_a_collision_and_the_co_signer_rotates() {
+    let mut env = base();
+    let admin = env.admin.insecure_clone();
+    let (oracle, co) = (env.oracle.pubkey(), env.co_signer.pubkey());
+
+    for to in [admin.pubkey(), oracle] {
+        let ix = env.set_co_signer_ix(&admin.pubkey(), to);
+        assert_program_error(env.send(&[ix], &[&admin]), VerdictError::RoleCollision);
+    }
+    let rotate_oracle = env.b_ix(
+        backstop::accounts::AdminOnly {
+            admin: admin.pubkey(),
+            config: env.b_config(),
+        },
+        backstop::instruction::SetVerdictOracle { verdict_oracle: co },
+    );
+    assert_program_error(
+        env.send(&[rotate_oracle], &[&admin]),
+        VerdictError::RoleCollision,
+    );
+    let rotate_admin = env.b_ix(
+        backstop::accounts::AdminOnly {
+            admin: admin.pubkey(),
+            config: env.b_config(),
+        },
+        backstop::instruction::SetAdmin { admin: co },
+    );
+    assert_program_error(
+        env.send(&[rotate_admin], &[&admin]),
+        VerdictError::RoleCollision,
+    );
+
+    let intruder = env.alice.insecure_clone();
+    let ix = env.set_co_signer_ix(&intruder.pubkey(), intruder.pubkey());
+    assert_program_error(env.send(&[ix], &[&intruder]), VerdictError::Unauthorized);
+
+    let fresh = Pubkey::new_unique();
+    let ix = env.set_co_signer_ix(&admin.pubkey(), fresh);
+    env.ok(&[ix], &[&admin]);
+    assert_eq!(env.config_state().co_signer, fresh);
+}
+
+#[test]
+fn a_payout_address_that_is_the_co_signer_is_refused() {
+    let (mut env, record_key, record) = liquidated_for_claims();
+    let admin = env.admin.insecure_clone();
+    let alice = env.alice.pubkey();
+    let ix = env.set_co_signer_ix(&admin.pubkey(), alice);
+    env.ok(&[ix], &[&admin]);
+    let (ref_price, _) = wrongful_ref_and_loss(&record);
+    let ixs = env.submit_facts_ixs(&record_key, &alice, ref_price, ref_price + 1);
+    assert_program_error(env.send(&ixs, &[&admin]), VerdictError::PrivilegedPayout);
+}
+
+#[test]
+fn cancelling_before_any_payout_releases_the_reservation_without_a_penalty() {
+    let (mut env, record_key, record) = liquidated_for_claims();
+    let (ref_price, loss) = wrongful_ref_and_loss(&record);
+    let alice = env.alice.pubkey();
+    env.submit_facts(&record_key, &alice, ref_price, ref_price + 1);
+    assert_eq!(env.config_state().reserved_total, loss);
+
+    let intruder = env.alice.insecure_clone();
+    let ix = env.cancel_claim_ix(&intruder.pubkey(), &record_key, &alice, 42);
+    assert_program_error(env.send(&[ix], &[&intruder]), VerdictError::Unauthorized);
+
+    let admin = env.admin.insecure_clone();
+    let ix = env.cancel_claim_ix(&admin.pubkey(), &record_key, &alice, 42);
+    env.ok(&[ix], &[&admin]);
+    let claim = env.claim_state(&record_key);
+    assert_eq!(claim.status, ClaimStatus::Cancelled);
+    assert_eq!(claim.deny_reason, 42, "the public reason code is recorded");
+    assert_eq!(env.config_state().reserved_total, 0);
+    let bc = env.borrower_claims_state(&alice);
+    assert_eq!(
+        (bc.penalty_since, bc.penalty_until),
+        (0, 0),
+        "nothing had streamed"
+    );
+
+    env.warp(1);
+    let ix = env.cancel_claim_ix(&admin.pubkey(), &record_key, &alice, 42);
+    assert_program_error(
+        env.send(&[ix], &[&admin]),
+        VerdictError::ClaimNotCancellable,
+    );
+}
+
+#[test]
+fn cancelling_after_a_payout_started_applies_the_365_day_penalty() {
+    let (mut env, record_key, record) = liquidated_for_claims();
+    let (ref_price, loss) = wrongful_ref_and_loss(&record);
+    let alice = env.alice.pubkey();
+    env.submit_facts(&record_key, &alice, ref_price, ref_price + 1);
+
+    let admin = env.admin.insecure_clone();
+    env.warp(COOLDOWN_SECS + STREAM_SECS / 2);
+    let stream = env.claim_stream_ix(&record_key, &env.alice_usdc);
+    env.ok(&[stream], &[&admin]);
+    let streamed = env.claim_state(&record_key).streamed;
+    assert!(streamed > 0 && streamed < loss);
+
+    let ix = env.cancel_claim_ix(&admin.pubkey(), &record_key, &alice, 7);
+    env.ok(&[ix], &[&admin]);
+    assert_eq!(env.claim_state(&record_key).status, ClaimStatus::Cancelled);
+    assert_eq!(
+        env.config_state().reserved_total,
+        0,
+        "only the unstreamed remainder was still reserved, and it is released"
+    );
+    let bc = env.borrower_claims_state(&alice);
+    assert_eq!(bc.penalty_since, env.now);
+    assert_eq!(bc.penalty_until, env.now + 365 * 86_400);
+}
+
+#[test]
+fn a_loan_inside_the_penalty_window_is_denied_with_a_reason_code() {
+    let (mut env, record_key, record) = liquidated_for_claims();
+    let alice = env.alice.pubkey();
+    env.open_borrower_claims(&alice);
+    let mut bc = env.borrower_claims_state(&alice);
+    bc.penalty_since = record.borrow_age_ts - 1;
+    bc.penalty_until = record.borrow_age_ts + 365 * 86_400;
+    overwrite_borrower_claims(&mut env, &alice, &bc);
+
+    let (ref_price, _) = wrongful_ref_and_loss(&record);
+    env.submit_facts(&record_key, &alice, ref_price, ref_price + 1);
+    let claim = env.claim_state(&record_key);
+    assert_eq!(claim.status, ClaimStatus::Denied);
+    assert_eq!(
+        claim.deny_reason,
+        backstop::state::deny_reason::PENALTY_ACTIVE
+    );
+    assert_eq!(env.config_state().reserved_total, 0);
+}
+
+#[test]
+fn a_loan_that_predates_the_penalty_is_still_covered() {
+    // Regression guard for the lower bound: `borrow_age_ts < penalty_until` alone would catch
+    // every older loan too, since `penalty_until` sits in the future by construction.
+    let (mut env, record_key, record) = liquidated_for_claims();
+    let alice = env.alice.pubkey();
+    env.open_borrower_claims(&alice);
+    let mut bc = env.borrower_claims_state(&alice);
+    bc.penalty_since = record.borrow_age_ts + 1;
+    bc.penalty_until = record.borrow_age_ts + 365 * 86_400;
+    overwrite_borrower_claims(&mut env, &alice, &bc);
+
+    let (ref_price, loss) = wrongful_ref_and_loss(&record);
+    env.submit_facts(&record_key, &alice, ref_price, ref_price + 1);
+    let claim = env.claim_state(&record_key);
+    assert_eq!(claim.status, ClaimStatus::Active);
+    assert_eq!(claim.loss, loss);
+}
+
+#[test]
+fn a_suspended_claim_is_frozen_and_its_expiry_clock_does_not_run() {
+    let (mut env, record_key, record) = liquidated_for_claims();
+    let (ref_price, _) = wrongful_ref_and_loss(&record);
+    let alice = env.alice.pubkey();
+    env.submit_facts(&record_key, &alice, ref_price, ref_price + 1);
+    let admin = env.admin.insecure_clone();
+
+    let intruder = env.alice.insecure_clone();
+    let ix = env.suspend_claim_ix(&intruder.pubkey(), &record_key);
+    assert_program_error(env.send(&[ix], &[&intruder]), VerdictError::Unauthorized);
+    let ix = env.unsuspend_claim_ix(&admin.pubkey(), &record_key);
+    assert_program_error(env.send(&[ix], &[&admin]), VerdictError::NotSuspended);
+
+    let ix = env.suspend_claim_ix(&admin.pubkey(), &record_key);
+    env.ok(&[ix], &[&admin]);
+    env.warp(1);
+    let ix = env.suspend_claim_ix(&admin.pubkey(), &record_key);
+    assert_program_error(env.send(&[ix], &[&admin]), VerdictError::AlreadySuspended);
+
+    env.warp(COOLDOWN_SECS + INACTIVITY_EXPIRY_SECS);
+    let stream = env.claim_stream_ix(&record_key, &env.alice_usdc);
+    assert_program_error(
+        env.send(std::slice::from_ref(&stream), &[&admin]),
+        VerdictError::ClaimSuspended,
+    );
+    let expire = env.expire_stale_ix(&record_key);
+    assert_program_error(
+        env.send(std::slice::from_ref(&expire), &[&admin]),
+        VerdictError::ClaimSuspended,
+    );
+
+    let ix = env.unsuspend_claim_ix(&admin.pubkey(), &record_key);
+    env.ok(&[ix], &[&admin]);
+    let claim = env.claim_state(&record_key);
+    assert!(!claim.suspended);
+    assert!(claim.suspended_secs >= COOLDOWN_SECS + INACTIVITY_EXPIRY_SECS);
+
+    // Without the discount this would already be stale: more than 100 days passed since admission.
+    env.warp(1);
+    assert_program_error(
+        env.send(std::slice::from_ref(&expire), &[&admin]),
+        VerdictError::NotYetStale,
+    );
+    env.warp(INACTIVITY_EXPIRY_SECS);
+    env.ok(&[expire], &[&admin]);
+    assert_eq!(env.claim_state(&record_key).status, ClaimStatus::Expired);
+}
+
+#[test]
+fn a_revoked_attestation_can_never_be_submitted() {
+    let (mut env, record_key, record) = liquidated_for_claims();
+    let (ref_price, _) = wrongful_ref_and_loss(&record);
+    let alice = env.alice.pubkey();
+    let admin = env.admin.insecure_clone();
+
+    let intruder = env.alice.insecure_clone();
+    let ix = env.revoke_attestation_ix(&intruder.pubkey(), &record_key, [7; 32]);
+    assert_program_error(env.send(&[ix], &[&intruder]), VerdictError::Unauthorized);
+
+    let ix = env.revoke_attestation_ix(&admin.pubkey(), &record_key, [7; 32]);
+    env.ok(&[ix], &[&admin]);
+    let revoked = env.revoked_state(&record_key, &[7; 32]);
+    assert_eq!(revoked.liquidation_record, record_key);
+    assert_eq!(revoked.evidence_hash, [7; 32]);
+
+    let ixs = env.submit_facts_ixs(&record_key, &alice, ref_price, ref_price + 1);
+    assert_program_error(env.send(&ixs, &[&admin]), VerdictError::AttestationRevoked);
+    assert!(env.svm.get_account(&env.claim_pda(&record_key)).is_none());
+}
+
+#[test]
+fn revoking_a_different_evidence_hash_leaves_this_attestation_valid() {
+    let (mut env, record_key, record) = liquidated_for_claims();
+    let (ref_price, _) = wrongful_ref_and_loss(&record);
+    let alice = env.alice.pubkey();
+    let admin = env.admin.insecure_clone();
+    let ix = env.revoke_attestation_ix(&admin.pubkey(), &record_key, [8; 32]);
+    env.ok(&[ix], &[&admin]);
+    env.submit_facts(&record_key, &alice, ref_price, ref_price + 1);
+    assert_eq!(env.claim_state(&record_key).status, ClaimStatus::Active);
+}
+
+#[test]
+fn a_two_of_two_override_pays_a_denied_claim_only_on_matching_approvals() {
+    let (mut env, record_key, record) = liquidated_for_claims();
+    let alice = env.alice.pubkey();
+    // The oracle's reference agrees with the price used, so check (a) denies.
+    env.submit_facts(&record_key, &alice, record.price_fp, record.price_fp);
+    assert_eq!(env.claim_state(&record_key).status, ClaimStatus::Denied);
+
+    let admin = env.admin.insecure_clone();
+    let co = funded_co_signer(&mut env);
+    let (ref_price, loss) = wrongful_ref_and_loss(&record);
+
+    let ix = env.open_override_ix(&admin.pubkey(), &record_key);
+    env.ok(&[ix], &[&admin]);
+
+    let intruder = env.alice.insecure_clone();
+    let ix = env.approve_override_ix(&intruder.pubkey(), &record_key, &alice, ref_price);
+    assert_program_error(
+        env.send(&[ix], &[&intruder]),
+        VerdictError::CallerNotAdminOrCoSigner,
+    );
+
+    let ix = env.approve_override_ix(&admin.pubkey(), &record_key, &alice, ref_price);
+    env.ok(&[ix], &[&admin]);
+    assert_eq!(
+        env.claim_state(&record_key).status,
+        ClaimStatus::Denied,
+        "one approval alone never executes"
+    );
+
+    let ix = env.approve_override_ix(&co.pubkey(), &record_key, &alice, ref_price + 1);
+    assert_program_error(
+        env.send(&[ix], &[&co]),
+        VerdictError::OverrideParamsMismatch,
+    );
+
+    let ix = env.approve_override_ix(&co.pubkey(), &record_key, &alice, ref_price);
+    env.ok(&[ix], &[&co]);
+    let claim = env.claim_state(&record_key);
+    assert_eq!(claim.status, ClaimStatus::Active);
+    assert_eq!(
+        claim.loss, loss,
+        "loss still comes from the on-chain formula"
+    );
+    assert_eq!(claim.deny_reason, backstop::state::deny_reason::NONE);
+    assert_eq!(env.config_state().reserved_total, loss);
+    assert!(env.override_state(&record_key).executed);
+
+    env.warp(1);
+    let ix = env.approve_override_ix(&co.pubkey(), &record_key, &alice, ref_price);
+    assert_program_error(
+        env.send(&[ix], &[&co]),
+        VerdictError::OverrideAlreadyExecuted,
+    );
+}
+
+#[test]
+fn an_approval_from_a_rotated_out_admin_no_longer_counts() {
+    let (mut env, record_key, record) = liquidated_for_claims();
+    let alice = env.alice.pubkey();
+    env.submit_facts(&record_key, &alice, record.price_fp, record.price_fp);
+    let old_admin = env.admin.insecure_clone();
+    let co = funded_co_signer(&mut env);
+    let (ref_price, _) = wrongful_ref_and_loss(&record);
+
+    let ix = env.open_override_ix(&old_admin.pubkey(), &record_key);
+    env.ok(&[ix], &[&old_admin]);
+    let ix = env.approve_override_ix(&old_admin.pubkey(), &record_key, &alice, ref_price);
+    env.ok(&[ix], &[&old_admin]);
+
+    let new_admin = Keypair::new();
+    env.svm.airdrop(&new_admin.pubkey(), 1_000_000_000).unwrap();
+    let rotate = env.b_ix(
+        backstop::accounts::AdminOnly {
+            admin: old_admin.pubkey(),
+            config: env.b_config(),
+        },
+        backstop::instruction::SetAdmin {
+            admin: new_admin.pubkey(),
+        },
+    );
+    env.ok(&[rotate], &[&old_admin]);
+
+    let ix = env.approve_override_ix(&co.pubkey(), &record_key, &alice, ref_price);
+    env.ok(&[ix], &[&co]);
+    assert_eq!(
+        env.claim_state(&record_key).status,
+        ClaimStatus::Denied,
+        "the stale admin approval must not complete the pair"
+    );
+
+    env.warp(1);
+    let ix = env.approve_override_ix(&old_admin.pubkey(), &record_key, &alice, ref_price);
+    assert_program_error(
+        env.send(&[ix], &[&old_admin]),
+        VerdictError::CallerNotAdminOrCoSigner,
+    );
+    let ix = env.approve_override_ix(&new_admin.pubkey(), &record_key, &alice, ref_price);
+    env.ok(&[ix], &[&new_admin]);
+    assert_eq!(env.claim_state(&record_key).status, ClaimStatus::Active);
+}
+
+#[test]
+fn overriding_a_streaming_claim_carries_what_was_paid_and_never_overpays() {
+    let (mut env, record_key, record) = liquidated_for_claims();
+    let alice = env.alice.pubkey();
+    let (ref1, loss1) = wrongful_ref_and_loss(&record);
+    env.submit_facts(&record_key, &alice, ref1, ref1 + 1);
+    let admin = env.admin.insecure_clone();
+
+    let start = env.balance(&env.alice_usdc);
+    env.warp(COOLDOWN_SECS + STREAM_SECS / 2);
+    let stream = env.claim_stream_ix(&record_key, &env.alice_usdc);
+    env.ok(std::slice::from_ref(&stream), &[&admin]);
+    let s1 = env.balance(&env.alice_usdc) - start;
+    assert!(s1 > 0 && s1 < loss1);
+
+    let ref2 = ref1 * 2;
+    let loss2 = safu_core::loss::wrongful_loss(
+        record.seized_raw,
+        record.collateral_decimals,
+        record.multiplier_fp,
+        ref2,
+        record.debt_repaid,
+    )
+    .unwrap();
+    assert!(loss2 > loss1);
+
+    let co = funded_co_signer(&mut env);
+    let ix = env.open_override_ix(&admin.pubkey(), &record_key);
+    env.ok(&[ix], &[&admin]);
+    let ix = env.approve_override_ix(&admin.pubkey(), &record_key, &alice, ref2);
+    env.ok(&[ix], &[&admin]);
+    let ix = env.approve_override_ix(&co.pubkey(), &record_key, &alice, ref2);
+    env.ok(&[ix], &[&co]);
+
+    let claim = env.claim_state(&record_key);
+    assert_eq!(claim.status, ClaimStatus::Active);
+    assert_eq!(claim.loss, loss2);
+    assert_eq!(
+        claim.streamed, s1,
+        "what already streamed is carried forward"
+    );
+    assert_eq!(env.config_state().reserved_total, loss2 - s1);
+
+    // Still goes through a fresh cooldown.
+    env.warp(60);
+    assert_program_error(
+        env.send(std::slice::from_ref(&stream), &[&admin]),
+        VerdictError::CooldownNotElapsed,
+    );
+
+    // Halfway through the new stream, half of the corrected loss is available — not half minus
+    // what was already paid, which is what re-streaming from zero would give.
+    env.warp(COOLDOWN_SECS - 60 + STREAM_SECS / 2);
+    let before = env.balance(&env.alice_usdc);
+    env.ok(std::slice::from_ref(&stream), &[&admin]);
+    let got = env.balance(&env.alice_usdc) - before;
+    let half = loss2 / 2;
+    assert!(
+        got.abs_diff(half) <= loss2 / 100 + 2,
+        "expected ~{half} halfway through the corrected stream, got {got}"
+    );
+
+    env.warp(STREAM_SECS);
+    env.ok(std::slice::from_ref(&stream), &[&admin]);
+    assert_eq!(
+        env.balance(&env.alice_usdc) - start,
+        loss2,
+        "total paid equals the corrected loss exactly"
+    );
+    let claim = env.claim_state(&record_key);
+    assert_eq!(claim.status, ClaimStatus::Completed);
+    assert_eq!(env.config_state().reserved_total, 0);
+
+    env.warp(1);
+    let ix = env.approve_override_ix(&admin.pubkey(), &record_key, &alice, ref2);
+    assert_program_error(
+        env.send(&[ix], &[&admin]),
+        VerdictError::ClaimAlreadyCompleted,
+    );
+}
+
+// ------------------------------------------------------------------ phase 5: time bounds + measurement
+
+const DAY: i64 = 86_400;
+/// gate, cooldown, stream, inactivity, min_after_wait -- the LOCKED spec values.
+const DEFAULT_TIMING: [i64; 5] = [60 * DAY, 7 * DAY, 45 * DAY, 100 * DAY, 3_600];
+const MAINNET_FLOORS: [i64; 5] = [30 * DAY, 3 * DAY, 14 * DAY, 30 * DAY, 3_600];
+
+fn mainnet_backstop() -> Env {
+    let mut env = base_uninitialized();
+    let admin = env.admin.insecure_clone();
+    let init = |env: &Env, cluster_tag: u8| {
+        env.b_ix(
+            backstop::accounts::InitializeBackstop {
+                admin: admin.pubkey(),
+                program: backstop::ID,
+                program_data: programdata(&backstop::ID),
+                config: env.b_config(),
+                usdc_mint: env.usdc_mint,
+                usdc_vault: env.b_vault(),
+                usdc_token_program: TOKEN_CLASSIC,
+                system_program: SYSTEM,
+            },
+            backstop::instruction::InitializeBackstop {
+                verdict_oracle: env.oracle.pubkey(),
+                co_signer: env.co_signer.pubkey(),
+                cluster_tag,
+                per_claim_cap_bps: CAP_BPS,
+                withdraw_delay_secs: 86_400,
+            },
+        )
+    };
+    let bad = init(&env, 3);
+    assert_program_error(env.send(&[bad], &[&admin]), VerdictError::InvalidParams);
+    let ix = init(&env, CLUSTER_MAINNET);
+    env.ok(&[ix], &[&admin]);
+    env
+}
+
+#[test]
+fn a_fresh_backstop_starts_on_the_locked_spec_timings() {
+    let env = base();
+    let c = env.config_state();
+    assert_eq!(
+        [
+            c.gate_secs,
+            c.cooldown_secs,
+            c.stream_secs,
+            c.inactivity_secs,
+            c.min_after_wait_secs
+        ],
+        DEFAULT_TIMING
+    );
+}
+
+#[test]
+fn devnet_timings_may_go_to_seconds_but_stay_inside_their_bounds() {
+    let mut env = base();
+    let admin = env.admin.insecure_clone();
+    let refused: [[i64; 5]; 7] = [
+        [0, 1, 1, 2, 1],                     // zero gate
+        [1, 1, 0, 2, 1],                     // zero stream
+        [DEFAULT_TIMING[0] + 1, 1, 1, 2, 1], // gate slower than the spec
+        [1, DEFAULT_TIMING[1] + 1, 1, 8 * DAY, 1],
+        [1, 1, 1, 366 * DAY, 1], // inactivity past one year
+        [1, 1, 1, 2, 3_601],     // minimum wait slower than the spec
+        [1, 5, 1, 5, 1],         // inactivity no longer than the cooldown
+    ];
+    for (i, t) in refused.iter().enumerate() {
+        env.warp(1);
+        let ix = env.set_claim_timing_ix(&admin.pubkey(), *t);
+        let result = env.send(&[ix], &[&admin]);
+        assert!(result.is_err(), "case {i} should be refused: {t:?}");
+        assert_program_error(result, VerdictError::InvalidParams);
+    }
+
+    let intruder = env.alice.insecure_clone();
+    let ix = env.set_claim_timing_ix(&intruder.pubkey(), [1, 1, 1, 2, 1]);
+    assert_program_error(env.send(&[ix], &[&intruder]), VerdictError::Unauthorized);
+
+    let ix = env.set_claim_timing_ix(&admin.pubkey(), [1, 1, 1, 2, 1]);
+    env.ok(&[ix], &[&admin]);
+    let c = env.config_state();
+    assert_eq!(
+        [
+            c.gate_secs,
+            c.cooldown_secs,
+            c.stream_secs,
+            c.inactivity_secs,
+            c.min_after_wait_secs
+        ],
+        [1, 1, 1, 2, 1]
+    );
+}
+
+#[test]
+fn mainnet_timings_can_never_drop_below_their_floors() {
+    let mut env = mainnet_backstop();
+    let admin = env.admin.insecure_clone();
+    for field in 0..5 {
+        let mut t = MAINNET_FLOORS;
+        t[field] -= 1;
+        env.warp(1);
+        let ix = env.set_claim_timing_ix(&admin.pubkey(), t);
+        assert_program_error(env.send(&[ix], &[&admin]), VerdictError::InvalidParams);
+    }
+    let ix = env.set_claim_timing_ix(&admin.pubkey(), MAINNET_FLOORS);
+    env.ok(&[ix], &[&admin]);
+    assert_eq!(env.config_state().gate_secs, MAINNET_FLOORS[0]);
+
+    let resale = |env: &Env, floor: i64| {
+        env.b_ix(
+            backstop::accounts::AdminOnly {
+                admin: admin.pubkey(),
+                config: env.b_config(),
+            },
+            backstop::instruction::SetPoolLiquidationParams {
+                per_liq_cap_bps: 1_000,
+                daily_liq_cap_bps: 2_500,
+                resale_discount_bps: 200,
+                resale_floor_secs: floor,
+                fee_share_bps: 1_000,
+                min_pool_repay: 10 * USDC,
+            },
+        )
+    };
+    let ix = resale(&env, 2 * DAY - 1);
+    assert_program_error(env.send(&[ix], &[&admin]), VerdictError::InvalidParams);
+    let ix = resale(&env, 2 * DAY);
+    env.ok(&[ix], &[&admin]);
+    assert_eq!(env.config_state().resale_floor_secs, 2 * DAY);
+}
+
+#[test]
+fn a_timing_change_never_reaches_a_claim_already_admitted() {
+    let (mut env, record_key, record) = liquidated_for_claims();
+    let (ref_price, loss) = wrongful_ref_and_loss(&record);
+    let alice = env.alice.pubkey();
+    env.submit_facts(&record_key, &alice, ref_price, ref_price + 1);
+    let before = env.claim_state(&record_key);
+    assert_eq!(before.status, ClaimStatus::Active);
+
+    let admin = env.admin.insecure_clone();
+    let ix = env.set_claim_timing_ix(&admin.pubkey(), [1, 1, 1, 2, 1]);
+    env.ok(&[ix], &[&admin]);
+
+    let after = env.claim_state(&record_key);
+    assert_eq!(after.cooldown_end, before.cooldown_end);
+    assert_eq!(after.stream_end - after.cooldown_end, DEFAULT_TIMING[2]);
+    assert_eq!(after.inactivity_secs, DEFAULT_TIMING[3]);
+
+    // Halfway through its own 45-day stream it has vested half -- not everything, as a 1 s stream would.
+    env.warp(COOLDOWN_SECS + STREAM_SECS / 2);
+    let start = env.balance(&env.alice_usdc);
+    let stream = env.claim_stream_ix(&record_key, &env.alice_usdc);
+    env.ok(&[stream], &[&admin]);
+    let got = env.balance(&env.alice_usdc) - start;
+    assert!(
+        got.abs_diff(loss / 2) <= loss / 100 + 2,
+        "expected ~half of {loss}, got {got}"
+    );
+
+    // And its 100-day inactivity window still holds, not the new 2 s one.
+    env.warp(3);
+    let expire = env.expire_stale_ix(&record_key);
+    assert_program_error(env.send(&[expire], &[&admin]), VerdictError::NotYetStale);
+}
+
+#[test]
+fn a_whole_claim_runs_on_short_devnet_timings() {
+    let mut env = with_loan();
+    env.back(1_000_000 * USDC);
+    liquidate(&mut env, None, 75); // the price walk ages the loan ~12 hours
+    let record = env.record_state(0);
+    let record_key = env.record(0);
+    let (ref_price, loss) = wrongful_ref_and_loss(&record);
+    let alice = env.alice.pubkey();
+    let admin = env.admin.insecure_clone();
+
+    // Under the default 1-hour minimum wait, a reference taken 2 minutes after the liquidation is refused.
+    let quick_after = record.ts + 120;
+    let ixs =
+        env.submit_facts_ixs_after(&record_key, &alice, ref_price, ref_price + 1, quick_after);
+    assert_program_error(env.send(&ixs, &[&admin]), VerdictError::InvalidAfterWindow);
+
+    // gate 1 day, cooldown 60 s, stream 5 min, inactivity 1 h, minimum wait 60 s.
+    let ix = env.set_claim_timing_ix(&admin.pubkey(), [DAY, 60, 300, 3_600, 60]);
+    env.ok(&[ix], &[&admin]);
+    env.warp(1);
+    let ixs =
+        env.submit_facts_ixs_after(&record_key, &alice, ref_price, ref_price + 1, quick_after);
+    env.ok(&ixs, &[&admin]);
+    let claim = env.claim_state(&record_key);
+    assert_eq!(claim.status, ClaimStatus::PendingTime);
+    assert_eq!(claim.releasable_at, record.borrow_age_ts + DAY);
+
+    env.warp(claim.releasable_at - env.now);
+    let unlock = env.unlock_claim_ix(&record_key);
+    env.ok(&[unlock], &[&admin]);
+    let claim = env.claim_state(&record_key);
+    assert_eq!(claim.status, ClaimStatus::Active);
+    assert_eq!(claim.cooldown_end, env.now + 60);
+    assert_eq!(claim.stream_end, env.now + 360);
+
+    let start = env.balance(&env.alice_usdc);
+    env.warp(360);
+    let stream = env.claim_stream_ix(&record_key, &env.alice_usdc);
+    env.ok(&[stream], &[&admin]);
+    assert_eq!(env.balance(&env.alice_usdc) - start, loss);
+    assert_eq!(env.claim_state(&record_key).status, ClaimStatus::Completed);
+}
+
+/// T3 (eng review): measure, don't assume. Legacy transactions, no lookup tables, default client
+/// setup. Limits: 1,400,000 compute units per transaction, 1,232 bytes per packet.
+#[test]
+fn heaviest_transactions_fit_solana_compute_and_size_limits() {
+    const MAX_CU: u64 = 1_400_000;
+    const MAX_TX_BYTES: usize = 1_232;
+    let mut env = with_loan();
+    let admin = env.admin.insecure_clone();
+    let alice = env.alice.pubkey();
+    let register = env.v_ix(
+        stock_vault::accounts::AdminOnly {
+            admin: admin.pubkey(),
+            config: vpda(&[VCONFIG_SEED]),
+        },
+        stock_vault::instruction::SetPoolLiquidator {
+            pool_liquidator: env.b_config(),
+        },
+    );
+    env.ok(&[register], &[&admin]);
+    env.back(1_000_000 * USDC);
+    let open_inv = env.open_inventory_ix(&admin.pubkey());
+    env.ok(&[open_inv], &[&admin]);
+    env.walk_price_to(PRICE * 75 / 100);
+
+    let mut rows: Vec<(&str, u64, usize)> = Vec::new();
+
+    let (crank, crank_usdc) = env.new_funded(0);
+    let seq = env.market_state().liq_seq;
+    let ix = env.pool_liquidate_ix(&crank.pubkey(), &crank_usdc, seq, &alice, 50_000 * USDC);
+    let (cu, size) = env.send_measured(&[ix], &[&crank]);
+    rows.push(("pool_liquidate (CPI into liquidate)", cu, size));
+
+    // Short gate so submission takes the heavier admit-straight-to-Active path.
+    let ix = env.set_claim_timing_ix(&admin.pubkey(), [1, 60, 300, 3_600, 3_600]);
+    env.ok(&[ix], &[&admin]);
+    env.warp(10);
+    let record_key = env.record(seq);
+    let record = env.record_state(seq);
+    let (ref_price, _) = wrongful_ref_and_loss(&record);
+    let ixs = env.submit_facts_ixs(&record_key, &alice, ref_price, ref_price + 1);
+    let (cu, size) = env.send_measured(&ixs, &[&admin]);
+    rows.push(("ed25519 + submit_facts (admits)", cu, size));
+    assert_eq!(env.claim_state(&record_key).status, ClaimStatus::Active);
+
+    let co = funded_co_signer(&mut env);
+    let ix = env.open_override_ix(&admin.pubkey(), &record_key);
+    env.ok(&[ix], &[&admin]);
+    let ix = env.approve_override_ix(&admin.pubkey(), &record_key, &alice, ref_price * 2);
+    let (cu, size) = env.send_measured(&[ix], &[&admin]);
+    rows.push(("approve_override (first approval)", cu, size));
+    let ix = env.approve_override_ix(&co.pubkey(), &record_key, &alice, ref_price * 2);
+    let (cu, size) = env.send_measured(&[ix], &[&co]);
+    rows.push(("approve_override (executes)", cu, size));
+
+    env.warp(60 + 150);
+    let ix = env.claim_stream_ix(&record_key, &env.alice_usdc);
+    let (cu, size) = env.send_measured(&[ix], &[&admin]);
+    rows.push(("claim_stream", cu, size));
+
+    for (name, cu, size) in &rows {
+        println!("T3 | {name:<38} | {cu:>7} CU | {size:>5} bytes");
+        assert!(*cu < MAX_CU, "{name}: {cu} CU exceeds {MAX_CU}");
+        assert!(
+            *size <= MAX_TX_BYTES,
+            "{name}: {size} bytes exceeds {MAX_TX_BYTES}"
+        );
+    }
 }

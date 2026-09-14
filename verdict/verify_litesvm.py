@@ -79,6 +79,7 @@ def build_backstop_config(
     b += bytes([1])  # version
     b += bytes(admin)
     b += bytes(verdict_oracle)
+    b += bytes(Pubkey.new_unique())  # co_signer (phase 4); unused by submit_facts, must differ from both
     b += bytes([cluster_tag])
     b += bytes([bump])
     b += bytes(usdc_mint)
@@ -98,6 +99,11 @@ def build_backstop_config(
     b += _i64(4 * 86_400)  # resale_floor_secs
     b += _u32(1_000)  # fee_share_bps
     b += _u64(10_000_000)  # min_pool_repay
+    b += _i64(60 * 86_400)  # gate_secs (phase 5)
+    b += _i64(7 * 86_400)  # cooldown_secs
+    b += _i64(45 * 86_400)  # stream_secs
+    b += _i64(100 * 86_400)  # inactivity_secs
+    b += _i64(3_600)  # min_after_wait_secs
     b += bytes(16)  # reserved
     return bytes(b)
 
@@ -109,6 +115,8 @@ def build_borrower_claims(*, bump: int, market: Pubkey, borrower: Pubkey) -> byt
     b += bytes(market)
     b += bytes(borrower)
     b += bytes(32)  # open = default (free slot)
+    b += _i64(0)  # penalty_since (phase 4)
+    b += _i64(0)  # penalty_until (phase 4)
     b += bytes(32)  # reserved
     return bytes(b)
 
