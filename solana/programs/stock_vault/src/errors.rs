@@ -48,6 +48,8 @@ pub enum VaultError {
     NotUpgradeAuthority,
     #[msg("Admin cannot be the default key")]
     InvalidAdmin,
+    #[msg("Payback address cannot be the default key, the vault admin or the feed authority")]
+    InvalidPayoutAddress,
 }
 
 impl From<safu_core::CoreError> for VaultError {

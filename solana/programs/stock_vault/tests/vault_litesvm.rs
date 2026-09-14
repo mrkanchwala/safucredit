@@ -2032,6 +2032,136 @@ fn an_unannounced_dividend_step_does_not_halt_the_market() {
     );
 }
 
+// ============================================================ 4a: loan age and payback address
+
+impl Env {
+    fn set_payout_ix(&self, signer: &Pubkey, borrower: &Pubkey, payout: &Pubkey) -> Instruction {
+        Instruction {
+            program_id: stock_vault::ID,
+            accounts: stock_vault::accounts::SetPayoutAddress {
+                owner: *signer,
+                config: self.config(),
+                position: self.position(borrower),
+            }
+            .to_account_metas(None),
+            data: stock_vault::instruction::SetPayoutAddress { payout: *payout }.data(),
+        }
+    }
+
+    /// Warps and pushes an unchanged price, so a borrow after a long gap has a fresh price to use.
+    fn warp_with_fresh_price(&mut self, secs: i64) {
+        let feed = self.feed.insecure_clone();
+        self.warp(secs);
+        let ix = self.push_price_ix(&feed.pubkey(), PRICE, true, PRICE);
+        self.ok(&[ix], &[&feed]);
+    }
+}
+
+#[test]
+fn loan_age_starts_at_the_first_borrow_and_a_big_top_up_makes_the_loan_young() {
+    let mut env = full();
+    let alice = env.alice.insecure_clone();
+    assert_eq!(env.position_state(&alice.pubkey()).borrow_age_ts, 0);
+
+    let t0 = env.now;
+    let ix = env.borrow_ix(&alice.pubkey(), &env.alice_usdc, 100 * USDC);
+    env.ok(&[ix], &[&alice]);
+    assert_eq!(env.position_state(&alice.pubkey()).borrow_age_ts, t0);
+
+    // Fifty days later she borrows nine times as much: the loan now reads about five days old, not fifty.
+    env.warp_with_fresh_price(50 * 86_400);
+    let t1 = env.now;
+    let ix = env.borrow_ix(&alice.pubkey(), &env.alice_usdc, 900 * USDC);
+    env.ok(&[ix], &[&alice]);
+    let age = env.position_state(&alice.pubkey()).borrow_age_ts;
+    let expected = t1 - 5 * 86_400; // (100·t0 + 900·t1) / 1000
+    assert!(
+        (age - expected).abs() <= 3_600,
+        "age {age}, expected about {expected} (interest on the first $100 moves it by minutes)"
+    );
+}
+
+#[test]
+fn a_small_top_up_barely_moves_the_loan_age() {
+    let mut env = full();
+    let alice = env.alice.insecure_clone();
+    let t0 = env.now;
+    let ix = env.borrow_ix(&alice.pubkey(), &env.alice_usdc, 1_000 * USDC);
+    env.ok(&[ix], &[&alice]);
+
+    env.warp_with_fresh_price(50 * 86_400);
+    let ix = env.borrow_ix(&alice.pubkey(), &env.alice_usdc, 10 * USDC);
+    env.ok(&[ix], &[&alice]);
+    let age = env.position_state(&alice.pubkey()).borrow_age_ts;
+    // $10 on top of ~$1,000 moves a fifty-day-old loan by under twelve hours.
+    assert!(age > t0 && age - t0 < 12 * 3_600, "moved {}s", age - t0);
+}
+
+#[test]
+fn partial_repayment_keeps_the_age_and_full_repayment_resets_it() {
+    let mut env = full();
+    let (alice, issuer) = (env.alice.insecure_clone(), env.issuer.insecure_clone());
+    let t0 = env.now;
+    let ix = env.borrow_ix(&alice.pubkey(), &env.alice_usdc, 100 * USDC);
+    env.ok(&[ix], &[&alice]);
+    let (usdc, alice_usdc) = (env.usdc_mint, env.alice_usdc);
+    mint_to(
+        &mut env.svm,
+        &issuer,
+        &usdc,
+        &alice_usdc,
+        10 * USDC,
+        &TOKEN_CLASSIC,
+    );
+
+    env.warp(86_400);
+    let ix = env.repay_ix(&alice.pubkey(), &alice_usdc, &alice.pubkey(), 10 * USDC);
+    env.ok(&[ix], &[&alice]);
+    assert_eq!(env.position_state(&alice.pubkey()).borrow_age_ts, t0);
+
+    env.warp(60);
+    let ix = env.repay_ix(&alice.pubkey(), &alice_usdc, &alice.pubkey(), 200 * USDC);
+    env.ok(&[ix], &[&alice]);
+    let p = env.position_state(&alice.pubkey());
+    assert_eq!((p.debt_shares, p.borrow_age_ts), (0, 0));
+
+    // The next borrow is a new loan.
+    env.warp_with_fresh_price(3_600);
+    let t2 = env.now;
+    let ix = env.borrow_ix(&alice.pubkey(), &alice_usdc, 50 * USDC);
+    env.ok(&[ix], &[&alice]);
+    assert_eq!(env.position_state(&alice.pubkey()).borrow_age_ts, t2);
+}
+
+#[test]
+fn only_the_owner_sets_the_payback_address_and_never_to_a_vault_key() {
+    let mut env = full();
+    let (alice, bob, admin, feed) = (
+        env.alice.insecure_clone(),
+        env.bob.insecure_clone(),
+        env.admin.insecure_clone(),
+        env.feed.insecure_clone(),
+    );
+    assert_eq!(env.position_state(&alice.pubkey()).payout, alice.pubkey());
+
+    let ix = env.set_payout_ix(&bob.pubkey(), &alice.pubkey(), &bob.pubkey());
+    assert_program_error(env.send(&[ix], &[&bob]), VaultError::Unauthorized);
+
+    for (i, bad) in [Pubkey::default(), admin.pubkey(), feed.pubkey()]
+        .iter()
+        .enumerate()
+    {
+        env.warp(1 + i as i64);
+        let ix = env.set_payout_ix(&alice.pubkey(), &alice.pubkey(), bad);
+        assert_program_error(env.send(&[ix], &[&alice]), VaultError::InvalidPayoutAddress);
+    }
+
+    let cold = Pubkey::new_unique();
+    let ix = env.set_payout_ix(&alice.pubkey(), &alice.pubkey(), &cold);
+    env.ok(&[ix], &[&alice]);
+    assert_eq!(env.position_state(&alice.pubkey()).payout, cold);
+}
+
 // ============================================================ 2b: liquidation
 
 impl Env {
@@ -2260,6 +2390,31 @@ fn tightening_the_liquidation_line_reaches_an_existing_loan_only_over_seven_days
     push_low(&mut env, 5 * 86_400);
     let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 100 * USDC);
     env.ok(&[ix], &[&liq]);
+}
+
+#[test]
+fn the_liquidation_record_freezes_the_loan_age_and_payback_address() {
+    let mut env = lending_env();
+    let alice = env.alice.insecure_clone();
+    let (liq, lu, lc) = env.new_liquidator(10_000 * USDC);
+    let cold = Pubkey::new_unique();
+    let ix = env.set_payout_ix(&alice.pubkey(), &alice.pubkey(), &cold);
+    env.ok(&[ix], &[&alice]);
+    let age = env.position_state(&alice.pubkey()).borrow_age_ts;
+    assert!(age > 0);
+
+    env.walk_price_to(PRICE * 75 / 100);
+    let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 100 * USDC);
+    env.ok(&[ix], &[&liq]);
+    let r = env.record_state(0);
+    assert_eq!((r.payout, r.borrow_age_ts), (cold, age));
+
+    // A later change, or someone holding Alice's key, cannot redirect what is already owed.
+    let other = Pubkey::new_unique();
+    let ix = env.set_payout_ix(&alice.pubkey(), &alice.pubkey(), &other);
+    env.ok(&[ix], &[&alice]);
+    assert_eq!(env.position_state(&alice.pubkey()).payout, other);
+    assert_eq!(env.record_state(0).payout, cold);
 }
 
 #[test]

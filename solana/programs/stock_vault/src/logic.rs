@@ -303,6 +303,27 @@ pub fn value_of(m: &Market, raw: u64, multiplier_fp: u128, price: u64) -> Result
     ))
 }
 
+// ------------------------------------------------------------------ loan age
+
+/// Debt-weighted borrow time after borrowing `amount` on top of `old_debt` carried at `old_age_ts`:
+/// `(old_debt·old_age + amount·now) / (old_debt + amount)`, rounded toward `now` so a loan never reads
+/// older than it is. With no existing debt it is simply `now`.
+pub fn weighted_borrow_age(old_debt: u64, old_age_ts: i64, amount: u64, now: i64) -> Result<i64> {
+    if old_debt == 0 {
+        return Ok(now);
+    }
+    let weight = old_debt as i128 + amount as i128;
+    let num = (old_debt as i128 * old_age_ts as i128)
+        .checked_add(amount as i128 * now as i128)
+        .ok_or(VaultError::MathOverflow)?;
+    let mut age = num.div_euclid(weight);
+    if num.rem_euclid(weight) != 0 {
+        age += 1;
+    }
+    let age = i64::try_from(age).map_err(|_| VaultError::MathOverflow)?;
+    Ok(age.min(now))
+}
+
 // ------------------------------------------------------------------ liquidation terms ramp (U3)
 
 /// Terms moving from `from` to `to`, each on its own straight line over the same window.
@@ -349,6 +370,32 @@ pub fn ramp_start_terms(current: LiquidationTerms, new: LiquidationTerms) -> Liq
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn borrow_age_is_weighted_by_size_and_never_reads_older() {
+        let day = 86_400;
+        assert_eq!(
+            weighted_borrow_age(0, 0, 500, 1_000).unwrap(),
+            1_000,
+            "first borrow"
+        );
+        // $100 at day 0, $900 at day 50 → day 45.
+        assert_eq!(
+            weighted_borrow_age(100, 0, 900, 50 * day).unwrap(),
+            45 * day
+        );
+        // $1,000 at day 0, $10 at day 50 → about 11.9 hours in, rounded toward now.
+        let small = weighted_borrow_age(1_000, 0, 10, 50 * day).unwrap();
+        assert_eq!(small, (10 * 50 * day + 1_009) / 1_010);
+        assert!(small > 0 && small < 12 * 3_600);
+        // Rounds toward now: 1 part at t=0, 2 parts at t=1 → 2/3, reads as 1.
+        assert_eq!(weighted_borrow_age(1, 0, 2, 1).unwrap(), 1);
+        // A zero-sized top-up changes nothing.
+        assert_eq!(weighted_borrow_age(1_000, 123, 0, 999).unwrap(), 123);
+        // Extremes: no panic, never after now.
+        assert!(weighted_borrow_age(u64::MAX, i64::MAX, u64::MAX, i64::MAX).is_err());
+        assert_eq!(weighted_borrow_age(u64::MAX, 0, u64::MAX, 2).unwrap(), 1);
+    }
 
     fn terms(thr: u32, ins: u32, close: u32, min: u32, max: u32) -> LiquidationTerms {
         LiquidationTerms {

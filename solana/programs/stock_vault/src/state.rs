@@ -207,6 +207,13 @@ pub struct Position {
     pub debt_shares: u128,
     /// Coverage in force when this loan was opened (U3: later changes never shrink an open loan's cover).
     pub coverage_bps: u32,
+    /// Debt-weighted borrow time (unix seconds), 0 while there is no debt. Each borrow pulls it toward
+    /// now in proportion to its size; full repayment resets it. The backstop's 60-day gate reads it, so
+    /// a tiny early loan topped up after a price breaks still counts as young.
+    pub borrow_age_ts: i64,
+    /// Where a wrongful-liquidation payback goes. Defaults to the owner, who may change it. A liquidation
+    /// record freezes it, so nobody can redirect a payback after the fact.
+    pub payout: Pubkey,
     pub reserved: [u8; 32],
 }
 
@@ -250,6 +257,10 @@ pub struct LiquidationRecord {
     pub ltv_bps: u32,
     /// Coverage in force for this borrower when the loan was opened (U3).
     pub coverage_bps: u32,
+    /// The loan's debt-weighted borrow time at the moment of liquidation (for the 60-day gate).
+    pub borrow_age_ts: i64,
+    /// Payback address at the moment of liquidation. Frozen here; later changes cannot redirect it.
+    pub payout: Pubkey,
     /// Debt written off because the collateral ran out, 0 in the normal case.
     pub bad_debt: u64,
     pub ts: i64,

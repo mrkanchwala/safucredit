@@ -198,6 +198,30 @@ pub mod stock_vault {
         position.raw_collateral = 0;
         position.debt_shares = 0;
         position.coverage_bps = 0;
+        position.borrow_age_ts = 0;
+        position.payout = ctx.accounts.owner.key();
+        position.reserved = [0; 32];
+        Ok(())
+    }
+
+    /// Where this position's wrongful-liquidation payback goes. Owner only. Refuses the default key and
+    /// the vault's own admin and feed keys (the backstop refuses its oracle and co-signer at payout). A
+    /// liquidation record freezes the address, so a later change, or a stolen key, cannot redirect a
+    /// payback already owed.
+    pub fn set_payout_address(ctx: Context<SetPayoutAddress>, payout: Pubkey) -> Result<()> {
+        let config = &ctx.accounts.config;
+        require!(
+            payout != Pubkey::default()
+                && payout != config.admin
+                && payout != config.feed_authority,
+            VaultError::InvalidPayoutAddress
+        );
+        let position = &mut ctx.accounts.position;
+        position.payout = payout;
+        emit!(PayoutAddressSet {
+            position: position.key(),
+            payout
+        });
         Ok(())
     }
 
@@ -448,6 +472,13 @@ pub mod stock_vault {
         if position.debt_shares == 0 {
             position.coverage_bps = FULL_COVERAGE_BPS;
         }
+        // Loan age for the backstop's 60-day gate: a new loan starts now; a top-up pulls the age toward
+        // now in proportion to its size (so a tiny early loan cannot make a large late one look old).
+        position.borrow_age_ts = if position.debt_shares == 0 {
+            now
+        } else {
+            weighted_borrow_age(debt, position.borrow_age_ts, amount, now)?
+        };
         let shares = logic::core(shares_for_borrow(amount, market.borrow_index))?;
         position.debt_shares = position
             .debt_shares
@@ -516,6 +547,10 @@ pub mod stock_vault {
         )?;
 
         position.debt_shares -= burn;
+        if position.debt_shares == 0 {
+            // Fully repaid: the next borrow is a new loan with a fresh age.
+            position.borrow_age_ts = 0;
+        }
         market.total_borrow_shares = market.total_borrow_shares.saturating_sub(burn);
         market.cash = market
             .cash
@@ -637,6 +672,8 @@ pub mod stock_vault {
         let price = risk_price(market, now, PriceUse::Liquidate)?;
 
         let position = &mut ctx.accounts.position;
+        // Frozen into the record below, before any reset: the gate and the payback use these as they were.
+        let (borrow_age_ts, payout) = (position.borrow_age_ts, position.payout);
         let value = value_of(market, position.raw_collateral, multiplier_fp, price)?;
         let debt = logic::core(debt_for_shares(position.debt_shares, market.borrow_index))?;
         // U3: the terms in force now, which may still be ramping toward a tightened `params`.
@@ -747,6 +784,10 @@ pub mod stock_vault {
                 .ok_or(VaultError::MathOverflow)?;
         }
 
+        if position.debt_shares == 0 {
+            position.borrow_age_ts = 0;
+        }
+
         let seq = market.liq_seq;
         market.liq_seq = seq.checked_add(1).ok_or(VaultError::MathOverflow)?;
         let issuer_halt = market.issuer_halt;
@@ -767,6 +808,8 @@ pub mod stock_vault {
         record.bonus_bps = bonus_bps;
         record.ltv_bps = ltv_bps;
         record.coverage_bps = position.coverage_bps;
+        record.borrow_age_ts = borrow_age_ts;
+        record.payout = payout;
         record.bad_debt = bad_debt;
         record.ts = now;
         record.slot = slot;
@@ -909,6 +952,20 @@ pub struct OpenSupplier<'info> {
     )]
     pub supplier: Account<'info, Supplier>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct SetPayoutAddress<'info> {
+    pub owner: Signer<'info>,
+    #[account(seeds = [VCONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, VaultConfig>,
+    #[account(
+        mut,
+        seeds = [POSITION_SEED, position.market.as_ref(), position.owner.as_ref()],
+        bump = position.bump,
+        has_one = owner @ VaultError::Unauthorized,
+    )]
+    pub position: Account<'info, Position>,
 }
 
 #[derive(Accounts)]
@@ -1148,6 +1205,12 @@ pub struct LiquidationTermsTightening {
     pub to: LiquidationTerms,
     pub starts: i64,
     pub completes: i64,
+}
+
+#[event]
+pub struct PayoutAddressSet {
+    pub position: Pubkey,
+    pub payout: Pubkey,
 }
 
 #[event]
