@@ -158,13 +158,24 @@ pub fn total_borrows(m: &Market) -> Result<u64> {
     core(debt_for_shares(m.total_borrow_shares, m.borrow_index))
 }
 
-/// Supplier-owned value: cash plus what borrowers owe, less recognised bad debt.
+/// Supplier-owned value: cash plus what borrowers still owe.
+///
+/// `bad_debt` is deliberately NOT subtracted here. Writing debt off already removes its shares from
+/// `total_borrow_shares`, so the loss lands on suppliers at that moment through `total_borrows`;
+/// subtracting it again would charge them twice. The field is a memo of what the backstop owes this
+/// market, and is reduced when the backstop pays it in.
 pub fn total_assets(m: &Market) -> Result<u64> {
-    let assets = m
-        .cash
+    m.cash
         .checked_add(total_borrows(m)?)
-        .ok_or(VaultError::MathOverflow)?;
-    Ok(assets.saturating_sub(m.bad_debt))
+        .ok_or_else(|| VaultError::MathOverflow.into())
+}
+
+/// D4: the issuer holds a permanent delegate over the mint and can burn straight out of the vault's
+/// own token account. Any risk action first checks that the tokens the market thinks it holds are
+/// actually there — seizing or releasing collateral on the strength of a stale number would take it
+/// from whoever is still in the pool.
+pub fn reconciliation_short(vault_amount: u64, m: &Market) -> bool {
+    vault_amount < m.total_collateral_raw
 }
 
 pub fn accrue(m: &mut Market, now: i64) -> Result<()> {

@@ -24,8 +24,9 @@ use spl_token_2022_interface::{
 use stock_vault::{
     errors::VaultError,
     state::{
-        Market, MarketParams, Position, RateParams, Supplier, VaultConfig, COLL_VAULT_SEED,
-        MARKET_SEED, POSITION_SEED, SUPPLIER_SEED, USDC_VAULT_SEED, VCONFIG_SEED,
+        LiquidationRecord, Market, MarketParams, Position, RateParams, Supplier, VaultConfig,
+        COLL_VAULT_SEED, LIQ_RECORD_SEED, MARKET_SEED, POSITION_SEED, SUPPLIER_SEED,
+        USDC_VAULT_SEED, VCONFIG_SEED,
     },
 };
 
@@ -258,7 +259,8 @@ fn create_t22_mint(
             &TOKEN_2022,
             &mint.pubkey(),
             &issuer.pubkey(),
-            None,
+            // Live AAPLx has a freeze authority; the mock carries one so the guard is testable.
+            Some(&issuer.pubkey()),
             decimals,
         )
         .unwrap(),
@@ -1859,4 +1861,514 @@ fn an_unannounced_dividend_step_does_not_halt_the_market() {
         after != baseline && after == env.mult_fp(),
         "a sub-threshold change moves the baseline instead of halting"
     );
+}
+
+// ============================================================ 2b: liquidation
+
+impl Env {
+    fn record_pda(&self, seq: u64) -> Pubkey {
+        pda(&[
+            LIQ_RECORD_SEED,
+            self.market().as_ref(),
+            seq.to_le_bytes().as_ref(),
+        ])
+    }
+
+    fn record_state(&self, seq: u64) -> LiquidationRecord {
+        let acc = self
+            .svm
+            .get_account(&self.record_pda(seq))
+            .expect("record exists");
+        LiquidationRecord::try_deserialize(&mut acc.data.as_slice()).unwrap()
+    }
+
+    fn liquidate_ix(
+        &self,
+        liquidator: &Pubkey,
+        liq_usdc: &Pubkey,
+        liq_coll: &Pubkey,
+        borrower: &Pubkey,
+        repay: u64,
+    ) -> Instruction {
+        Instruction {
+            program_id: stock_vault::ID,
+            accounts: stock_vault::accounts::Liquidate {
+                liquidator: *liquidator,
+                config: self.config(),
+                market: self.market(),
+                position: self.position(borrower),
+                record: self.record_pda(self.market_state().liq_seq),
+                collateral_mint: self.coll_mint,
+                usdc_mint: self.usdc_mint,
+                liquidator_usdc: *liq_usdc,
+                liquidator_collateral: *liq_coll,
+                collateral_vault: self.coll_vault(),
+                usdc_vault: self.usdc_vault(),
+                collateral_token_program: TOKEN_2022,
+                usdc_token_program: TOKEN_CLASSIC,
+                system_program: SYSTEM,
+            }
+            .to_account_metas(None),
+            data: stock_vault::instruction::Liquidate {
+                repay_amount: repay,
+            }
+            .data(),
+        }
+    }
+
+    fn sync_issuer_ix(&self) -> Instruction {
+        Instruction {
+            program_id: stock_vault::ID,
+            accounts: stock_vault::accounts::SyncIssuerState {
+                market: self.market(),
+                collateral_mint: self.coll_mint,
+                collateral_vault: self.coll_vault(),
+            }
+            .to_account_metas(None),
+            data: stock_vault::instruction::SyncIssuerState {}.data(),
+        }
+    }
+
+    /// A funded liquidator with both token accounts open.
+    fn new_liquidator(&mut self, usdc: u64) -> (Keypair, Pubkey, Pubkey) {
+        let who = Keypair::new();
+        self.svm.airdrop(&who.pubkey(), 100_000_000_000).unwrap();
+        let (usdc_mint, coll_mint) = (self.usdc_mint, self.coll_mint);
+        let u = create_token_account(
+            &mut self.svm,
+            &who,
+            &usdc_mint,
+            &who.pubkey(),
+            &TOKEN_CLASSIC,
+        );
+        let c = create_token_account(&mut self.svm, &who, &coll_mint, &who.pubkey(), &TOKEN_2022);
+        let issuer = self.issuer.insecure_clone();
+        mint_to(&mut self.svm, &issuer, &usdc_mint, &u, usdc, &TOKEN_CLASSIC);
+        (who, u, c)
+    }
+
+    /// Walks the feed down to `target` the way a real 5-minute feed would, in steps small enough to
+    /// stay inside the deviation cap against the trailing TWAP. A price crash cannot be staged as
+    /// one print: the spike guard would flag it, which is exactly the behaviour tested elsewhere.
+    fn walk_price_to(&mut self, target: u64) {
+        let feed = self.feed.insecure_clone();
+        for _ in 0..400 {
+            let current = self.market_state().price.last_price;
+            if current <= target {
+                return;
+            }
+            let next = (current * 996 / 1_000).max(target);
+            self.warp(600);
+            let ix = self.push_price_ix(&feed.pubkey(), next, true, PRICE);
+            self.ok(&[ix], &[&feed]);
+            assert!(
+                !self.market_state().price.flagged,
+                "walk step to {next} was flagged; steps must stay inside the deviation cap"
+            );
+        }
+        panic!("price walk never reached {target}");
+    }
+
+    fn freeze_vault(&mut self) {
+        let issuer = self.issuer.insecure_clone();
+        let ix = spl_token_2022_interface::instruction::freeze_account(
+            &TOKEN_2022,
+            &self.coll_vault(),
+            &self.coll_mint,
+            &issuer.pubkey(),
+            &[],
+        )
+        .unwrap();
+        self.ok(&[ix], &[&issuer]);
+    }
+
+    /// Simulates the mint's permanent delegate burning straight out of the vault, which is what D4
+    /// exists to catch. Written directly because the mock mint has no delegate configured.
+    fn shrink_vault_balance(&mut self, by: u64) {
+        let key = self.coll_vault();
+        let mut acc = self.svm.get_account(&key).unwrap();
+        let amount = u64::from_le_bytes(acc.data[64..72].try_into().unwrap());
+        acc.data[64..72].copy_from_slice(&(amount - by).to_le_bytes());
+        self.svm.set_account(key, acc).unwrap();
+    }
+}
+
+/// A market with a borrower at the loan-to-value limit and a thin supply, so the position can be
+/// walked underwater by the feed alone.
+fn lending_env() -> Env {
+    let mut env = with_market();
+    let (alice, bob, feed) = (
+        env.alice.insecure_clone(),
+        env.bob.insecure_clone(),
+        env.feed.insecure_clone(),
+    );
+    let (supply, deposit, push) = (
+        env.supply_ix(&bob.pubkey(), &env.bob_usdc, 50_000 * USDC),
+        env.deposit_collateral_ix(&alice.pubkey(), &env.alice_coll, 10 * ONE_SHARE),
+        env.push_price_ix(&feed.pubkey(), PRICE, true, PRICE),
+    );
+    env.ok(&[supply], &[&bob]);
+    env.ok(&[deposit], &[&alice]);
+    env.ok(&[push], &[&feed]);
+
+    let limit = env.borrow_limit(10 * ONE_SHARE, PRICE);
+    let borrow = env.borrow_ix(&alice.pubkey(), &env.alice_usdc, limit);
+    env.ok(&[borrow], &[&alice]);
+    env
+}
+
+#[test]
+fn a_healthy_position_cannot_be_liquidated() {
+    let mut env = lending_env();
+    let alice = env.alice.insecure_clone();
+    let (liq, lu, lc) = env.new_liquidator(10_000 * USDC);
+    env.warp(60);
+    let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 100 * USDC);
+    assert_program_error(env.send(&[ix], &[&liq]), VaultError::NotLiquidatable);
+}
+
+#[test]
+fn exactly_at_the_threshold_is_not_liquidatable_but_one_step_past_it_is() {
+    let mut env = lending_env();
+    let alice = env.alice.insecure_clone();
+    let (liq, lu, lc) = env.new_liquidator(10_000 * USDC);
+
+    // LTV starts at the 40% borrow limit; the line is 50%, so value must fall by a fifth.
+    env.walk_price_to(PRICE * 81 / 100);
+    let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 100 * USDC);
+    assert_program_error(env.send(&[ix], &[&liq]), VaultError::NotLiquidatable);
+
+    env.walk_price_to(PRICE * 75 / 100);
+    let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 100 * USDC);
+    env.ok(&[ix], &[&liq]);
+}
+
+#[test]
+fn an_underwater_position_is_seized_at_the_dynamic_bonus_and_recorded() {
+    let mut env = lending_env();
+    let alice = env.alice.insecure_clone();
+    let (liq, lu, lc) = env.new_liquidator(10_000 * USDC);
+    env.walk_price_to(PRICE * 75 / 100);
+
+    let before_debt = {
+        let m = env.market_state();
+        safu_core::lending::debt_for_shares(
+            env.position_state(&alice.pubkey()).debt_shares,
+            m.borrow_index,
+        )
+        .unwrap()
+    };
+    let usdc_before = env.token_balance(&lu);
+    let coll_before = env.token_balance(&lc);
+    let cash_before = env.market_state().cash;
+
+    let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 10_000 * USDC);
+    env.ok(&[ix], &[&liq]);
+
+    let r = env.record_state(0);
+    assert_eq!(r.seq, 0);
+    assert_eq!(r.borrower, alice.pubkey());
+    assert_eq!(r.liquidator, liq.pubkey());
+    assert_eq!(r.bad_debt, 0, "collateral still covers this one");
+    assert_eq!(r.coverage_bps, stock_vault::state::FULL_COVERAGE_BPS);
+    assert_eq!(r.collateral_decimals, COLL_DECIMALS);
+    assert!(r.price_fp > 0 && r.multiplier_fp > 0);
+    assert!(!r.issuer_halt);
+
+    // Dynamic bonus: past the 50% line but not by much, so it sits inside the 100..500 bps band.
+    assert!(
+        r.bonus_bps >= 100 && r.bonus_bps <= 500,
+        "bonus {} outside the configured band",
+        r.bonus_bps
+    );
+    assert!(
+        r.ltv_bps > 5_000,
+        "ltv {} should be past the line",
+        r.ltv_bps
+    );
+
+    // The close factor caps this liquidation at a quarter of the debt. Derived from the state the
+    // instruction itself produced: `liquidate` accrues before it prices anything, so a debt read
+    // taken beforehand is already stale.
+    let m = env.market_state();
+    let remaining = safu_core::lending::debt_for_shares(
+        env.position_state(&alice.pubkey()).debt_shares,
+        m.borrow_index,
+    )
+    .unwrap();
+    let debt_at_seizure = remaining + r.debt_repaid;
+    assert!(
+        debt_at_seizure >= before_debt,
+        "accrual only ever adds to the debt"
+    );
+    let expected = debt_at_seizure / 4;
+    assert!(
+        r.debt_repaid.abs_diff(expected) <= debt_at_seizure / 1_000,
+        "repaid {} should be the 25% close factor of {debt_at_seizure} (≈{expected})",
+        r.debt_repaid
+    );
+
+    // The liquidator paid USDC and received collateral; the market booked the cash.
+    assert_eq!(usdc_before - env.token_balance(&lu), r.debt_repaid);
+    assert_eq!(env.token_balance(&lc) - coll_before, r.seized_raw);
+    assert_eq!(env.market_state().cash - cash_before, r.debt_repaid);
+    assert_eq!(
+        env.position_state(&alice.pubkey()).raw_collateral,
+        10 * ONE_SHARE - r.seized_raw
+    );
+    assert_eq!(env.market_state().liq_seq, 1);
+
+    // The seizure is worth what was repaid plus the bonus, and never more.
+    let seized_value = safu_core::collateral::collateral_value(
+        r.seized_raw,
+        COLL_DECIMALS,
+        r.multiplier_fp,
+        r.price_fp,
+    )
+    .unwrap();
+    let with_bonus = safu_core::apply_bps(r.debt_repaid, 10_000 + r.bonus_bps).unwrap();
+    assert!(
+        seized_value <= with_bonus,
+        "seized {seized_value} exceeds repay+bonus {with_bonus}"
+    );
+}
+
+#[test]
+fn past_the_insolvency_line_the_whole_debt_can_go_in_one_liquidation() {
+    let mut env = lending_env();
+    let alice = env.alice.insecure_clone();
+    let (liq, lu, lc) = env.new_liquidator(10_000 * USDC);
+    // 40% LTV at the start; a 58% fall in value puts it past the 95% insolvency line.
+    env.walk_price_to(PRICE * 40 / 100);
+
+    let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 10_000 * USDC);
+    env.ok(&[ix], &[&liq]);
+
+    let r = env.record_state(0);
+    assert!(
+        r.ltv_bps > 9_500,
+        "ltv {} should be past the insolvency line",
+        r.ltv_bps
+    );
+    assert_eq!(
+        env.position_state(&alice.pubkey()).debt_shares,
+        0,
+        "the whole debt goes in one liquidation past the insolvency line"
+    );
+}
+
+#[test]
+fn the_chunk_cap_bounds_a_single_liquidation() {
+    let mut env = lending_env();
+    let (admin, alice) = (env.admin.insecure_clone(), env.alice.insecure_clone());
+    let mut capped = params();
+    capped.max_liquidation_debt = 10 * USDC;
+    let ix = update_params_ix(&admin.pubkey(), &env.coll_mint, capped);
+    env.ok(&[ix], &[&admin]);
+
+    let (liq, lu, lc) = env.new_liquidator(10_000 * USDC);
+    env.walk_price_to(PRICE * 40 / 100);
+    let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 10_000 * USDC);
+    env.ok(&[ix], &[&liq]);
+
+    assert_eq!(
+        env.record_state(0).debt_repaid,
+        10 * USDC,
+        "no single liquidation may exceed the measured-liquidity chunk cap"
+    );
+}
+
+#[test]
+fn bad_debt_is_written_off_when_the_collateral_runs_out() {
+    let mut env = lending_env();
+    let alice = env.alice.insecure_clone();
+    let (liq, lu, lc) = env.new_liquidator(50_000 * USDC);
+    // Value below the debt: seizing everything still leaves the loan short.
+    env.walk_price_to(PRICE * 25 / 100);
+
+    let assets_before = {
+        let m = env.market_state();
+        m.cash + safu_core::lending::debt_for_shares(m.total_borrow_shares, m.borrow_index).unwrap()
+    };
+
+    let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 50_000 * USDC);
+    env.ok(&[ix], &[&liq]);
+
+    let r = env.record_state(0);
+    let m = env.market_state();
+    let p = env.position_state(&alice.pubkey());
+    assert_eq!(p.raw_collateral, 0, "all collateral seized");
+    assert_eq!(
+        p.debt_shares, 0,
+        "the remainder is written off, not left accruing"
+    );
+    assert!(r.bad_debt > 0, "a shortfall must be recorded");
+    assert_eq!(m.bad_debt, r.bad_debt);
+
+    // The write-off lands on suppliers once, through total_borrow_shares -- not twice.
+    let assets_after = m.cash
+        + safu_core::lending::debt_for_shares(m.total_borrow_shares, m.borrow_index).unwrap();
+    let loss = assets_before - assets_after;
+    assert!(
+        loss <= r.bad_debt + 1,
+        "suppliers lost {loss} against a {} write-off -- double counted?",
+        r.bad_debt
+    );
+}
+
+#[test]
+fn each_liquidation_gets_its_own_immutable_record() {
+    let mut env = lending_env();
+    let alice = env.alice.insecure_clone();
+    let (liq, lu, lc) = env.new_liquidator(10_000 * USDC);
+    // Far enough past the line that a second liquidation is still due after the first one repairs
+    // some of the ratio -- 70% would leave it at ~50.4%, on the boundary.
+    env.walk_price_to(PRICE * 60 / 100);
+
+    let first = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 10_000 * USDC);
+    env.ok(&[first], &[&liq]);
+    env.warp(60);
+    let second = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 10_000 * USDC);
+    env.ok(&[second], &[&liq]);
+
+    assert_eq!(env.market_state().liq_seq, 2);
+    let (r0, r1) = (env.record_state(0), env.record_state(1));
+    assert_eq!(r0.seq, 0);
+    assert_eq!(r1.seq, 1);
+    assert!(
+        r1.debt_repaid < r0.debt_repaid,
+        "the close factor shrinks with the remaining debt"
+    );
+}
+
+// ---------------------------------------------- liquidation guards
+
+#[test]
+fn liquidation_is_blocked_while_paused() {
+    let mut env = lending_env();
+    let (admin, alice) = (env.admin.insecure_clone(), env.alice.insecure_clone());
+    let (liq, lu, lc) = env.new_liquidator(10_000 * USDC);
+    env.walk_price_to(PRICE * 75 / 100);
+    env.ok(&[set_paused_ix(&admin.pubkey(), true)], &[&admin]);
+
+    env.warp(60);
+    let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 10_000 * USDC);
+    assert_program_error(env.send(&[ix], &[&liq]), VaultError::Paused);
+}
+
+#[test]
+fn liquidation_is_blocked_by_an_issuer_pause() {
+    let mut env = lending_env();
+    let alice = env.alice.insecure_clone();
+    let (liq, lu, lc) = env.new_liquidator(10_000 * USDC);
+    env.walk_price_to(PRICE * 75 / 100);
+    env.pause_mint();
+
+    env.warp(60);
+    let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 10_000 * USDC);
+    assert_program_error(env.send(&[ix], &[&liq]), VaultError::IssuerHalt);
+}
+
+#[test]
+fn liquidation_is_blocked_by_a_frozen_vault_account() {
+    let mut env = lending_env();
+    let alice = env.alice.insecure_clone();
+    let (liq, lu, lc) = env.new_liquidator(10_000 * USDC);
+    env.walk_price_to(PRICE * 75 / 100);
+    env.freeze_vault();
+
+    env.warp(60);
+    let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 10_000 * USDC);
+    assert_program_error(
+        env.send(&[ix], &[&liq]),
+        VaultError::CollateralAccountFrozen,
+    );
+}
+
+#[test]
+fn a_vault_short_of_its_recorded_collateral_refuses_to_liquidate() {
+    // D4: the permanent delegate can burn out of the vault. Seizing on the strength of a number
+    // that no longer matches the tokens would take collateral from whoever is still in the pool.
+    let mut env = lending_env();
+    let alice = env.alice.insecure_clone();
+    let (liq, lu, lc) = env.new_liquidator(10_000 * USDC);
+    env.walk_price_to(PRICE * 75 / 100);
+    env.shrink_vault_balance(ONE_SHARE);
+
+    env.warp(60);
+    let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 10_000 * USDC);
+    assert_program_error(env.send(&[ix], &[&liq]), VaultError::ReconciliationFailed);
+}
+
+#[test]
+fn liquidation_is_blocked_by_a_flagged_price() {
+    let mut env = lending_env();
+    let (alice, feed) = (env.alice.insecure_clone(), env.feed.insecure_clone());
+    let (liq, lu, lc) = env.new_liquidator(10_000 * USDC);
+    env.walk_price_to(PRICE * 75 / 100);
+
+    env.warp(600);
+    let last = env.market_state().price.last_price;
+    let spike = env.push_price_ix(&feed.pubkey(), last / 2, true, PRICE);
+    env.ok(&[spike], &[&feed]);
+    assert!(env.market_state().price.flagged);
+
+    let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 10_000 * USDC);
+    assert_program_error(env.send(&[ix], &[&liq]), VaultError::PriceUnavailable);
+}
+
+#[test]
+fn liquidation_is_blocked_by_an_unannounced_multiplier_change() {
+    let mut env = lending_env();
+    let alice = env.alice.insecure_clone();
+    let (liq, lu, lc) = env.new_liquidator(10_000 * USDC);
+    env.walk_price_to(PRICE * 75 / 100);
+
+    // The 2a guard must cover the liquidation path too: a wrongful liquidation during an
+    // unannounced split is the exact scenario this product is named after.
+    env.schedule_multiplier(MULT * 0.25, env.now - 1_000);
+    env.warp(60);
+    let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 10_000 * USDC);
+    assert_program_error(env.send(&[ix], &[&liq]), VaultError::CorporateActionHold);
+}
+
+#[test]
+fn liquidation_is_blocked_inside_a_scheduled_split_hold() {
+    let mut env = lending_env();
+    let alice = env.alice.insecure_clone();
+    let (liq, lu, lc) = env.new_liquidator(10_000 * USDC);
+    env.walk_price_to(PRICE * 75 / 100);
+
+    env.schedule_multiplier(MULT * 4.0, env.now + 1_000);
+    env.warp(2_000);
+    let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 10_000 * USDC);
+    assert_program_error(env.send(&[ix], &[&liq]), VaultError::CorporateActionHold);
+}
+
+#[test]
+fn sync_issuer_state_reflects_the_issuer_controlled_facts() {
+    let mut env = lending_env();
+    env.warp(60);
+    env.ok(&[env.sync_issuer_ix()], &[&env.admin.insecure_clone()]);
+    assert!(!env.market_state().issuer_halt, "nothing wrong yet");
+
+    env.pause_mint();
+    env.warp(60);
+    env.ok(&[env.sync_issuer_ix()], &[&env.admin.insecure_clone()]);
+    assert!(
+        env.market_state().issuer_halt,
+        "an issuer pause raises the halt"
+    );
+}
+
+#[test]
+fn sync_issuer_state_catches_a_vault_shortfall_and_is_permissionless() {
+    let mut env = lending_env();
+    env.shrink_vault_balance(ONE_SHARE);
+    // Anyone may call it: it only records facts already visible on-chain.
+    let (stranger, _, _) = env.new_liquidator(0);
+    env.warp(60);
+    let ix = env.sync_issuer_ix();
+    env.ok(&[ix], &[&stranger]);
+    assert!(env.market_state().issuer_halt);
 }

@@ -34,6 +34,14 @@ pub enum VaultError {
     InsufficientCash,
     #[msg("Not enough shares or collateral")]
     InsufficientBalance,
+    #[msg("Position is not past its liquidation threshold")]
+    NotLiquidatable,
+    #[msg("The vault's collateral account is frozen")]
+    CollateralAccountFrozen,
+    #[msg("Vault holds less collateral than the market has recorded")]
+    ReconciliationFailed,
+    #[msg("Liquidation would seize no collateral")]
+    NothingSeized,
     #[msg("Arithmetic overflow")]
     MathOverflow,
 }

@@ -8,6 +8,7 @@ pub const COLL_VAULT_SEED: &[u8] = b"coll_vault";
 pub const USDC_VAULT_SEED: &[u8] = b"usdc_vault";
 pub const POSITION_SEED: &[u8] = b"position";
 pub const SUPPLIER_SEED: &[u8] = b"supplier";
+pub const LIQ_RECORD_SEED: &[u8] = b"liq";
 
 /// Layout version of every account in this program (upgradeability U4).
 pub const ACCOUNT_VERSION: u8 = 1;
@@ -183,5 +184,42 @@ pub struct Supplier {
     pub market: Pubkey,
     pub owner: Pubkey,
     pub shares: u128,
+    pub reserved: [u8; 32],
+}
+
+/// Immutable snapshot of one liquidation.
+///
+/// The verdict engine decides wrongfulness off-chain, so it must be able to re-derive the decision
+/// from what the contract actually used — not from whatever the feed says later. Every input that
+/// fed the seizure is recorded here, including `issuer_halt` at the time, because a liquidation
+/// taken while the issuer had intervened is excluded from cover (spec 14a).
+#[account]
+#[derive(InitSpace)]
+pub struct LiquidationRecord {
+    pub version: u8,
+    pub bump: u8,
+    pub market: Pubkey,
+    pub seq: u64,
+    pub borrower: Pubkey,
+    pub liquidator: Pubkey,
+    /// Raw collateral handed to the liquidator.
+    pub seized_raw: u64,
+    /// USDC the liquidator repaid on the borrower's behalf.
+    pub debt_repaid: u64,
+    /// Effective multiplier used for the valuation, in `MULT_SCALE` fixed point.
+    pub multiplier_fp: u128,
+    /// TWAP the seizure was priced at, 8 decimals.
+    pub price_fp: u64,
+    pub collateral_decimals: u8,
+    pub bonus_bps: u32,
+    /// Position LTV at the moment of seizure.
+    pub ltv_bps: u32,
+    /// Coverage in force for this borrower when the loan was opened (U3).
+    pub coverage_bps: u32,
+    /// Debt written off because the collateral ran out, 0 in the normal case.
+    pub bad_debt: u64,
+    pub ts: i64,
+    pub slot: u64,
+    pub issuer_halt: bool,
     pub reserved: [u8; 32],
 }

@@ -1,7 +1,9 @@
 use anchor_lang::prelude::*;
+use anchor_spl::token_2022::spl_token_2022::state::AccountState;
 use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
 use safu_core::lending::{
-    debt_for_shares, max_borrow, shares_for_borrow, shares_for_repay, INDEX_SCALE,
+    current_ltv_bps, debt_for_shares, is_liquidatable, liquidation_bonus_bps, max_borrow,
+    max_repay, repay_for_seized, seize_for_repay, shares_for_borrow, shares_for_repay, INDEX_SCALE,
 };
 
 pub mod errors;
@@ -499,6 +501,234 @@ pub mod stock_vault {
         });
         Ok(())
     }
+
+    /// Permissionless. Re-derives the issuer-controlled facts the market must respect and records
+    /// them, so a halt can be raised (or lifted) without waiting for someone to attempt a risk
+    /// action. It reflects observable on-chain state only, which is why it needs no authority.
+    ///
+    /// Known limit: a burn by the mint's permanent delegate leaves `reconciliation_short` true
+    /// forever, because the collateral really is gone. Clearing that needs an admin write-down,
+    /// which lands with upgradeability (stage 2 item 5). Until then the halt is permanent and
+    /// correct — the market genuinely cannot honour the collateral it has recorded.
+    pub fn sync_issuer_state(ctx: Context<SyncIssuerState>) -> Result<()> {
+        let mint_info = ctx.accounts.collateral_mint.to_account_info();
+        let mint_blocked = issuer_blocks(&mint_info);
+        let vault_frozen = ctx.accounts.collateral_vault.state == AccountState::Frozen;
+        let vault_amount = ctx.accounts.collateral_vault.amount;
+        let market_key = ctx.accounts.market.key();
+        let market = &mut ctx.accounts.market;
+        let short = reconciliation_short(vault_amount, market);
+        let halted = mint_blocked || vault_frozen || short;
+        market.issuer_halt = halted;
+        emit!(IssuerHaltSet {
+            market: market_key,
+            halted,
+            mint_blocked,
+            vault_frozen,
+            reconciliation_short: short,
+        });
+        Ok(())
+    }
+
+    /// Permissionless liquidation of a position past its threshold.
+    ///
+    /// The liquidator repays USDC on the borrower's behalf and receives collateral at a bonus that
+    /// grows with how far the position has drifted, bounded by solvency, the close factor, and a
+    /// chunk cap sized from measured liquidity. Everything used to price the seizure is snapshotted
+    /// into a `LiquidationRecord`: the wrongful-liquidation verdict is decided off-chain against
+    /// exactly these inputs, and must never be re-derived from a later feed state.
+    pub fn liquidate(ctx: Context<Liquidate>, repay_amount: u64) -> Result<()> {
+        require!(!ctx.accounts.config.paused, VaultError::Paused);
+        require!(repay_amount > 0, VaultError::ZeroAmount);
+        let clock = Clock::get()?;
+        let (now, slot) = (clock.unix_timestamp, clock.slot);
+
+        let market_info = ctx.accounts.market.to_account_info();
+        let mint_info = ctx.accounts.collateral_mint.to_account_info();
+        let vault_amount = ctx.accounts.collateral_vault.amount;
+        let vault_frozen = ctx.accounts.collateral_vault.state == AccountState::Frozen;
+        let market_key = ctx.accounts.market.key();
+        let liquidator_key = ctx.accounts.liquidator.key();
+
+        let market = &mut ctx.accounts.market;
+        accrue(market, now)?;
+
+        // D4 before anything else. If the collateral is not actually in the vault, refuse rather
+        // than hand a liquidator tokens that belong to whoever is still in the pool. Raising the
+        // halt flag is `sync_issuer_state`'s job — a flag written here would be rolled back with
+        // the failing transaction anyway.
+        require!(
+            !reconciliation_short(vault_amount, market),
+            VaultError::ReconciliationFailed
+        );
+        require!(!vault_frozen, VaultError::CollateralAccountFrozen);
+        require!(
+            !market.issuer_halt && !issuer_blocks(&mint_info),
+            VaultError::IssuerHalt
+        );
+
+        let schedule = MultiplierSchedule::read(&mint_info)?;
+        require!(
+            !corporate_action_hold(market, &schedule, now)
+                && !unobserved_multiplier_change(market, &schedule, now),
+            VaultError::CorporateActionHold
+        );
+        let multiplier_fp = schedule.effective(now);
+        market.observed_multiplier_fp = multiplier_fp;
+
+        // Liquidation prices on the TWAP, never the last print: one bad tick must not be able to
+        // seize anyone's collateral.
+        let price = risk_price(market, now, PriceUse::Liquidate)?;
+
+        let position = &mut ctx.accounts.position;
+        let value = value_of(market, position.raw_collateral, multiplier_fp, price)?;
+        let debt = logic::core(debt_for_shares(position.debt_shares, market.borrow_index))?;
+        require!(
+            logic::core(is_liquidatable(
+                debt,
+                value,
+                market.params.liq_threshold_bps
+            ))?,
+            VaultError::NotLiquidatable
+        );
+
+        let ltv_bps = logic::core(current_ltv_bps(debt, value))?;
+        let bonus_bps = logic::core(liquidation_bonus_bps(
+            ltv_bps,
+            market.params.liq_threshold_bps,
+            market.params.min_liq_bonus_bps,
+            market.params.max_liq_bonus_bps,
+        ))?;
+        let allowed = logic::core(max_repay(
+            debt,
+            ltv_bps,
+            market.params.insolvency_ltv_bps,
+            market.params.close_factor_bps,
+            market.params.max_liquidation_debt,
+        ))?;
+        let mut pay = repay_amount.min(allowed);
+        require!(pay > 0, VaultError::ZeroAmount);
+
+        let wanted = logic::core(seize_for_repay(
+            pay,
+            bonus_bps,
+            market.collateral_decimals,
+            multiplier_fp,
+            price,
+        ))?;
+        // The position may hold less than the repayment would buy. Seize what is there and cut the
+        // repayment to match, so the liquidator never pays for collateral that does not exist —
+        // and, just as importantly, so the debt the collateral could not cover survives as bad debt
+        // instead of being silently cleared by an overpayment.
+        let seized = wanted.min(position.raw_collateral);
+        if seized < wanted {
+            let seized_value = value_of(market, seized, multiplier_fp, price)?;
+            pay = logic::core(repay_for_seized(seized_value, bonus_bps))?.min(pay);
+        }
+        require!(seized > 0 && pay > 0, VaultError::NothingSeized);
+
+        token_interface::transfer_checked(
+            CpiContext::new(
+                ctx.accounts.usdc_token_program.key(),
+                TransferChecked {
+                    from: ctx.accounts.liquidator_usdc.to_account_info(),
+                    mint: ctx.accounts.usdc_mint.to_account_info(),
+                    to: ctx.accounts.usdc_vault.to_account_info(),
+                    authority: ctx.accounts.liquidator.to_account_info(),
+                },
+            ),
+            pay,
+            ctx.accounts.usdc_mint.decimals,
+        )?;
+
+        let collateral_mint = market.collateral_mint;
+        let bump = [market.bump];
+        let seeds: &[&[&[u8]]] = &[&[MARKET_SEED, collateral_mint.as_ref(), &bump]];
+        token_interface::transfer_checked(
+            CpiContext::new_with_signer(
+                ctx.accounts.collateral_token_program.key(),
+                TransferChecked {
+                    from: ctx.accounts.collateral_vault.to_account_info(),
+                    mint: mint_info,
+                    to: ctx.accounts.liquidator_collateral.to_account_info(),
+                    authority: market_info,
+                },
+                seeds,
+            ),
+            seized,
+            ctx.accounts.collateral_mint.decimals,
+        )?;
+
+        let burn = if pay >= debt {
+            position.debt_shares
+        } else {
+            logic::core(shares_for_repay(pay, market.borrow_index))?.min(position.debt_shares)
+        };
+        position.debt_shares -= burn;
+        market.total_borrow_shares = market.total_borrow_shares.saturating_sub(burn);
+        market.cash = market
+            .cash
+            .checked_add(pay)
+            .ok_or(VaultError::MathOverflow)?;
+        position.raw_collateral -= seized;
+        market.total_collateral_raw -= seized;
+
+        // Collateral exhausted with debt still outstanding: write it off now rather than let it
+        // accrue interest nobody will ever pay. Removing the shares is what charges the loss to
+        // suppliers; `bad_debt` is the memo of what the backstop owes them back.
+        let mut bad_debt = 0u64;
+        if position.raw_collateral == 0 && position.debt_shares > 0 {
+            bad_debt = logic::core(debt_for_shares(position.debt_shares, market.borrow_index))?;
+            market.total_borrow_shares = market
+                .total_borrow_shares
+                .saturating_sub(position.debt_shares);
+            position.debt_shares = 0;
+            market.bad_debt = market
+                .bad_debt
+                .checked_add(bad_debt)
+                .ok_or(VaultError::MathOverflow)?;
+        }
+
+        let seq = market.liq_seq;
+        market.liq_seq = seq.checked_add(1).ok_or(VaultError::MathOverflow)?;
+        let issuer_halt = market.issuer_halt;
+        let collateral_decimals = market.collateral_decimals;
+
+        let record = &mut ctx.accounts.record;
+        record.version = ACCOUNT_VERSION;
+        record.bump = ctx.bumps.record;
+        record.market = market_key;
+        record.seq = seq;
+        record.borrower = position.owner;
+        record.liquidator = liquidator_key;
+        record.seized_raw = seized;
+        record.debt_repaid = pay;
+        record.multiplier_fp = multiplier_fp;
+        record.price_fp = price;
+        record.collateral_decimals = collateral_decimals;
+        record.bonus_bps = bonus_bps;
+        record.ltv_bps = ltv_bps;
+        record.coverage_bps = position.coverage_bps;
+        record.bad_debt = bad_debt;
+        record.ts = now;
+        record.slot = slot;
+        record.issuer_halt = issuer_halt;
+        record.reserved = [0; 32];
+
+        emit!(Liquidated {
+            market: market_key,
+            seq,
+            borrower: record.borrower,
+            liquidator: liquidator_key,
+            seized_raw: seized,
+            debt_repaid: pay,
+            bonus_bps,
+            ltv_bps,
+            price_fp: price,
+            bad_debt,
+        });
+        Ok(())
+    }
 }
 
 // ------------------------------------------------------------------ accounts
@@ -757,6 +987,58 @@ pub struct Borrow<'info> {
 }
 
 #[derive(Accounts)]
+pub struct SyncIssuerState<'info> {
+    #[account(mut, seeds = [MARKET_SEED, market.collateral_mint.as_ref()], bump = market.bump)]
+    pub market: Box<Account<'info, Market>>,
+    #[account(address = market.collateral_mint)]
+    pub collateral_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(seeds = [COLL_VAULT_SEED, market.key().as_ref()], bump)]
+    pub collateral_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+}
+
+#[derive(Accounts)]
+pub struct Liquidate<'info> {
+    #[account(mut)]
+    pub liquidator: Signer<'info>,
+    #[account(seeds = [VCONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, VaultConfig>,
+    #[account(mut, seeds = [MARKET_SEED, market.collateral_mint.as_ref()], bump = market.bump)]
+    pub market: Box<Account<'info, Market>>,
+    #[account(
+        mut,
+        seeds = [POSITION_SEED, market.key().as_ref(), position.owner.as_ref()],
+        bump = position.bump,
+        has_one = market,
+    )]
+    pub position: Box<Account<'info, Position>>,
+    /// Seeded by the market's own counter, so each liquidation gets its own immutable record and a
+    /// replayed transaction cannot overwrite an earlier one.
+    #[account(
+        init,
+        payer = liquidator,
+        space = 8 + LiquidationRecord::INIT_SPACE,
+        seeds = [LIQ_RECORD_SEED, market.key().as_ref(), market.liq_seq.to_le_bytes().as_ref()],
+        bump,
+    )]
+    pub record: Box<Account<'info, LiquidationRecord>>,
+    #[account(address = market.collateral_mint, mint::token_program = collateral_token_program)]
+    pub collateral_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(address = market.usdc_mint, mint::token_program = usdc_token_program)]
+    pub usdc_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(mut, token::mint = usdc_mint, token::authority = liquidator, token::token_program = usdc_token_program)]
+    pub liquidator_usdc: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(mut, token::mint = collateral_mint, token::authority = liquidator, token::token_program = collateral_token_program)]
+    pub liquidator_collateral: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(mut, seeds = [COLL_VAULT_SEED, market.key().as_ref()], bump, token::token_program = collateral_token_program)]
+    pub collateral_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(mut, seeds = [USDC_VAULT_SEED, market.key().as_ref()], bump, token::token_program = usdc_token_program)]
+    pub usdc_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub collateral_token_program: Interface<'info, TokenInterface>,
+    pub usdc_token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
 pub struct Repay<'info> {
     pub payer: Signer<'info>,
     #[account(mut, seeds = [MARKET_SEED, market.collateral_mint.as_ref()], bump = market.bump)]
@@ -837,6 +1119,30 @@ pub struct Borrowed {
     pub owner: Pubkey,
     pub amount: u64,
     pub shares: u128,
+}
+
+#[event]
+pub struct IssuerHaltSet {
+    pub market: Pubkey,
+    pub halted: bool,
+    pub mint_blocked: bool,
+    pub vault_frozen: bool,
+    pub reconciliation_short: bool,
+}
+
+/// Everything the off-chain verdict engine needs to start from, without reading the record account.
+#[event]
+pub struct Liquidated {
+    pub market: Pubkey,
+    pub seq: u64,
+    pub borrower: Pubkey,
+    pub liquidator: Pubkey,
+    pub seized_raw: u64,
+    pub debt_repaid: u64,
+    pub bonus_bps: u32,
+    pub ltv_bps: u32,
+    pub price_fp: u64,
+    pub bad_debt: u64,
 }
 
 #[event]

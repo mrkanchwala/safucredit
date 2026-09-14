@@ -82,6 +82,62 @@ pub fn shares_for_repay(amount: u64, index: u128) -> Result<u128> {
     div(mul(amount as u128, INDEX_SCALE)?, index)
 }
 
+/// Position LTV in basis points: `debt × 10_000 / collateral_value`.
+///
+/// Collateral valued at zero with debt outstanding is maximally unhealthy rather than an error —
+/// a liquidation must still be possible there, and the bonus and repay caps below both read this.
+pub fn current_ltv_bps(debt: u64, collateral_value: u64) -> Result<u32> {
+    if collateral_value == 0 {
+        return Ok(if debt == 0 { 0 } else { u32::MAX });
+    }
+    let ltv = div(mul(debt as u128, BPS)?, collateral_value as u128)?;
+    Ok(u32::try_from(ltv).unwrap_or(u32::MAX))
+}
+
+/// Dynamic liquidation bonus (market config 2026-09-14, matched to the market leader's shape).
+///
+/// It grows with how far past the liquidation line a position has drifted, floored at `min_bps` so
+/// a liquidator is always paid to act, capped at `max_bps`, and capped again by **solvency**:
+/// `10_000 − current_ltv`. That last cap is what keeps `repay × (1 + bonus)` inside the collateral
+/// that actually exists. Past 100% LTV it returns 0 — there is no room for a bonus, and the
+/// shortfall becomes bad debt instead of being taken out of someone else's collateral.
+pub fn liquidation_bonus_bps(
+    current_ltv_bps: u32,
+    liq_threshold_bps: u32,
+    min_bps: u32,
+    max_bps: u32,
+) -> Result<u32> {
+    if min_bps > max_bps {
+        return Err(CoreError::InvalidParameter);
+    }
+    let drift = current_ltv_bps.saturating_sub(liq_threshold_bps);
+    let wanted = drift.max(min_bps).min(max_bps);
+    let solvency = (BPS as u32).saturating_sub(current_ltv_bps);
+    Ok(wanted.min(solvency))
+}
+
+/// Largest debt a single liquidation may repay.
+///
+/// Three bounds: the close factor's share of the debt; the whole debt once the position is past
+/// `insolvency_ltv_bps` (below that line, chipping away is enough); and never more than
+/// `max_liquidation_debt`, which is sized from *measured* collateral liquidity so one liquidation
+/// cannot move the market against itself. The Binance 10-11 Oct 2025 cascade is the shape this
+/// last bound exists to avoid.
+pub fn max_repay(
+    debt: u64,
+    current_ltv_bps: u32,
+    insolvency_ltv_bps: u32,
+    close_factor_bps: u32,
+    max_liquidation_debt: u64,
+) -> Result<u64> {
+    let allowed = if current_ltv_bps > insolvency_ltv_bps {
+        debt
+    } else {
+        apply_bps(debt, close_factor_bps)?
+    };
+    Ok(allowed.min(max_liquidation_debt))
+}
+
 /// Collateral a liquidator receives for repaying `repay_usd`, including `bonus_bps`. Rounds down.
 pub fn seize_for_repay(
     repay_usd: u64,
@@ -97,6 +153,20 @@ pub fn seize_for_repay(
             .ok_or(CoreError::Overflow)?,
     )?;
     raw_for_usd(with_bonus, decimals, multiplier_fp, price_fp)
+}
+
+/// Debt a liquidator actually repays for `seized_value` of collateral at `bonus_bps` — the inverse
+/// of [`seize_for_repay`]'s bonus step.
+///
+/// Needed when a position holds less collateral than the requested repayment would seize. Without
+/// it the liquidator pays the full amount and receives whatever is left, and because the repayment
+/// then clears the whole debt, the shortfall is never recognised — suppliers take the loss with no
+/// record of what the backstop owes them. Rounds up, so the protocol never under-charges.
+pub fn repay_for_seized(seized_value: u64, bonus_bps: u32) -> Result<u64> {
+    to_u64(div_ceil(
+        mul(seized_value as u128, BPS)?,
+        add(BPS, bonus_bps as u128)?,
+    )?)
 }
 
 #[cfg(test)]
@@ -127,6 +197,76 @@ mod tests {
             borrow_rate_bps(10_001, CURVE),
             Err(CoreError::InvalidParameter)
         );
+    }
+
+    #[test]
+    fn bonus_grows_with_drift_then_stops_at_the_cap() {
+        // threshold 5_000, bonus band 100..500 bps.
+        let b = |ltv| liquidation_bonus_bps(ltv, 5_000, 100, 500).unwrap();
+        assert_eq!(b(5_001), 100, "just past the line pays the floor");
+        assert_eq!(b(5_300), 300, "drift of 300 bps pays 300");
+        assert_eq!(b(5_500), 500, "drift of 500 bps pays the ceiling");
+        assert_eq!(b(6_000), 500, "and never more");
+    }
+
+    #[test]
+    fn bonus_is_capped_by_solvency_and_vanishes_past_full_ltv() {
+        // At 9_800 LTV only 200 bps of collateral is left over the debt, so that is the cap.
+        assert_eq!(liquidation_bonus_bps(9_800, 5_000, 100, 500), Ok(200));
+        assert_eq!(liquidation_bonus_bps(10_000, 5_000, 100, 500), Ok(0));
+        assert_eq!(liquidation_bonus_bps(12_000, 5_000, 100, 500), Ok(0));
+        assert_eq!(
+            liquidation_bonus_bps(6_000, 5_000, 600, 500),
+            Err(CoreError::InvalidParameter)
+        );
+    }
+
+    #[test]
+    fn ltv_handles_a_worthless_position_without_dividing_by_zero() {
+        assert_eq!(current_ltv_bps(0, 0), Ok(0));
+        assert_eq!(current_ltv_bps(1, 0), Ok(u32::MAX));
+        assert_eq!(current_ltv_bps(50, 100), Ok(5_000));
+        assert_eq!(current_ltv_bps(150, 100), Ok(15_000));
+    }
+
+    #[test]
+    fn repay_is_bounded_by_close_factor_insolvency_and_the_chunk_cap() {
+        // Below the insolvency line: 25% of a 1_000 debt.
+        assert_eq!(max_repay(1_000, 6_000, 9_500, 2_500, u64::MAX), Ok(250));
+        // Past it: the whole debt in one go.
+        assert_eq!(max_repay(1_000, 9_501, 9_500, 2_500, u64::MAX), Ok(1_000));
+        // The chunk cap wins over both.
+        assert_eq!(max_repay(1_000, 9_501, 9_500, 2_500, 400), Ok(400));
+        // Exactly at the insolvency line is NOT past it.
+        assert_eq!(max_repay(1_000, 9_500, 9_500, 2_500, u64::MAX), Ok(250));
+    }
+
+    #[test]
+    fn a_liquidator_never_receives_more_collateral_than_they_paid_for() {
+        // Bonus applied, then converted back: the seized value must not exceed repay × (1 + bonus).
+        let seized = seize_for_repay(1_000_000, 500, 8, crate::MULT_SCALE, 10_000_000_000).unwrap();
+        let back =
+            crate::collateral::collateral_value(seized, 8, crate::MULT_SCALE, 10_000_000_000)
+                .unwrap();
+        assert!(back <= 1_050_000, "got {back}");
+    }
+
+    #[test]
+    fn repay_for_seized_inverts_the_bonus_without_undercharging() {
+        // $105 of collateral at a 5% bonus was bought with $100 of repayment.
+        assert_eq!(repay_for_seized(105_000_000, 500), Ok(100_000_000));
+        assert_eq!(repay_for_seized(100, 0), Ok(100));
+        // Round trip never lets the liquidator get collateral they did not pay for.
+        for value in [1u64, 7, 999, 1_000_000, u64::MAX / 20_000] {
+            for bonus in [0u32, 1, 100, 500, 2_000] {
+                let repay = repay_for_seized(value, bonus).unwrap();
+                let back = apply_bps(repay, 10_000 + bonus).unwrap();
+                assert!(
+                    back >= value,
+                    "value {value} bonus {bonus}: {back} < {value}"
+                );
+            }
+        }
     }
 
     #[test]
