@@ -58,6 +58,16 @@ fn roll_admission_day(config: &mut BackstopConfig, now: i64) {
     }
 }
 
+/// Separate day bucket from `roll_admission_day`: claim admissions and pool-liquidation draws are
+/// different budgets (phase 3).
+fn roll_liq_day(config: &mut BackstopConfig, now: i64) {
+    let today = now.div_euclid(DAY_SECS);
+    if config.liq_day != today {
+        config.liq_day = today;
+        config.liq_spent_today = 0;
+    }
+}
+
 /// Attempts to admit `claim` (already priced, `claim.loss` set) against `config`'s current caps
 /// and solvency. Never errors on "doesn't fit" — over any limit queues rather than rejects
 /// (LOCKED verdict spec); returns whether it was admitted.
@@ -852,6 +862,341 @@ pub mod backstop {
         });
         Ok(())
     }
+
+    /// Opens the collateral-inventory tracker and its token vault for one market (phase 3).
+    /// Permissionless, one-time, ahead of that market's first pool liquidation.
+    pub fn open_inventory(ctx: Context<OpenInventory>) -> Result<()> {
+        let inv = &mut ctx.accounts.inventory;
+        inv.version = ACCOUNT_VERSION;
+        inv.bump = ctx.bumps.inventory;
+        inv.market = ctx.accounts.market.key();
+        inv.raw = 0;
+        inv.cost_total = 0;
+        inv.last_acquired_at = 0;
+        inv.reserved = [0; 32];
+        Ok(())
+    }
+
+    /// Opens the interest-recognition counter for one market (phase 3). Permissionless, one-time.
+    pub fn open_interest_absorbed(ctx: Context<OpenInterestAbsorbed>) -> Result<()> {
+        let ia = &mut ctx.accounts.interest_absorbed;
+        ia.version = ACCOUNT_VERSION;
+        ia.bump = ctx.bumps.interest_absorbed;
+        ia.market = ctx.accounts.market.key();
+        ia.total_absorbed = 0;
+        ia.reserved = [0; 32];
+        Ok(())
+    }
+
+    /// Liquidates a position through the vault with the pool itself as liquidator
+    /// (backstop-as-liquidator lock). A permissionless crank; the caller pays the new
+    /// `LiquidationRecord`'s rent (A1 -- the pool's key is a program PDA, it cannot fund an
+    /// account) and earns a slice of the bonus (D6). Bounded by the per-liquidation and daily
+    /// caps -- over either, this pays what caps and cash allow (E1): the position stays
+    /// liquidatable and an outside liquidator may act once the vault's own grace period elapses.
+    pub fn pool_liquidate(ctx: Context<PoolLiquidate>, repay_amount: u64) -> Result<()> {
+        require!(repay_amount > 0, VerdictError::ZeroAmount);
+        let now = Clock::get()?.unix_timestamp;
+        let config_bump = ctx.accounts.config.bump;
+
+        let (cash, per_liq_cap_bps, daily_cap_bps, min_repay) = {
+            let c = &ctx.accounts.config;
+            (
+                c.cash,
+                c.per_liq_cap_bps,
+                c.daily_liq_cap_bps,
+                c.min_pool_repay,
+            )
+        };
+        roll_liq_day(&mut ctx.accounts.config, now);
+        let liq_spent_today = ctx.accounts.config.liq_spent_today;
+
+        let per_liq_cap =
+            safu_core::apply_bps(cash, per_liq_cap_bps).map_err(|_| VerdictError::MathOverflow)?;
+        let daily_cap =
+            safu_core::apply_bps(cash, daily_cap_bps).map_err(|_| VerdictError::MathOverflow)?;
+        let daily_room = daily_cap.saturating_sub(liq_spent_today);
+        let capped = repay_amount.min(per_liq_cap).min(daily_room).min(cash);
+        require!(capped >= min_repay, VerdictError::BelowMinPoolRepay);
+
+        let seeds: &[&[&[u8]]] = &[&[CONFIG_SEED, &[config_bump]]];
+        let cpi_accounts = stock_vault::cpi::accounts::Liquidate {
+            payer: ctx.accounts.payer.to_account_info(),
+            liquidator: ctx.accounts.config.to_account_info(),
+            config: ctx.accounts.vault_config.to_account_info(),
+            market: ctx.accounts.market.to_account_info(),
+            position: ctx.accounts.position.to_account_info(),
+            record: ctx.accounts.record.to_account_info(),
+            collateral_mint: ctx.accounts.collateral_mint.to_account_info(),
+            usdc_mint: ctx.accounts.usdc_mint.to_account_info(),
+            liquidator_usdc: ctx.accounts.pool_usdc_vault.to_account_info(),
+            liquidator_collateral: ctx.accounts.inventory_vault.to_account_info(),
+            collateral_vault: ctx.accounts.vault_collateral_vault.to_account_info(),
+            usdc_vault: ctx.accounts.vault_usdc_vault.to_account_info(),
+            collateral_token_program: ctx.accounts.collateral_token_program.to_account_info(),
+            usdc_token_program: ctx.accounts.usdc_token_program.to_account_info(),
+            system_program: ctx.accounts.system_program.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new_with_signer(
+            ctx.accounts.stock_vault_program.key(),
+            cpi_accounts,
+            seeds,
+        );
+        stock_vault::cpi::liquidate(cpi_ctx, capped)?;
+
+        // `liquidate` may have paid less than `capped` (partial seizure) -- read what actually
+        // happened from the record it just wrote, rather than assume the requested amount landed.
+        let (seized_raw, debt_repaid, bonus_bps) = {
+            let data = ctx.accounts.record.try_borrow_data()?;
+            let record = stock_vault::state::LiquidationRecord::try_deserialize(&mut &data[..])?;
+            (record.seized_raw, record.debt_repaid, record.bonus_bps)
+        };
+
+        // D6: pay × bonus_bps × fee_share / 10^8, so the pool never pays more than the bonus it
+        // just captured. bonus_bps and fee_share_bps are both <= 10_000 by construction, so the
+        // product with debt_repaid (a u64) always fits u128.
+        let fee_share_bps = ctx.accounts.config.fee_share_bps;
+        let fee = u64::try_from(
+            (debt_repaid as u128) * (bonus_bps as u128) * (fee_share_bps as u128) / 100_000_000u128,
+        )
+        .map_err(|_| VerdictError::MathOverflow)?;
+
+        if fee > 0 {
+            token_interface::transfer_checked(
+                CpiContext::new_with_signer(
+                    ctx.accounts.usdc_token_program.key(),
+                    TransferChecked {
+                        from: ctx.accounts.pool_usdc_vault.to_account_info(),
+                        mint: ctx.accounts.usdc_mint.to_account_info(),
+                        to: ctx.accounts.crank_usdc.to_account_info(),
+                        authority: ctx.accounts.config.to_account_info(),
+                    },
+                    seeds,
+                ),
+                fee,
+                ctx.accounts.usdc_mint.decimals,
+            )?;
+        }
+
+        let inventory = &mut ctx.accounts.inventory;
+        inventory.raw = inventory
+            .raw
+            .checked_add(seized_raw)
+            .ok_or(VerdictError::MathOverflow)?;
+        inventory.cost_total = inventory
+            .cost_total
+            .checked_add(debt_repaid)
+            .ok_or(VerdictError::MathOverflow)?;
+        inventory.last_acquired_at = now;
+
+        let config = &mut ctx.accounts.config;
+        config.cash = config
+            .cash
+            .checked_sub(debt_repaid)
+            .and_then(|v| v.checked_sub(fee))
+            .ok_or(VerdictError::MathOverflow)?;
+        config.liq_spent_today = config
+            .liq_spent_today
+            .checked_add(debt_repaid)
+            .ok_or(VerdictError::MathOverflow)?;
+        config.inventory_cost_total = config
+            .inventory_cost_total
+            .checked_add(debt_repaid)
+            .ok_or(VerdictError::MathOverflow)?;
+
+        emit!(PoolLiquidated {
+            market: ctx.accounts.market.key(),
+            seized_raw,
+            debt_repaid,
+            bonus_bps,
+            fee,
+        });
+        Ok(())
+    }
+
+    /// Buys collateral out of a market's inventory at the healthy price minus the discount, never
+    /// below the pool's own cost for the first `resale_floor_secs` after acquiring it, and never
+    /// while the price is flagged or a corporate-action hold is active (D5). Bounded by the
+    /// buyer's own `max_price_per_share` (slippage).
+    pub fn buy_inventory(
+        ctx: Context<BuyInventory>,
+        raw: u64,
+        max_price_per_share: u64,
+    ) -> Result<()> {
+        require!(raw > 0, VerdictError::ZeroAmount);
+        let now = Clock::get()?.unix_timestamp;
+        require_keys_eq!(
+            ctx.accounts.inventory.market,
+            ctx.accounts.market.key(),
+            VerdictError::MarketMismatch
+        );
+        require!(
+            raw <= ctx.accounts.inventory.raw,
+            VerdictError::NothingToBuy
+        );
+
+        let market = &ctx.accounts.market;
+        let mint_info = ctx.accounts.collateral_mint.to_account_info();
+        require!(
+            !market.issuer_halt && !stock_vault::logic::issuer_blocks(&mint_info),
+            VerdictError::ResaleBlocked
+        );
+        let schedule = stock_vault::logic::MultiplierSchedule::read(&mint_info)?;
+        require!(
+            !stock_vault::logic::corporate_action_hold(market, &schedule, now)
+                && !stock_vault::logic::unobserved_multiplier_change(market, &schedule, now),
+            VerdictError::ResaleBlocked
+        );
+        let multiplier_fp = schedule.effective(now);
+        let healthy =
+            stock_vault::logic::risk_price(market, now, stock_vault::logic::PriceUse::Liquidate)?;
+        let discounted =
+            safu_core::apply_bps(healthy, 10_000 - ctx.accounts.config.resale_discount_bps)
+                .map_err(|_| VerdictError::MathOverflow)?;
+        let discounted_value =
+            stock_vault::logic::value_of(market, raw, multiplier_fp, discounted)?;
+
+        let inventory = &ctx.accounts.inventory;
+        let prorated_cost = u64::try_from(
+            mul_div_floor(
+                inventory.cost_total as u128,
+                raw as u128,
+                inventory.raw as u128,
+            )
+            .map_err(|_| VerdictError::MathOverflow)?,
+        )
+        .map_err(|_| VerdictError::MathOverflow)?;
+        let in_floor_window = now
+            < inventory
+                .last_acquired_at
+                .saturating_add(ctx.accounts.config.resale_floor_secs);
+        let sale_value = if in_floor_window {
+            discounted_value.max(prorated_cost)
+        } else {
+            discounted_value
+        };
+        require!(sale_value > 0, VerdictError::ZeroAmount);
+
+        let max_allowed_value =
+            stock_vault::logic::value_of(market, raw, multiplier_fp, max_price_per_share)?;
+        require!(sale_value <= max_allowed_value, VerdictError::PriceAboveMax);
+
+        token_interface::transfer_checked(
+            CpiContext::new(
+                ctx.accounts.usdc_token_program.key(),
+                TransferChecked {
+                    from: ctx.accounts.buyer_usdc.to_account_info(),
+                    mint: ctx.accounts.usdc_mint.to_account_info(),
+                    to: ctx.accounts.pool_usdc_vault.to_account_info(),
+                    authority: ctx.accounts.buyer.to_account_info(),
+                },
+            ),
+            sale_value,
+            ctx.accounts.usdc_mint.decimals,
+        )?;
+
+        let config_bump = ctx.accounts.config.bump;
+        let seeds: &[&[&[u8]]] = &[&[CONFIG_SEED, &[config_bump]]];
+        token_interface::transfer_checked(
+            CpiContext::new_with_signer(
+                ctx.accounts.collateral_token_program.key(),
+                TransferChecked {
+                    from: ctx.accounts.inventory_vault.to_account_info(),
+                    mint: ctx.accounts.collateral_mint.to_account_info(),
+                    to: ctx.accounts.buyer_collateral.to_account_info(),
+                    authority: ctx.accounts.config.to_account_info(),
+                },
+                seeds,
+            ),
+            raw,
+            ctx.accounts.collateral_mint.decimals,
+        )?;
+
+        let inventory = &mut ctx.accounts.inventory;
+        inventory.raw -= raw;
+        let config = &mut ctx.accounts.config;
+        if inventory.raw == 0 {
+            // Dust-safe close-out: whatever cost basis remains after floor division leaves the
+            // aggregate pause signal stuck above zero forever otherwise.
+            config.inventory_cost_total = config
+                .inventory_cost_total
+                .saturating_sub(inventory.cost_total);
+            inventory.cost_total = 0;
+        } else {
+            inventory.cost_total -= prorated_cost;
+            config.inventory_cost_total -= prorated_cost;
+        }
+        config.cash = config
+            .cash
+            .checked_add(sale_value)
+            .ok_or(VerdictError::MathOverflow)?;
+
+        emit!(InventorySold {
+            market: ctx.accounts.market.key(),
+            raw,
+            sale_value,
+        });
+        Ok(())
+    }
+
+    /// Admin-only, bounded to a market the issuer has actually frozen or halted (E3): the only
+    /// case where `buy_inventory` can never clear the position on its own, because the token
+    /// account itself is frozen. Zeroes this market's cost basis so deposits/withdrawals can
+    /// resume; backers take the loss, same as any other issuer-seizure risk they carry.
+    pub fn write_off_inventory(ctx: Context<WriteOffInventory>) -> Result<()> {
+        let issuer_acted = ctx.accounts.market.issuer_halt
+            || stock_vault::logic::issuer_blocks(&ctx.accounts.collateral_mint.to_account_info());
+        require!(issuer_acted, VerdictError::NotFrozenOrHalted);
+
+        let inventory = &mut ctx.accounts.inventory;
+        let written_off = inventory.cost_total;
+        require!(written_off > 0, VerdictError::ZeroAmount);
+        inventory.cost_total = 0;
+
+        let config = &mut ctx.accounts.config;
+        config.inventory_cost_total = config.inventory_cost_total.saturating_sub(written_off);
+
+        emit!(InventoryWrittenOff {
+            market: ctx.accounts.market.key(),
+            raw_stranded: inventory.raw,
+            cost_written_off: written_off,
+        });
+        Ok(())
+    }
+
+    /// Recognises USDC `pay_backer_interest` has already moved into the pool's vault. Permissionless,
+    /// bounded by the unaccounted surplus actually sitting in the token account (2c pattern, in
+    /// reverse) -- a raw donation is never counted, and repeat calls settle only the remainder.
+    pub fn absorb_interest(ctx: Context<AbsorbInterest>) -> Result<()> {
+        let vault_amount = ctx.accounts.pool_usdc_vault.amount;
+        let owed = ctx
+            .accounts
+            .market
+            .backer_interest_paid_cumulative
+            .saturating_sub(ctx.accounts.interest_absorbed.total_absorbed);
+        let surplus = vault_amount.saturating_sub(ctx.accounts.config.cash);
+        let credit = owed.min(surplus);
+        require!(credit > 0, VerdictError::ZeroAmount);
+
+        ctx.accounts.config.cash = ctx
+            .accounts
+            .config
+            .cash
+            .checked_add(credit)
+            .ok_or(VerdictError::MathOverflow)?;
+        ctx.accounts.interest_absorbed.total_absorbed = ctx
+            .accounts
+            .interest_absorbed
+            .total_absorbed
+            .checked_add(credit)
+            .ok_or(VerdictError::MathOverflow)?;
+
+        emit!(InterestAbsorbedEvent {
+            market: ctx.accounts.market.key(),
+            credited: credit,
+        });
+        Ok(())
+    }
 }
 
 #[derive(Accounts)]
@@ -1076,6 +1421,155 @@ pub struct CoverBadDebt<'info> {
     pub usdc_token_program: Interface<'info, TokenInterface>,
 }
 
+// ------------------------------------------------------------------ phase 3: pool-as-liquidator
+
+#[derive(Accounts)]
+pub struct OpenInventory<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub market: Box<Account<'info, stock_vault::state::Market>>,
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + Inventory::INIT_SPACE,
+        seeds = [INVENTORY_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub inventory: Box<Account<'info, Inventory>>,
+    #[account(address = market.collateral_mint, mint::token_program = collateral_token_program)]
+    pub collateral_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, BackstopConfig>>,
+    #[account(
+        init,
+        payer = payer,
+        seeds = [INVENTORY_VAULT_SEED, market.key().as_ref()],
+        bump,
+        token::mint = collateral_mint,
+        token::authority = config,
+        token::token_program = collateral_token_program,
+    )]
+    pub inventory_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub collateral_token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct OpenInterestAbsorbed<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub market: Box<Account<'info, stock_vault::state::Market>>,
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + InterestAbsorbed::INIT_SPACE,
+        seeds = [INTEREST_SEED, market.key().as_ref()],
+        bump,
+    )]
+    pub interest_absorbed: Box<Account<'info, InterestAbsorbed>>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct PoolLiquidate<'info> {
+    /// Pays the new LiquidationRecord's rent (A1) and receives the crank fee.
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, BackstopConfig>>,
+    /// The vault's own config, required by the CPI; re-validated there, not here.
+    pub vault_config: Box<Account<'info, stock_vault::state::VaultConfig>>,
+    #[account(mut)]
+    pub market: Box<Account<'info, stock_vault::state::Market>>,
+    /// CHECK: not independently constrained here -- the CPI'd `liquidate` re-derives and checks it
+    /// against its own seeds, so a wrong position simply fails inside the CPI.
+    #[account(mut)]
+    pub position: UncheckedAccount<'info>,
+    /// CHECK: the vault's own `init` constraint creates this during the CPI. Derived here with the
+    /// vault's own seeds so a wrong address fails before the CPI runs, not inside it.
+    #[account(
+        mut,
+        seeds = [stock_vault::state::LIQ_RECORD_SEED, market.key().as_ref(), market.liq_seq.to_le_bytes().as_ref()],
+        bump,
+        seeds::program = stock_vault::ID,
+    )]
+    pub record: UncheckedAccount<'info>,
+    #[account(address = market.collateral_mint, mint::token_program = collateral_token_program)]
+    pub collateral_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(address = market.usdc_mint, mint::token_program = usdc_token_program)]
+    pub usdc_mint: Box<InterfaceAccount<'info, Mint>>,
+    /// The pool's own USDC -- doubles as the CPI's `liquidator_usdc`.
+    #[account(mut, seeds = [USDC_VAULT_SEED], bump, token::token_program = usdc_token_program)]
+    pub pool_usdc_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(mut, seeds = [INVENTORY_SEED, market.key().as_ref()], bump = inventory.bump, has_one = market)]
+    pub inventory: Box<Account<'info, Inventory>>,
+    /// The pool's own collateral holding -- doubles as the CPI's `liquidator_collateral`.
+    #[account(mut, seeds = [INVENTORY_VAULT_SEED, market.key().as_ref()], bump, token::token_program = collateral_token_program)]
+    pub inventory_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// CHECK: the vault's own seeds; re-validated by the CPI callee.
+    #[account(mut, seeds = [stock_vault::state::COLL_VAULT_SEED, market.key().as_ref()], bump, seeds::program = stock_vault::ID)]
+    pub vault_collateral_vault: UncheckedAccount<'info>,
+    /// CHECK: the vault's own seeds; re-validated by the CPI callee.
+    #[account(mut, seeds = [stock_vault::state::USDC_VAULT_SEED, market.key().as_ref()], bump, seeds::program = stock_vault::ID)]
+    pub vault_usdc_vault: UncheckedAccount<'info>,
+    #[account(mut, token::mint = usdc_mint, token::authority = payer, token::token_program = usdc_token_program)]
+    pub crank_usdc: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub collateral_token_program: Interface<'info, TokenInterface>,
+    pub usdc_token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+    pub stock_vault_program: Program<'info, stock_vault::program::StockVault>,
+}
+
+#[derive(Accounts)]
+pub struct BuyInventory<'info> {
+    #[account(mut)]
+    pub buyer: Signer<'info>,
+    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, BackstopConfig>>,
+    pub market: Box<Account<'info, stock_vault::state::Market>>,
+    #[account(mut, seeds = [INVENTORY_SEED, market.key().as_ref()], bump = inventory.bump, has_one = market)]
+    pub inventory: Box<Account<'info, Inventory>>,
+    #[account(address = market.collateral_mint, mint::token_program = collateral_token_program)]
+    pub collateral_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(address = market.usdc_mint, mint::token_program = usdc_token_program)]
+    pub usdc_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(mut, seeds = [INVENTORY_VAULT_SEED, market.key().as_ref()], bump, token::token_program = collateral_token_program)]
+    pub inventory_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(mut, seeds = [USDC_VAULT_SEED], bump, token::token_program = usdc_token_program)]
+    pub pool_usdc_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(mut, token::mint = usdc_mint, token::authority = buyer, token::token_program = usdc_token_program)]
+    pub buyer_usdc: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(mut, token::mint = collateral_mint, token::authority = buyer, token::token_program = collateral_token_program)]
+    pub buyer_collateral: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub collateral_token_program: Interface<'info, TokenInterface>,
+    pub usdc_token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
+pub struct WriteOffInventory<'info> {
+    pub admin: Signer<'info>,
+    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump, has_one = admin @ VerdictError::Unauthorized)]
+    pub config: Box<Account<'info, BackstopConfig>>,
+    pub market: Box<Account<'info, stock_vault::state::Market>>,
+    /// CHECK: only read for `issuer_blocks`; address-pinned to the market's own mint.
+    #[account(address = market.collateral_mint)]
+    pub collateral_mint: UncheckedAccount<'info>,
+    #[account(mut, seeds = [INVENTORY_SEED, market.key().as_ref()], bump = inventory.bump, has_one = market)]
+    pub inventory: Box<Account<'info, Inventory>>,
+}
+
+#[derive(Accounts)]
+pub struct AbsorbInterest<'info> {
+    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, BackstopConfig>>,
+    pub market: Box<Account<'info, stock_vault::state::Market>>,
+    #[account(mut, seeds = [INTEREST_SEED, market.key().as_ref()], bump = interest_absorbed.bump, has_one = market)]
+    pub interest_absorbed: Box<Account<'info, InterestAbsorbed>>,
+    #[account(seeds = [USDC_VAULT_SEED], bump, token::token_program = usdc_token_program)]
+    pub pool_usdc_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub usdc_token_program: Interface<'info, TokenInterface>,
+}
+
 #[event]
 pub struct VerdictOracleRotated {
     pub verdict_oracle: Pubkey,
@@ -1130,4 +1624,33 @@ pub struct ClaimStreamed {
     pub pull: u64,
     pub streamed: u64,
     pub completed: bool,
+}
+
+#[event]
+pub struct PoolLiquidated {
+    pub market: Pubkey,
+    pub seized_raw: u64,
+    pub debt_repaid: u64,
+    pub bonus_bps: u32,
+    pub fee: u64,
+}
+
+#[event]
+pub struct InventorySold {
+    pub market: Pubkey,
+    pub raw: u64,
+    pub sale_value: u64,
+}
+
+#[event]
+pub struct InventoryWrittenOff {
+    pub market: Pubkey,
+    pub raw_stranded: u64,
+    pub cost_written_off: u64,
+}
+
+#[event]
+pub struct InterestAbsorbedEvent {
+    pub market: Pubkey,
+    pub credited: u64,
 }

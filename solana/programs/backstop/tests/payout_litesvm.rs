@@ -16,9 +16,9 @@ use anchor_lang::{
 use backstop::{
     errors::VerdictError,
     state::{
-        Backer, BackstopConfig, BadDebtCover, BorrowerClaims, Claim, ClaimStatus, BACKER_SEED,
-        BAD_DEBT_SEED, BORROWER_CLAIMS_SEED, CLAIM_SEED, CONFIG_SEED,
-        USDC_VAULT_SEED as B_USDC_VAULT_SEED,
+        Backer, BackstopConfig, BadDebtCover, BorrowerClaims, Claim, ClaimStatus, InterestAbsorbed,
+        Inventory, BACKER_SEED, BAD_DEBT_SEED, BORROWER_CLAIMS_SEED, CLAIM_SEED, CONFIG_SEED,
+        INTEREST_SEED, INVENTORY_SEED, INVENTORY_VAULT_SEED, USDC_VAULT_SEED as B_USDC_VAULT_SEED,
     },
     verdict::{encode_message, FactsArgs, CLUSTER_DEVNET},
 };
@@ -135,6 +135,26 @@ impl Env {
     }
     fn claim_pda(&self, record: &Pubkey) -> Pubkey {
         bpda(&[CLAIM_SEED, record.as_ref()])
+    }
+    fn inventory(&self, market: &Pubkey) -> Pubkey {
+        bpda(&[INVENTORY_SEED, market.as_ref()])
+    }
+    fn inventory_vault(&self, market: &Pubkey) -> Pubkey {
+        bpda(&[INVENTORY_VAULT_SEED, market.as_ref()])
+    }
+    fn inventory_state(&self, market: &Pubkey) -> Inventory {
+        let a = self.svm.get_account(&self.inventory(market)).unwrap();
+        Inventory::try_deserialize(&mut a.data.as_slice()).unwrap()
+    }
+    fn interest_absorbed_pda(&self, market: &Pubkey) -> Pubkey {
+        bpda(&[INTEREST_SEED, market.as_ref()])
+    }
+    fn interest_absorbed_state(&self, market: &Pubkey) -> InterestAbsorbed {
+        let a = self
+            .svm
+            .get_account(&self.interest_absorbed_pda(market))
+            .unwrap();
+        InterestAbsorbed::try_deserialize(&mut a.data.as_slice()).unwrap()
     }
 
     fn send(&mut self, ixs: &[Instruction], signers: &[&Keypair]) -> Result<(), String> {
@@ -628,6 +648,107 @@ impl Env {
                 usdc_token_program: TOKEN_CLASSIC,
             },
             backstop::instruction::ClaimStream {},
+        )
+    }
+    fn open_inventory_ix(&self, payer: &Pubkey) -> Instruction {
+        let market = self.market();
+        self.b_ix(
+            backstop::accounts::OpenInventory {
+                payer: *payer,
+                market,
+                inventory: self.inventory(&market),
+                collateral_mint: self.coll_mint,
+                config: self.b_config(),
+                inventory_vault: self.inventory_vault(&market),
+                collateral_token_program: TOKEN_2022,
+                system_program: SYSTEM,
+            },
+            backstop::instruction::OpenInventory {},
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn pool_liquidate_ix(
+        &self,
+        payer: &Pubkey,
+        crank_usdc: &Pubkey,
+        seq: u64,
+        borrower: &Pubkey,
+        repay_amount: u64,
+    ) -> Instruction {
+        let market = self.market();
+        self.b_ix(
+            backstop::accounts::PoolLiquidate {
+                payer: *payer,
+                config: self.b_config(),
+                vault_config: vpda(&[VCONFIG_SEED]),
+                market,
+                position: vpda(&[POSITION_SEED, market.as_ref(), borrower.as_ref()]),
+                record: self.record(seq),
+                collateral_mint: self.coll_mint,
+                usdc_mint: self.usdc_mint,
+                pool_usdc_vault: self.b_vault(),
+                inventory: self.inventory(&market),
+                inventory_vault: self.inventory_vault(&market),
+                vault_collateral_vault: vpda(&[COLL_VAULT_SEED, market.as_ref()]),
+                vault_usdc_vault: vpda(&[USDC_VAULT_SEED, market.as_ref()]),
+                crank_usdc: *crank_usdc,
+                collateral_token_program: TOKEN_2022,
+                usdc_token_program: TOKEN_CLASSIC,
+                system_program: SYSTEM,
+                stock_vault_program: stock_vault::ID,
+            },
+            backstop::instruction::PoolLiquidate { repay_amount },
+        )
+    }
+    fn write_off_inventory_ix(&self, admin: &Pubkey) -> Instruction {
+        let market = self.market();
+        self.b_ix(
+            backstop::accounts::WriteOffInventory {
+                admin: *admin,
+                config: self.b_config(),
+                market,
+                collateral_mint: self.coll_mint,
+                inventory: self.inventory(&market),
+            },
+            backstop::instruction::WriteOffInventory {},
+        )
+    }
+    fn open_interest_absorbed_ix(&self, payer: &Pubkey) -> Instruction {
+        let market = self.market();
+        self.b_ix(
+            backstop::accounts::OpenInterestAbsorbed {
+                payer: *payer,
+                market,
+                interest_absorbed: self.interest_absorbed_pda(&market),
+                system_program: SYSTEM,
+            },
+            backstop::instruction::OpenInterestAbsorbed {},
+        )
+    }
+    fn absorb_interest_ix(&self) -> Instruction {
+        let market = self.market();
+        self.b_ix(
+            backstop::accounts::AbsorbInterest {
+                config: self.b_config(),
+                market,
+                interest_absorbed: self.interest_absorbed_pda(&market),
+                pool_usdc_vault: self.b_vault(),
+                usdc_token_program: TOKEN_CLASSIC,
+            },
+            backstop::instruction::AbsorbInterest {},
+        )
+    }
+    fn pay_backer_interest_ix(&self) -> Instruction {
+        self.v_ix(
+            stock_vault::accounts::PayBackerInterest {
+                config: vpda(&[VCONFIG_SEED]),
+                market: self.market(),
+                usdc_mint: self.usdc_mint,
+                usdc_vault: vpda(&[USDC_VAULT_SEED, self.market().as_ref()]),
+                pool_usdc_vault: self.b_vault(),
+                usdc_token_program: TOKEN_CLASSIC,
+            },
+            stock_vault::instruction::PayBackerInterest {},
         )
     }
 }
@@ -1962,4 +2083,330 @@ fn backstop_initialize_refuses_the_upgrade_authority_of_a_different_program() {
         env.send(&[ix], &[&attacker]),
         VerdictError::NotUpgradeAuthority,
     );
+}
+
+// ------------------------------------------------------------------ phase 3: pool-as-liquidator
+//
+// These are the only tests in the suite that exercise pool_liquidate/buy_inventory through a real
+// CPI into stock_vault::liquidate -- everything else about the CPI's account wiring is checked by
+// the compiler (Anchor's generated stock_vault::cpi::accounts::Liquidate), but only a real LiteSVM
+// run proves the signer seeds, the account list order, and the vault's own guards actually agree.
+
+#[test]
+fn pool_liquidate_seizes_collateral_into_inventory_and_pays_a_crank_fee() {
+    let mut env = with_loan();
+    let admin = env.admin.insecure_clone();
+    let market = env.market();
+    let alice = env.alice.pubkey();
+
+    let register = env.v_ix(
+        stock_vault::accounts::AdminOnly {
+            admin: admin.pubkey(),
+            config: vpda(&[VCONFIG_SEED]),
+        },
+        stock_vault::instruction::SetPoolLiquidator {
+            pool_liquidator: env.b_config(),
+        },
+    );
+    env.ok(&[register], &[&admin]);
+
+    env.back(100_000 * USDC);
+    let open_inv = env.open_inventory_ix(&admin.pubkey());
+    env.ok(&[open_inv], &[&admin]);
+
+    env.walk_price_to(PRICE * 75 / 100);
+
+    let (crank, crank_usdc) = env.new_funded(0);
+    let seq = env.market_state().liq_seq;
+    let cash_before = env.config_state().cash;
+    let ix = env.pool_liquidate_ix(&crank.pubkey(), &crank_usdc, seq, &alice, 50_000 * USDC);
+    env.ok(&[ix], &[&crank]);
+
+    let inv = env.inventory_state(&market);
+    assert!(inv.raw > 0, "the pool should have seized some collateral");
+    assert!(inv.cost_total > 0);
+    assert_eq!(inv.last_acquired_at, env.now);
+
+    let record_data = env.svm.get_account(&env.record(seq)).unwrap().data;
+    let record = LiquidationRecord::try_deserialize(&mut record_data.as_slice()).unwrap();
+    assert_eq!(record.liquidator, env.b_config());
+    assert_eq!(record.seized_raw, inv.raw);
+    assert_eq!(record.debt_repaid, inv.cost_total);
+
+    let config = env.config_state();
+    assert_eq!(config.inventory_cost_total, inv.cost_total);
+    assert_eq!(config.liq_spent_today, record.debt_repaid);
+
+    let crank_fee = env.balance(&crank_usdc);
+    assert!(crank_fee > 0, "the crank must be paid a slice of the bonus");
+    assert_eq!(
+        cash_before - config.cash,
+        record.debt_repaid + crank_fee,
+        "cash must fall by exactly the repay plus the fee -- nothing unaccounted for"
+    );
+
+    // Deposits and withdrawals pause while the pool holds inventory (D4).
+    let (another, another_usdc) = env.new_funded(100 * USDC);
+    let open = env.b_ix(
+        backstop::accounts::OpenBacker {
+            owner: another.pubkey(),
+            config: env.b_config(),
+            backer: env.backer(&another.pubkey()),
+            system_program: SYSTEM,
+        },
+        backstop::instruction::OpenBacker {},
+    );
+    env.ok(&[open], &[&another]);
+    let dep = env.b_ix(
+        backstop::accounts::Deposit {
+            owner: another.pubkey(),
+            config: env.b_config(),
+            backer: env.backer(&another.pubkey()),
+            usdc_mint: env.usdc_mint,
+            owner_usdc: another_usdc,
+            usdc_vault: env.b_vault(),
+            usdc_token_program: TOKEN_CLASSIC,
+        },
+        backstop::instruction::Deposit { amount: 10 * USDC },
+    );
+    assert_program_error(
+        env.send(&[dep], &[&another]),
+        VerdictError::PausedForInventory,
+    );
+}
+
+#[test]
+fn pool_liquidate_repay_is_bounded_by_the_per_liquidation_cap() {
+    let mut env = with_loan();
+    let admin = env.admin.insecure_clone();
+    let alice = env.alice.pubkey();
+
+    let register = env.v_ix(
+        stock_vault::accounts::AdminOnly {
+            admin: admin.pubkey(),
+            config: vpda(&[VCONFIG_SEED]),
+        },
+        stock_vault::instruction::SetPoolLiquidator {
+            pool_liquidator: env.b_config(),
+        },
+    );
+    env.ok(&[register], &[&admin]);
+    // Small pool: 10% of 10_000 USDC = 1_000 USDC per-liquidation cap, well under the 50_000 USDC
+    // the position could otherwise be liquidated for.
+    env.back(10_000 * USDC);
+    let open_inv = env.open_inventory_ix(&admin.pubkey());
+    env.ok(&[open_inv], &[&admin]);
+    env.walk_price_to(PRICE * 75 / 100);
+
+    let (crank, crank_usdc) = env.new_funded(0);
+    let seq = env.market_state().liq_seq;
+    let ix = env.pool_liquidate_ix(&crank.pubkey(), &crank_usdc, seq, &alice, 50_000 * USDC);
+    env.ok(&[ix], &[&crank]);
+
+    let record_data = env.svm.get_account(&env.record(seq)).unwrap().data;
+    let record = LiquidationRecord::try_deserialize(&mut record_data.as_slice()).unwrap();
+    assert!(
+        record.debt_repaid <= 1_000 * USDC,
+        "must be capped at 10% of the pool's cash, got {}",
+        record.debt_repaid
+    );
+}
+
+#[test]
+fn pool_liquidate_below_the_minimum_is_refused() {
+    let mut env = with_loan();
+    let admin = env.admin.insecure_clone();
+    let alice = env.alice.pubkey();
+
+    let register = env.v_ix(
+        stock_vault::accounts::AdminOnly {
+            admin: admin.pubkey(),
+            config: vpda(&[VCONFIG_SEED]),
+        },
+        stock_vault::instruction::SetPoolLiquidator {
+            pool_liquidator: env.b_config(),
+        },
+    );
+    env.ok(&[register], &[&admin]);
+    env.back(100_000 * USDC);
+    let open_inv = env.open_inventory_ix(&admin.pubkey());
+    env.ok(&[open_inv], &[&admin]);
+    env.walk_price_to(PRICE * 75 / 100);
+
+    let (crank, crank_usdc) = env.new_funded(0);
+    let seq = env.market_state().liq_seq;
+    // Below DEFAULT_MIN_POOL_REPAY (10 USDC).
+    let ix = env.pool_liquidate_ix(&crank.pubkey(), &crank_usdc, seq, &alice, USDC);
+    assert_program_error(env.send(&[ix], &[&crank]), VerdictError::BelowMinPoolRepay);
+}
+
+#[test]
+fn buy_inventory_after_a_pool_liquidation_resells_at_the_current_price() {
+    let mut env = with_loan();
+    let admin = env.admin.insecure_clone();
+    let market = env.market();
+    let alice = env.alice.pubkey();
+
+    let register = env.v_ix(
+        stock_vault::accounts::AdminOnly {
+            admin: admin.pubkey(),
+            config: vpda(&[VCONFIG_SEED]),
+        },
+        stock_vault::instruction::SetPoolLiquidator {
+            pool_liquidator: env.b_config(),
+        },
+    );
+    env.ok(&[register], &[&admin]);
+    env.back(100_000 * USDC);
+    let open_inv = env.open_inventory_ix(&admin.pubkey());
+    env.ok(&[open_inv], &[&admin]);
+    env.walk_price_to(PRICE * 75 / 100);
+
+    let (crank, crank_usdc) = env.new_funded(0);
+    let seq = env.market_state().liq_seq;
+    let ix = env.pool_liquidate_ix(&crank.pubkey(), &crank_usdc, seq, &alice, 50_000 * USDC);
+    env.ok(&[ix], &[&crank]);
+    let inv_before = env.inventory_state(&market);
+
+    // Well past the resale floor (4 days default), so the discount off the healthy price applies
+    // rather than the cost floor. A fresh price keeps `risk_price`'s age guard happy after the warp.
+    env.warp(5 * 86_400);
+    env.push_price(PRICE * 75 / 100);
+
+    let (buyer, buyer_usdc) = env.new_funded(1_000_000 * USDC);
+    let buyer_coll = token_account(
+        &mut env.svm,
+        &buyer,
+        &env.coll_mint.clone(),
+        &buyer.pubkey(),
+        &TOKEN_2022,
+    );
+    let cash_before = env.config_state().cash;
+    let ix = env.b_ix(
+        backstop::accounts::BuyInventory {
+            buyer: buyer.pubkey(),
+            config: env.b_config(),
+            market,
+            inventory: env.inventory(&market),
+            collateral_mint: env.coll_mint,
+            usdc_mint: env.usdc_mint,
+            inventory_vault: env.inventory_vault(&market),
+            pool_usdc_vault: env.b_vault(),
+            buyer_usdc,
+            buyer_collateral: buyer_coll,
+            collateral_token_program: TOKEN_2022,
+            usdc_token_program: TOKEN_CLASSIC,
+        },
+        backstop::instruction::BuyInventory {
+            raw: inv_before.raw,
+            max_price_per_share: u64::MAX,
+        },
+    );
+    env.ok(&[ix], &[&buyer]);
+
+    let inv_after = env.inventory_state(&market);
+    assert_eq!(inv_after.raw, 0);
+    assert_eq!(
+        inv_after.cost_total, 0,
+        "dust-safe close-out on a full sale"
+    );
+    assert_eq!(
+        env.balance(&buyer_coll),
+        inv_before.raw,
+        "the buyer must receive exactly what was bought"
+    );
+    let config = env.config_state();
+    assert_eq!(
+        config.inventory_cost_total, 0,
+        "pause signal must fully clear"
+    );
+    assert!(
+        config.cash > cash_before,
+        "resale proceeds must land back in cash"
+    );
+
+    // The pause is lifted: a deposit now succeeds.
+    env.back(USDC);
+}
+
+#[test]
+fn write_off_inventory_is_refused_when_the_market_is_not_frozen_or_halted() {
+    let mut env = with_loan();
+    let admin = env.admin.insecure_clone();
+    let open_inv = env.open_inventory_ix(&admin.pubkey());
+    env.ok(&[open_inv], &[&admin]);
+    let ix = env.write_off_inventory_ix(&admin.pubkey());
+    assert_program_error(env.send(&[ix], &[&admin]), VerdictError::NotFrozenOrHalted);
+}
+
+#[test]
+fn absorb_interest_credits_cash_and_a_donation_is_never_counted() {
+    let mut env = with_loan();
+    let admin = env.admin.insecure_clone();
+    let market = env.market();
+
+    let register = env.v_ix(
+        stock_vault::accounts::AdminOnly {
+            admin: admin.pubkey(),
+            config: vpda(&[VCONFIG_SEED]),
+        },
+        stock_vault::instruction::SetPoolLiquidator {
+            pool_liquidator: env.b_config(),
+        },
+    );
+    env.ok(&[register], &[&admin]);
+    env.back(1_000 * USDC);
+    let open_ia = env.open_interest_absorbed_ix(&admin.pubkey());
+    env.ok(&[open_ia], &[&admin]);
+
+    // Force real interest to accrue -- update_market_params calls accrue() first, with no other
+    // side effect when the params supplied are unchanged.
+    env.warp(365 * 86_400);
+    let upd = env.v_ix(
+        stock_vault::accounts::UpdateMarket {
+            admin: admin.pubkey(),
+            config: vpda(&[VCONFIG_SEED]),
+            market,
+        },
+        stock_vault::instruction::UpdateMarketParams { params: params() },
+    );
+    env.ok(&[upd], &[&admin]);
+    let owed = env.market_state().backer_interest_owed;
+    assert!(
+        owed > 0,
+        "a year of accrual on a real loan must produce owed interest"
+    );
+
+    let pay = env.pay_backer_interest_ix();
+    env.ok(&[pay], &[&admin]);
+    assert_eq!(env.market_state().backer_interest_owed, 0);
+
+    // A raw donation straight into the pool's USDC vault -- must never be counted as recognised
+    // interest (2c donation invariant, in reverse).
+    let issuer = env.issuer.insecure_clone();
+    let (usdc, vault) = (env.usdc_mint, env.b_vault());
+    mint_to(
+        &mut env.svm,
+        &issuer,
+        &usdc,
+        &vault,
+        5_000 * USDC,
+        &TOKEN_CLASSIC,
+    );
+
+    let cash_before = env.config_state().cash;
+    let absorb = env.absorb_interest_ix();
+    env.ok(&[absorb], &[&admin]);
+    let credited = env.config_state().cash - cash_before;
+    assert_eq!(
+        credited, owed,
+        "must credit exactly the paid interest, not the donation too"
+    );
+    assert_eq!(env.interest_absorbed_state(&market).total_absorbed, owed);
+
+    // A repeat call settles nothing further -- the remainder is zero. A fresh blockhash is needed
+    // so this transaction (otherwise byte-identical to the one above) isn't just deduplicated.
+    env.warp(1);
+    let ix2 = env.absorb_interest_ix();
+    assert_program_error(env.send(&[ix2], &[&admin]), VerdictError::ZeroAmount);
 }
