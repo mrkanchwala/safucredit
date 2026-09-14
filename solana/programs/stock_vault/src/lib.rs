@@ -2,8 +2,8 @@ use anchor_lang::prelude::*;
 use anchor_spl::token_2022::spl_token_2022::state::AccountState;
 use anchor_spl::token_interface::{self, Mint, TokenAccount, TokenInterface, TransferChecked};
 use safu_core::lending::{
-    current_ltv_bps, debt_for_shares, is_liquidatable, liquidation_bonus_bps, max_borrow,
-    max_repay, repay_for_seized, seize_for_repay, shares_for_borrow, shares_for_repay, INDEX_SCALE,
+    current_ltv_bps, debt_for_shares, liquidation_bonus_bps, max_borrow, max_repay,
+    repay_for_seized, seize_for_repay, shares_for_borrow, shares_for_repay, INDEX_SCALE,
 };
 
 pub mod errors;
@@ -30,6 +30,9 @@ pub mod stock_vault {
         config.feed_authority = feed_authority;
         config.paused = false;
         config.bump = ctx.bumps.config;
+        config.pool_liquidator = Pubkey::default();
+        config.fallback_grace_secs = DEFAULT_FALLBACK_GRACE_SECS;
+        config.reserved = [0; 24];
         Ok(())
     }
 
@@ -42,6 +45,73 @@ pub mod stock_vault {
     /// Key rotation (U5).
     pub fn set_feed_authority(ctx: Context<AdminOnly>, feed_authority: Pubkey) -> Result<()> {
         ctx.accounts.config.feed_authority = feed_authority;
+        Ok(())
+    }
+
+    /// Registers the backstop pool's liquidator key (its config PDA). Default unregisters it, which leaves the
+    /// grace rule applying to every liquidator. Never the vault admin or the feed authority.
+    pub fn set_pool_liquidator(ctx: Context<AdminOnly>, pool_liquidator: Pubkey) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        require!(
+            pool_liquidator != config.admin && pool_liquidator != config.feed_authority,
+            VaultError::InvalidPoolLiquidator
+        );
+        config.pool_liquidator = pool_liquidator;
+        Ok(())
+    }
+
+    /// How long a position must be liquidatable before outside liquidators may act. Bounded 1 min to 1 day.
+    pub fn set_fallback_grace(ctx: Context<AdminOnly>, secs: i64) -> Result<()> {
+        require!(
+            (MIN_FALLBACK_GRACE_SECS..=MAX_FALLBACK_GRACE_SECS).contains(&secs),
+            VaultError::InvalidFallbackGrace
+        );
+        ctx.accounts.config.fallback_grace_secs = secs;
+        Ok(())
+    }
+
+    /// Permissionless. Records that a position can be liquidated right now (every liquidation guard passes and
+    /// it is past its line), or clears the record if it cannot. The pool may liquidate at any time; outside
+    /// liquidators only once the position has been marked for the grace period and the mark is still fresh.
+    /// A mark older than twice the grace period restarts the clock, so a position that recovered and fell
+    /// again gets the pool's full head start.
+    pub fn mark_liquidatable(ctx: Context<MarkLiquidatable>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let mint_info = ctx.accounts.collateral_mint.to_account_info();
+        let vault_amount = ctx.accounts.collateral_vault.amount;
+        let vault_frozen = ctx.accounts.collateral_vault.state == AccountState::Frozen;
+        let (paused, grace) = (
+            ctx.accounts.config.paused,
+            ctx.accounts.config.fallback_grace_secs,
+        );
+        let market = &mut ctx.accounts.market;
+        let position = &mut ctx.accounts.position;
+        let open = !paused
+            && liquidation_view(
+                market,
+                position,
+                &mint_info,
+                vault_amount,
+                vault_frozen,
+                now,
+            )
+            .is_ok();
+        if open {
+            let stale =
+                now.saturating_sub(position.liquidatable_last_seen) > grace.saturating_mul(2);
+            if position.liquidatable_first_seen == 0 || stale {
+                position.liquidatable_first_seen = now;
+            }
+            position.liquidatable_last_seen = now;
+        } else {
+            position.liquidatable_first_seen = 0;
+            position.liquidatable_last_seen = 0;
+        }
+        emit!(LiquidatableMarked {
+            position: position.key(),
+            first_seen: position.liquidatable_first_seen,
+            last_seen: position.liquidatable_last_seen,
+        });
         Ok(())
     }
 
@@ -200,7 +270,9 @@ pub mod stock_vault {
         position.coverage_bps = 0;
         position.borrow_age_ts = 0;
         position.payout = ctx.accounts.owner.key();
-        position.reserved = [0; 32];
+        position.liquidatable_first_seen = 0;
+        position.liquidatable_last_seen = 0;
+        position.reserved = [0; 16];
         Ok(())
     }
 
@@ -641,47 +713,41 @@ pub mod stock_vault {
         let market_key = ctx.accounts.market.key();
         let liquidator_key = ctx.accounts.liquidator.key();
 
+        let (pool, grace) = (
+            ctx.accounts.config.pool_liquidator,
+            ctx.accounts.config.fallback_grace_secs,
+        );
         let market = &mut ctx.accounts.market;
-        accrue(market, now)?;
-
-        // D4 before anything else. If the collateral is not actually in the vault, refuse rather
-        // than hand a liquidator tokens that belong to whoever is still in the pool. Raising the
-        // halt flag is `sync_issuer_state`'s job — a flag written here would be rolled back with
-        // the failing transaction anyway.
-        require!(
-            !reconciliation_short(vault_amount, market),
-            VaultError::ReconciliationFailed
-        );
-        require!(!vault_frozen, VaultError::CollateralAccountFrozen);
-        require!(
-            !market.issuer_halt && !issuer_blocks(&mint_info),
-            VaultError::IssuerHalt
-        );
-
-        let schedule = MultiplierSchedule::read(&mint_info)?;
-        require!(
-            !corporate_action_hold(market, &schedule, now)
-                && !unobserved_multiplier_change(market, &schedule, now),
-            VaultError::CorporateActionHold
-        );
-        let multiplier_fp = schedule.effective(now);
-        market.observed_multiplier_fp = multiplier_fp;
-
-        // Liquidation prices on the TWAP, never the last print: one bad tick must not be able to
-        // seize anyone's collateral.
-        let price = risk_price(market, now, PriceUse::Liquidate)?;
-
         let position = &mut ctx.accounts.position;
+        let LiquidationView {
+            multiplier_fp,
+            price,
+            value,
+            debt,
+            terms,
+        } = liquidation_view(
+            market,
+            position,
+            &mint_info,
+            vault_amount,
+            vault_frozen,
+            now,
+        )?;
+        // Pool priority (backstop-as-liquidator lock): the pool acts at once; anyone else only after the position
+        // has been liquidatable for the grace period, which covers a pool that is empty, capped, paused or broken.
+        if liquidator_key != pool {
+            require!(
+                fallback_open(
+                    position.liquidatable_first_seen,
+                    position.liquidatable_last_seen,
+                    grace,
+                    now
+                ),
+                VaultError::PoolPriority
+            );
+        }
         // Frozen into the record below, before any reset: the gate and the payback use these as they were.
         let (borrow_age_ts, payout) = (position.borrow_age_ts, position.payout);
-        let value = value_of(market, position.raw_collateral, multiplier_fp, price)?;
-        let debt = logic::core(debt_for_shares(position.debt_shares, market.borrow_index))?;
-        // U3: the terms in force now, which may still be ramping toward a tightened `params`.
-        let terms = effective_liquidation_terms(market, now);
-        require!(
-            logic::core(is_liquidatable(debt, value, terms.liq_threshold_bps))?,
-            VaultError::NotLiquidatable
-        );
 
         let ltv_bps = logic::core(current_ltv_bps(debt, value))?;
         let bonus_bps = logic::core(liquidation_bonus_bps(
@@ -786,6 +852,8 @@ pub mod stock_vault {
 
         if position.debt_shares == 0 {
             position.borrow_age_ts = 0;
+            position.liquidatable_first_seen = 0;
+            position.liquidatable_last_seen = 0;
         }
 
         let seq = market.liq_seq;
@@ -952,6 +1020,26 @@ pub struct OpenSupplier<'info> {
     )]
     pub supplier: Account<'info, Supplier>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct MarkLiquidatable<'info> {
+    #[account(seeds = [VCONFIG_SEED], bump = config.bump)]
+    pub config: Account<'info, VaultConfig>,
+    #[account(mut, seeds = [MARKET_SEED, market.collateral_mint.as_ref()], bump = market.bump)]
+    pub market: Box<Account<'info, Market>>,
+    #[account(
+        mut,
+        seeds = [POSITION_SEED, market.key().as_ref(), position.owner.as_ref()],
+        bump = position.bump,
+        has_one = market,
+    )]
+    pub position: Box<Account<'info, Position>>,
+    #[account(address = market.collateral_mint, mint::token_program = collateral_token_program)]
+    pub collateral_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(seeds = [COLL_VAULT_SEED, market.key().as_ref()], bump, token::token_program = collateral_token_program)]
+    pub collateral_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub collateral_token_program: Interface<'info, TokenInterface>,
 }
 
 #[derive(Accounts)]
@@ -1126,7 +1214,11 @@ pub struct SyncIssuerState<'info> {
 
 #[derive(Accounts)]
 pub struct Liquidate<'info> {
+    /// Pays the record's rent. Separate from `liquidator` so the backstop pool, whose key is a program-owned
+    /// PDA that cannot fund an account, can liquidate with a crank wallet paying the rent (eng review A1).
     #[account(mut)]
+    pub payer: Signer<'info>,
+    /// Authorizes the USDC in and receives the collateral out.
     pub liquidator: Signer<'info>,
     #[account(seeds = [VCONFIG_SEED], bump = config.bump)]
     pub config: Account<'info, VaultConfig>,
@@ -1143,7 +1235,7 @@ pub struct Liquidate<'info> {
     /// replayed transaction cannot overwrite an earlier one.
     #[account(
         init,
-        payer = liquidator,
+        payer = payer,
         space = 8 + LiquidationRecord::INIT_SPACE,
         seeds = [LIQ_RECORD_SEED, market.key().as_ref(), market.liq_seq.to_le_bytes().as_ref()],
         bump,
@@ -1205,6 +1297,13 @@ pub struct LiquidationTermsTightening {
     pub to: LiquidationTerms,
     pub starts: i64,
     pub completes: i64,
+}
+
+#[event]
+pub struct LiquidatableMarked {
+    pub position: Pubkey,
+    pub first_seen: i64,
+    pub last_seen: i64,
 }
 
 #[event]

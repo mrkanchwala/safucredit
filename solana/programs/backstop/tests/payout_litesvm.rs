@@ -789,8 +789,21 @@ fn liquidate(env: &mut Env, liquidator: Option<&Keypair>, price_fraction: u64) -
     let market = env.market();
     let seq = env.market_state().liq_seq;
     let alice = env.alice.pubkey();
+    // Registered as the pool, so it may act at once; the grace rule is tested in the vault's own suite.
+    let admin = env.admin.insecure_clone();
+    let register = env.v_ix(
+        stock_vault::accounts::AdminOnly {
+            admin: admin.pubkey(),
+            config: vpda(&[VCONFIG_SEED]),
+        },
+        stock_vault::instruction::SetPoolLiquidator {
+            pool_liquidator: liq.pubkey(),
+        },
+    );
+    env.ok(&[register], &[&admin]);
     let ix = env.v_ix(
         stock_vault::accounts::Liquidate {
+            payer: liq.pubkey(),
             liquidator: liq.pubkey(),
             config: vpda(&[VCONFIG_SEED]),
             market,

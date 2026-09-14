@@ -22,7 +22,7 @@ use spl_token_2022_interface::{
     state::{Account as T22Account, Mint as T22Mint},
     ID as TOKEN_2022,
 };
-use stock_vault::state::LIQUIDATION_TERMS_RAMP_SECS;
+use stock_vault::state::{DEFAULT_FALLBACK_GRACE_SECS, LIQUIDATION_TERMS_RAMP_SECS};
 use stock_vault::{
     errors::VaultError,
     state::{
@@ -623,6 +623,25 @@ fn set_admin_ix(admin: &Pubkey, new_admin: &Pubkey) -> Instruction {
         program_id: stock_vault::ID,
         accounts: admin_only_metas(admin),
         data: stock_vault::instruction::SetAdmin { admin: *new_admin }.data(),
+    }
+}
+
+fn set_pool_liquidator_ix(admin: &Pubkey, pool: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: stock_vault::ID,
+        accounts: admin_only_metas(admin),
+        data: stock_vault::instruction::SetPoolLiquidator {
+            pool_liquidator: *pool,
+        }
+        .data(),
+    }
+}
+
+fn set_fallback_grace_ix(admin: &Pubkey, secs: i64) -> Instruction {
+    Instruction {
+        program_id: stock_vault::ID,
+        accounts: admin_only_metas(admin),
+        data: stock_vault::instruction::SetFallbackGrace { secs }.data(),
     }
 }
 
@@ -2189,9 +2208,22 @@ impl Env {
         borrower: &Pubkey,
         repay: u64,
     ) -> Instruction {
+        self.liquidate_ix_paid_by(liquidator, liquidator, liq_usdc, liq_coll, borrower, repay)
+    }
+
+    fn liquidate_ix_paid_by(
+        &self,
+        payer: &Pubkey,
+        liquidator: &Pubkey,
+        liq_usdc: &Pubkey,
+        liq_coll: &Pubkey,
+        borrower: &Pubkey,
+        repay: u64,
+    ) -> Instruction {
         Instruction {
             program_id: stock_vault::ID,
             accounts: stock_vault::accounts::Liquidate {
+                payer: *payer,
                 liquidator: *liquidator,
                 config: self.config(),
                 market: self.market(),
@@ -2228,8 +2260,19 @@ impl Env {
         }
     }
 
-    /// A funded liquidator with both token accounts open.
+    /// A funded liquidator registered as the pool, so it may act at once (as the backstop pool will).
     fn new_liquidator(&mut self, usdc: u64) -> (Keypair, Pubkey, Pubkey) {
+        let (who, u, c) = self.new_outside_liquidator(usdc);
+        let admin = self.admin.insecure_clone();
+        self.ok(
+            &[set_pool_liquidator_ix(&admin.pubkey(), &who.pubkey())],
+            &[&admin],
+        );
+        (who, u, c)
+    }
+
+    /// A funded liquidator with both token accounts open, NOT the pool: it waits for the grace period.
+    fn new_outside_liquidator(&mut self, usdc: u64) -> (Keypair, Pubkey, Pubkey) {
         let who = Keypair::new();
         self.svm.airdrop(&who.pubkey(), 100_000_000_000).unwrap();
         let (usdc_mint, coll_mint) = (self.usdc_mint, self.coll_mint);
@@ -2745,4 +2788,208 @@ fn sync_issuer_state_catches_a_vault_shortfall_and_is_permissionless() {
     let ix = env.sync_issuer_ix();
     env.ok(&[ix], &[&stranger]);
     assert!(env.market_state().issuer_halt);
+}
+
+// ============================================================ phase 1: pool priority and the fallback grace period
+
+impl Env {
+    fn mark_ix(&self, borrower: &Pubkey) -> Instruction {
+        Instruction {
+            program_id: stock_vault::ID,
+            accounts: stock_vault::accounts::MarkLiquidatable {
+                config: self.config(),
+                market: self.market(),
+                position: self.position(borrower),
+                collateral_mint: self.coll_mint,
+                collateral_vault: self.coll_vault(),
+                collateral_token_program: TOKEN_2022,
+            }
+            .to_account_metas(None),
+            data: stock_vault::instruction::MarkLiquidatable {}.data(),
+        }
+    }
+
+    fn marks(&self, borrower: &Pubkey) -> (i64, i64) {
+        let p = self.position_state(borrower);
+        (p.liquidatable_first_seen, p.liquidatable_last_seen)
+    }
+}
+
+#[test]
+fn only_the_admin_registers_the_pool_and_sets_the_grace_within_bounds() {
+    let mut env = base();
+    let (admin, feed, intruder) = (
+        env.admin.insecure_clone(),
+        env.feed.insecure_clone(),
+        env.alice.insecure_clone(),
+    );
+    let pool = Pubkey::new_unique();
+    assert_eq!(
+        env.config_state().fallback_grace_secs,
+        DEFAULT_FALLBACK_GRACE_SECS
+    );
+    assert_eq!(env.config_state().pool_liquidator, Pubkey::default());
+
+    assert_program_error(
+        env.send(
+            &[set_pool_liquidator_ix(&intruder.pubkey(), &pool)],
+            &[&intruder],
+        ),
+        VaultError::Unauthorized,
+    );
+    for bad in [admin.pubkey(), feed.pubkey()] {
+        assert_program_error(
+            env.send(&[set_pool_liquidator_ix(&admin.pubkey(), &bad)], &[&admin]),
+            VaultError::InvalidPoolLiquidator,
+        );
+    }
+    env.ok(&[set_pool_liquidator_ix(&admin.pubkey(), &pool)], &[&admin]);
+    assert_eq!(env.config_state().pool_liquidator, pool);
+    env.ok(
+        &[set_pool_liquidator_ix(&admin.pubkey(), &Pubkey::default())],
+        &[&admin],
+    );
+    assert_eq!(env.config_state().pool_liquidator, Pubkey::default());
+
+    for bad in [59, 86_401] {
+        assert_program_error(
+            env.send(&[set_fallback_grace_ix(&admin.pubkey(), bad)], &[&admin]),
+            VaultError::InvalidFallbackGrace,
+        );
+    }
+    env.ok(&[set_fallback_grace_ix(&admin.pubkey(), 600)], &[&admin]);
+    assert_eq!(env.config_state().fallback_grace_secs, 600);
+}
+
+#[test]
+fn the_pool_liquidates_at_once_while_an_outsider_is_refused() {
+    let mut env = lending_env();
+    let alice = env.alice.insecure_clone();
+    let (outsider, ou, oc) = env.new_outside_liquidator(10_000 * USDC);
+    let (pool, pu, pc) = env.new_liquidator(10_000 * USDC);
+    env.walk_price_to(PRICE * 75 / 100);
+
+    let ix = env.liquidate_ix(&outsider.pubkey(), &ou, &oc, &alice.pubkey(), 100 * USDC);
+    assert_program_error(env.send(&[ix], &[&outsider]), VaultError::PoolPriority);
+    let ix = env.liquidate_ix(&pool.pubkey(), &pu, &pc, &alice.pubkey(), 100 * USDC);
+    env.ok(&[ix], &[&pool]);
+    assert_eq!(env.record_state(0).liquidator, pool.pubkey());
+}
+
+#[test]
+fn an_outsider_may_liquidate_once_the_position_has_been_marked_for_the_grace_period() {
+    let mut env = lending_env();
+    let alice = env.alice.insecure_clone();
+    let (outsider, ou, oc) = env.new_outside_liquidator(10_000 * USDC);
+    env.walk_price_to(PRICE * 75 / 100);
+    let g = DEFAULT_FALLBACK_GRACE_SECS;
+
+    let ix = env.liquidate_ix(&outsider.pubkey(), &ou, &oc, &alice.pubkey(), 100 * USDC);
+    assert_program_error(env.send(&[ix], &[&outsider]), VaultError::PoolPriority);
+
+    let ix = env.mark_ix(&alice.pubkey());
+    env.ok(&[ix], &[&outsider]);
+    env.warp(g - 1);
+    let ix = env.liquidate_ix(&outsider.pubkey(), &ou, &oc, &alice.pubkey(), 101 * USDC);
+    assert_program_error(env.send(&[ix], &[&outsider]), VaultError::PoolPriority);
+    env.warp(1);
+    let ix = env.liquidate_ix(&outsider.pubkey(), &ou, &oc, &alice.pubkey(), 102 * USDC);
+    env.ok(&[ix], &[&outsider]);
+    assert_eq!(env.record_state(0).liquidator, outsider.pubkey());
+}
+
+#[test]
+fn a_stale_mark_restarts_the_grace_clock() {
+    let mut env = lending_env();
+    let alice = env.alice.insecure_clone();
+    let (outsider, ou, oc) = env.new_outside_liquidator(10_000 * USDC);
+    env.walk_price_to(PRICE * 75 / 100);
+    let g = DEFAULT_FALLBACK_GRACE_SECS;
+
+    let ix = env.mark_ix(&alice.pubkey());
+    env.ok(&[ix], &[&outsider]);
+    // Nobody re-marks for longer than the grace period: the old mark no longer counts.
+    env.warp(2 * g + 1);
+    let ix = env.liquidate_ix(&outsider.pubkey(), &ou, &oc, &alice.pubkey(), 100 * USDC);
+    assert_program_error(env.send(&[ix], &[&outsider]), VaultError::PoolPriority);
+
+    // Re-marking after that long restarts the clock rather than continuing it.
+    let ix = env.mark_ix(&alice.pubkey());
+    env.ok(&[ix], &[&outsider]);
+    assert_eq!(env.marks(&alice.pubkey()), (env.now, env.now));
+    env.warp(g);
+    let ix = env.liquidate_ix(&outsider.pubkey(), &ou, &oc, &alice.pubkey(), 101 * USDC);
+    env.ok(&[ix], &[&outsider]);
+}
+
+#[test]
+fn marking_counts_only_while_a_liquidation_could_actually_happen() {
+    let mut env = lending_env();
+    let (alice, admin) = (env.alice.insecure_clone(), env.admin.insecure_clone());
+
+    // At the borrow limit the position is healthy: nothing is recorded.
+    let ix = env.mark_ix(&alice.pubkey());
+    env.ok(&[ix], &[&alice]);
+    assert_eq!(env.marks(&alice.pubkey()), (0, 0));
+
+    env.walk_price_to(PRICE * 75 / 100);
+    let ix = env.mark_ix(&alice.pubkey());
+    env.ok(&[ix], &[&alice]);
+    let first = env.now;
+    assert_eq!(env.marks(&alice.pubkey()), (first, first));
+
+    // A re-mark within the window keeps the first sighting.
+    env.warp(60);
+    let ix = env.mark_ix(&alice.pubkey());
+    env.ok(&[ix], &[&alice]);
+    assert_eq!(env.marks(&alice.pubkey()), (first, env.now));
+
+    // While the vault is paused no liquidation can happen, so the clock is cleared, not left running.
+    env.ok(&[set_paused_ix(&admin.pubkey(), true)], &[&admin]);
+    env.warp(60);
+    let ix = env.mark_ix(&alice.pubkey());
+    env.ok(&[ix], &[&alice]);
+    assert_eq!(env.marks(&alice.pubkey()), (0, 0));
+}
+
+/// Eng review A1: the backstop pool's key is a PDA that cannot pay rent, so the record's rent comes from a
+/// separate payer. Proven here with a liquidator that holds no SOL at all.
+#[test]
+fn a_separate_payer_covers_the_record_rent_for_a_liquidator_with_no_sol() {
+    let mut env = lending_env();
+    let (alice, bob, admin, issuer) = (
+        env.alice.insecure_clone(),
+        env.bob.insecure_clone(),
+        env.admin.insecure_clone(),
+        env.issuer.insecure_clone(),
+    );
+    let broke = Keypair::new();
+    let (usdc, coll) = (env.usdc_mint, env.coll_mint);
+    let bu = create_token_account(&mut env.svm, &admin, &usdc, &broke.pubkey(), &TOKEN_CLASSIC);
+    let bc = create_token_account(&mut env.svm, &admin, &coll, &broke.pubkey(), &TOKEN_2022);
+    mint_to(
+        &mut env.svm,
+        &issuer,
+        &usdc,
+        &bu,
+        10_000 * USDC,
+        &TOKEN_CLASSIC,
+    );
+    env.ok(
+        &[set_pool_liquidator_ix(&admin.pubkey(), &broke.pubkey())],
+        &[&admin],
+    );
+    env.walk_price_to(PRICE * 75 / 100);
+
+    let ix = env.liquidate_ix_paid_by(
+        &bob.pubkey(),
+        &broke.pubkey(),
+        &bu,
+        &bc,
+        &alice.pubkey(),
+        100 * USDC,
+    );
+    env.ok(&[ix], &[&bob, &broke]);
+    assert_eq!(env.svm.get_balance(&broke.pubkey()).unwrap_or(0), 0);
+    assert_eq!(env.record_state(0).liquidator, broke.pubkey());
 }

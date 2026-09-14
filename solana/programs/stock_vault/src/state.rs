@@ -26,7 +26,13 @@ pub struct VaultConfig {
     pub feed_authority: Pubkey,
     pub paused: bool,
     pub bump: u8,
-    pub reserved: [u8; 64],
+    /// The backstop pool's liquidator key (its config PDA). It may liquidate at once; anyone else only after
+    /// the grace period. Default = no pool registered, so the grace rule applies to every liquidator.
+    pub pool_liquidator: Pubkey,
+    /// How long a position must have been liquidatable before an outside liquidator may act. 900 s.
+    pub fallback_grace_secs: i64,
+    /// Taken from the old 64 reserved bytes (32 + 8), so the account size is unchanged (U4).
+    pub reserved: [u8; 24],
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq, InitSpace)]
@@ -36,6 +42,11 @@ pub struct RateParams {
     pub slope2_bps: u32,
     pub kink_bps: u32,
 }
+
+/// Outside liquidators wait this long after a position is first marked liquidatable (eng review A2).
+pub const DEFAULT_FALLBACK_GRACE_SECS: i64 = 900;
+pub const MIN_FALLBACK_GRACE_SECS: i64 = 60;
+pub const MAX_FALLBACK_GRACE_SECS: i64 = 86_400;
 
 /// How long a tightening of the liquidation terms takes to reach existing loans (U3, founder 2026-09-14).
 /// Loosening applies at once. A constant, not a parameter: an admin must not be able to set it to zero.
@@ -214,7 +225,12 @@ pub struct Position {
     /// Where a wrongful-liquidation payback goes. Defaults to the owner, who may change it. A liquidation
     /// record freezes it, so nobody can redirect a payback after the fact.
     pub payout: Pubkey,
-    pub reserved: [u8; 32],
+    /// When this position was first seen liquidatable by `mark_liquidatable`, and most recently. 0 = not
+    /// marked. Outside liquidators wait on these; the pool does not.
+    pub liquidatable_first_seen: i64,
+    pub liquidatable_last_seen: i64,
+    /// Taken from the old 32 reserved bytes (8 + 8).
+    pub reserved: [u8; 16],
 }
 
 #[account]

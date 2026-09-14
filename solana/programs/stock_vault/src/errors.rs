@@ -50,6 +50,12 @@ pub enum VaultError {
     InvalidAdmin,
     #[msg("Payback address cannot be the default key, the vault admin or the feed authority")]
     InvalidPayoutAddress,
+    #[msg("Only the backstop pool may liquidate until the position has been liquidatable for the grace period")]
+    PoolPriority,
+    #[msg("Pool liquidator cannot be the vault admin or the feed authority")]
+    InvalidPoolLiquidator,
+    #[msg("Fallback grace period is outside its bounds")]
+    InvalidFallbackGrace,
 }
 
 impl From<safu_core::CoreError> for VaultError {

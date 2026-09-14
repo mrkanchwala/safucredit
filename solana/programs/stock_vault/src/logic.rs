@@ -17,7 +17,9 @@ use safu_core::{
 };
 
 use crate::errors::VaultError;
-use crate::state::{LiquidationTerms, Market, PriceState, LIQUIDATION_TERMS_RAMP_SECS, TWAP_SLOTS};
+use crate::state::{
+    LiquidationTerms, Market, Position, PriceState, LIQUIDATION_TERMS_RAMP_SECS, TWAP_SLOTS,
+};
 
 pub fn core<T>(r: safu_core::Result<T>) -> Result<T> {
     r.map_err(|e| VaultError::from(e).into())
@@ -303,6 +305,81 @@ pub fn value_of(m: &Market, raw: u64, multiplier_fp: u128, price: u64) -> Result
     ))
 }
 
+// ------------------------------------------------------------------ liquidation view (shared by liquidate and mark)
+
+/// What `liquidate` needs once every guard has passed.
+pub struct LiquidationView {
+    pub multiplier_fp: u128,
+    pub price: u64,
+    pub value: u64,
+    pub debt: u64,
+    pub terms: LiquidationTerms,
+}
+
+/// Every guard `liquidate` applies before seizing collateral, then the liquidation test itself. Shared with
+/// `mark_liquidatable`, so "liquidatable" means exactly the same thing to both: the grace clock only runs
+/// while a liquidation could actually have happened.
+pub fn liquidation_view(
+    market: &mut Market,
+    position: &Position,
+    mint_info: &AccountInfo,
+    vault_amount: u64,
+    vault_frozen: bool,
+    now: i64,
+) -> Result<LiquidationView> {
+    accrue(market, now)?;
+    // D4 before anything else. If the collateral is not actually in the vault, refuse rather than hand a
+    // liquidator tokens that belong to whoever is still in the pool. Raising the halt flag is
+    // `sync_issuer_state`'s job.
+    require!(
+        !reconciliation_short(vault_amount, market),
+        VaultError::ReconciliationFailed
+    );
+    require!(!vault_frozen, VaultError::CollateralAccountFrozen);
+    require!(
+        !market.issuer_halt && !issuer_blocks(mint_info),
+        VaultError::IssuerHalt
+    );
+    let schedule = MultiplierSchedule::read(mint_info)?;
+    require!(
+        !corporate_action_hold(market, &schedule, now)
+            && !unobserved_multiplier_change(market, &schedule, now),
+        VaultError::CorporateActionHold
+    );
+    let multiplier_fp = schedule.effective(now);
+    market.observed_multiplier_fp = multiplier_fp;
+    // Liquidation prices on the TWAP, never the last print: one bad tick must not seize anyone's collateral.
+    let price = risk_price(market, now, PriceUse::Liquidate)?;
+    let value = value_of(market, position.raw_collateral, multiplier_fp, price)?;
+    let debt = core(debt_for_shares(position.debt_shares, market.borrow_index))?;
+    // U3: the terms in force now, which may still be ramping toward a tightened `params`.
+    let terms = effective_liquidation_terms(market, now);
+    require!(
+        core(safu_core::lending::is_liquidatable(
+            debt,
+            value,
+            terms.liq_threshold_bps
+        ))?,
+        VaultError::NotLiquidatable
+    );
+    Ok(LiquidationView {
+        multiplier_fp,
+        price,
+        value,
+        debt,
+        terms,
+    })
+}
+
+/// Whether an outside liquidator may act: the position was first marked at least `grace` ago, and the
+/// latest mark is no older than `grace` (a stale mark from before the position recovered does not count).
+/// `liquidate` itself re-checks that the position is liquidatable now.
+pub fn fallback_open(first_seen: i64, last_seen: i64, grace: i64, now: i64) -> bool {
+    first_seen > 0
+        && now.saturating_sub(first_seen) >= grace
+        && now.saturating_sub(last_seen) <= grace
+}
+
 // ------------------------------------------------------------------ loan age
 
 /// Debt-weighted borrow time after borrowing `amount` on top of `old_debt` carried at `old_age_ts`:
@@ -370,6 +447,29 @@ pub fn ramp_start_terms(current: LiquidationTerms, new: LiquidationTerms) -> Liq
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_opens_only_after_a_fresh_mark_has_aged_past_the_grace_period() {
+        let g = 900;
+        assert!(!fallback_open(0, 0, g, 10_000), "never marked");
+        assert!(
+            !fallback_open(1_000, 1_000, g, 1_000 + g - 1),
+            "one second short"
+        );
+        assert!(
+            fallback_open(1_000, 1_000, g, 1_000 + g),
+            "exactly the grace period"
+        );
+        assert!(
+            !fallback_open(1_000, 1_000, g, 1_000 + g + 1),
+            "the only mark has gone stale"
+        );
+        assert!(fallback_open(1_000, 2_500, g, 3_000), "re-marked recently");
+        assert!(
+            !fallback_open(i64::MIN + 1, i64::MIN + 1, g, i64::MAX),
+            "saturating, stale"
+        );
+    }
 
     #[test]
     fn borrow_age_is_weighted_by_size_and_never_reads_older() {
