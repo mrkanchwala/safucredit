@@ -152,14 +152,19 @@ pub struct Market {
     pub last_accrual_ts: i64,
     /// Sum of all positions' raw collateral, for reconciliation against the vault (review D4).
     pub total_collateral_raw: u64,
+    /// Bad debt still uncovered. Falls when the backstop reimburses it.
     pub bad_debt: u64,
+    /// Every write-off this market has ever taken, monotonic. The backstop compares its own running
+    /// total against this to work out what it still owes, which makes reimbursement idempotent with
+    /// no epoch counter to keep in step.
+    pub bad_debt_cumulative: u64,
     pub issuer_halt: bool,
     pub liq_seq: u64,
     /// Effective multiplier this market last acted on, in `MULT_SCALE` fixed point. The baseline the
     /// unannounced-change guard compares the live value against. Seeded by `create_market`; 0 means
     /// "not yet observed", which the guard treats as no change rather than as a change from zero.
     pub observed_multiplier_fp: u128,
-    pub reserved: [u8; 48],
+    pub reserved: [u8; 40],
 }
 
 #[account]

@@ -106,10 +106,11 @@ pub mod stock_vault {
         market.last_accrual_ts = now;
         market.total_collateral_raw = 0;
         market.bad_debt = 0;
+        market.bad_debt_cumulative = 0;
         market.issuer_halt = false;
         market.liq_seq = 0;
         market.observed_multiplier_fp = schedule.effective(now);
-        market.reserved = [0; 48];
+        market.reserved = [0; 40];
 
         emit!(MarketCreated {
             market: market.key(),
@@ -530,6 +531,35 @@ pub mod stock_vault {
         Ok(())
     }
 
+    /// Credits USDC sitting in the market's vault beyond what the market has accounted for, against
+    /// bad debt. Permissionless and authority-free by construction.
+    ///
+    /// The backstop reimburses bad debt by simply transferring USDC into this market's USDC vault.
+    /// Cash is tracked internally precisely so a raw transfer cannot move the share price, which
+    /// means that reimbursement would otherwise sit unaccounted forever. This instruction is the one
+    /// place unaccounted surplus may be recognised, and it is bounded by `bad_debt` — so a stranger
+    /// donating tokens can repair a write-off but can never inflate the pool beyond it. Anything
+    /// above the outstanding bad debt stays unaccounted, exactly as before.
+    pub fn absorb_bad_debt_cover(ctx: Context<AbsorbBadDebtCover>) -> Result<()> {
+        let vault_amount = ctx.accounts.usdc_vault.amount;
+        let market_key = ctx.accounts.market.key();
+        let market = &mut ctx.accounts.market;
+        let surplus = vault_amount.saturating_sub(market.cash);
+        let absorbed = surplus.min(market.bad_debt);
+        require!(absorbed > 0, VaultError::ZeroAmount);
+        market.cash = market
+            .cash
+            .checked_add(absorbed)
+            .ok_or(VaultError::MathOverflow)?;
+        market.bad_debt -= absorbed;
+        emit!(BadDebtCovered {
+            market: market_key,
+            absorbed,
+            bad_debt_remaining: market.bad_debt,
+        });
+        Ok(())
+    }
+
     /// Permissionless liquidation of a position past its threshold.
     ///
     /// The liquidator repays USDC on the borrower's behalf and receives collateral at a bonus that
@@ -685,6 +715,10 @@ pub mod stock_vault {
             position.debt_shares = 0;
             market.bad_debt = market
                 .bad_debt
+                .checked_add(bad_debt)
+                .ok_or(VaultError::MathOverflow)?;
+            market.bad_debt_cumulative = market
+                .bad_debt_cumulative
                 .checked_add(bad_debt)
                 .ok_or(VaultError::MathOverflow)?;
         }
@@ -987,6 +1021,14 @@ pub struct Borrow<'info> {
 }
 
 #[derive(Accounts)]
+pub struct AbsorbBadDebtCover<'info> {
+    #[account(mut, seeds = [MARKET_SEED, market.collateral_mint.as_ref()], bump = market.bump)]
+    pub market: Box<Account<'info, Market>>,
+    #[account(seeds = [USDC_VAULT_SEED, market.key().as_ref()], bump)]
+    pub usdc_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+}
+
+#[derive(Accounts)]
 pub struct SyncIssuerState<'info> {
     #[account(mut, seeds = [MARKET_SEED, market.collateral_mint.as_ref()], bump = market.bump)]
     pub market: Box<Account<'info, Market>>,
@@ -1119,6 +1161,13 @@ pub struct Borrowed {
     pub owner: Pubkey,
     pub amount: u64,
     pub shares: u128,
+}
+
+#[event]
+pub struct BadDebtCovered {
+    pub market: Pubkey,
+    pub absorbed: u64,
+    pub bad_debt_remaining: u64,
 }
 
 #[event]

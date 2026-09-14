@@ -674,7 +674,11 @@ dependencies = [
  "solana-message",
  "solana-sdk-ids",
  "solana-signer",
+ "solana-system-interface 2.0.0",
  "solana-transaction",
+ "spl-token-2022-interface",
+ "spl-token-interface",
+ "stock_vault",
 ]
 
 [[package]]

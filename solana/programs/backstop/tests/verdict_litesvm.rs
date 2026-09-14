@@ -60,7 +60,15 @@ fn setup(cluster_tag: u8) -> Env {
         verdict_oracle: oracle.pubkey(),
         cluster_tag,
         bump,
-        reserved: [0; 64],
+        // Token fields are unused by these tests: nothing here moves USDC. They exist so the
+        // fixture matches the live layout after 2c.
+        usdc_mint: Pubkey::new_unique(),
+        cash: 0,
+        total_shares: 0,
+        per_claim_cap_bps: 1_000,
+        open_claims: 0,
+        withdraw_delay_secs: 0,
+        reserved: [0; 32],
     };
     let mut data = Vec::new();
     config.try_serialize(&mut data).unwrap();
