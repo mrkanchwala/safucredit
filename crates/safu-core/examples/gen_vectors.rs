@@ -339,7 +339,7 @@ fn hand_picked(v: &mut Vectors) {
         33_028_000_000,
     );
     v.collateral_value(
-        "u64 max raw at 1000x overflows u128",
+        "u64 max raw and price at 1000x is past u64",
         u64::MAX,
         8,
         MULT_SCALE * 1_000,
@@ -347,16 +347,30 @@ fn hand_picked(v: &mut Vectors) {
     );
     v.collateral_value("u64 max raw at 1x", u64::MAX, 8, MULT_SCALE, 1);
     v.collateral_value(
+        "E2: u64 max raw and price at 1000x, 21 decimals, values exactly",
+        u64::MAX,
+        21,
+        1_000 * MULT_SCALE,
+        u64::MAX,
+    );
+    v.collateral_value(
+        "E2: one rounding step, not three",
+        123_456_789,
+        AAPLX_DECIMALS,
+        AAPLX_MULT,
+        PRICE_330_28,
+    );
+    v.collateral_value(
         "result overflows u64",
         u64::MAX,
         0,
         MULT_SCALE,
         100_000_000_000,
     );
-    v.collateral_value("multiplier u128 max overflows", 2, 8, u128::MAX, 1);
-    v.collateral_value("decimals 38 ok", u64::MAX, 38, MULT_SCALE, u64::MAX);
-    v.collateral_value("decimals 39 overflows pow10", 1, 39, MULT_SCALE, 1);
-    v.collateral_value("decimals 255 overflows pow10", 1, 255, MULT_SCALE, 1);
+    v.collateral_value("multiplier u128 max is past u64", 2, 8, u128::MAX, 1);
+    v.collateral_value("decimals 38", u64::MAX, 38, MULT_SCALE, u64::MAX);
+    v.collateral_value("decimals 39", 1, 39, MULT_SCALE, 1);
+    v.collateral_value("decimals 255 floors to zero", 1, 255, MULT_SCALE, 1);
 
     let smp = |price_fp, ts| Sample { price_fp, ts };
     v.twap("single sample", &[smp(33_028_000_000, 100)], 400);

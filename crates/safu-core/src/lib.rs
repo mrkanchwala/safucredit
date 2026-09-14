@@ -13,6 +13,7 @@ pub mod collateral;
 pub mod lending;
 pub mod loss;
 pub mod price;
+mod wide;
 
 /// Basis points in 100%.
 pub const BPS: u128 = 10_000;

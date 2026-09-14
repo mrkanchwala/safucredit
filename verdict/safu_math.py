@@ -6,9 +6,9 @@ golden vectors in `tests/vectors/safu_core.json`, asserted by both `cargo test` 
 
 Rules copied from the crate, so the two cannot drift silently:
 - Integers only. No floats anywhere.
-- Rust's checked u128 arithmetic is reproduced: an intermediate past u128, or a result past u64, raises
-  `CoreError("Overflow")` exactly where Rust returns `Err(Overflow)`.
-- Rounding favours the protocol: collateral value rounds down.
+- Rust's overflow behaviour is reproduced: an intermediate past u128 (or past 256 bits in valuation, which cannot
+  happen), or a result past u64, raises `CoreError("Overflow")` exactly where Rust returns `Err(Overflow)`.
+- Rounding favours the protocol: collateral value rounds down, exactly once.
 
 Inputs outside the Rust parameter types (a negative amount, a u64 above 2^64 - 1) cannot reach the Rust
 functions at all, so they raise `ValueError` here rather than a `CoreError`.
@@ -123,13 +123,6 @@ def _to_u64(v: int) -> int:
     return v
 
 
-def _pow10(n: int) -> int:
-    r = 10**n
-    if r > U128_MAX:
-        raise CoreError("Overflow")
-    return r
-
-
 def _i64_checked_sub(a: int, b: int) -> int:
     r = a - b
     if not I64_MIN <= r <= I64_MAX:
@@ -173,16 +166,19 @@ def effective_multiplier(
 
 
 def collateral_value(raw: int, decimals: int, multiplier_fp: int, price_fp: int) -> int:
-    """USD value (6 decimals) of `raw` base units, at `multiplier_fp` and `price_fp` (8 decimals). Rounds down."""
+    """USD value (6 decimals) of `raw` base units, at `multiplier_fp` and `price_fp` (8 decimals).
+
+    One exact floor division. Rust computes the same product in 256 bits (eng review E2), where it always fits,
+    so the only overflow is a value past u64.
+    """
     _u64(raw, "raw")
     _u8(decimals, "decimals")
     _u128(multiplier_fp, "multiplier_fp")
     _u64(price_fp, "price_fp")
     if multiplier_fp == 0:
         raise CoreError("InvalidMultiplier")
-    scaled_raw = _div(_mul(raw, multiplier_fp), MULT_SCALE)
-    usd_price_units = _div(_mul(scaled_raw, price_fp), _pow10(decimals))
-    return _to_u64(_div(usd_price_units, _pow10(PRICE_DECIMALS - USD_DECIMALS)))
+    divisor = MULT_SCALE * 10 ** (PRICE_DECIMALS - USD_DECIMALS) * 10**decimals
+    return _to_u64(raw * price_fp * multiplier_fp // divisor)
 
 
 # --- price.rs ---------------------------------------------------------------------------------------------

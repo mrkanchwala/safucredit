@@ -14,3 +14,4 @@ __pycache__
 keys/
 # CMC redistribution terms unverified: recordings stay local until checked
 verdict/recordings/
+.pytest_cache

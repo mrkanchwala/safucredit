@@ -52,6 +52,34 @@ proptest! {
     }
 
     #[test]
+    fn valuation_matches_plain_u128_math_wherever_that_fits(raw in 0u64..=1_000_000_000_000, d in 0u8..=18, m in 0u128..=10_000_000_000_000, p in 0u64..=1_000_000_000_000) {
+        // Independent reference: one exact floor division in u128 (every input here keeps the product inside u128),
+        // and Overflow exactly when the true value is past u64.
+        let reference = (raw as u128 * p as u128 * m) / (MULT_SCALE * 100 * 10u128.pow(d as u32));
+        if m == 0 {
+            prop_assert_eq!(collateral_value(raw, d, m, p), Err(safu_core::CoreError::InvalidMultiplier));
+        } else {
+            let want = u64::try_from(reference).map_err(|_| safu_core::CoreError::Overflow);
+            prop_assert_eq!(collateral_value(raw, d, m, p), want);
+        }
+    }
+
+    #[test]
+    fn raw_for_usd_matches_plain_u128_math_wherever_that_fits(usd in any::<u32>(), d in 0u8..=8, m in 1u128..=10_000_000_000_000, p in 1u64..=1_000_000_000_000) {
+        let reference = (usd as u128 * 100 * 10u128.pow(d as u32) * MULT_SCALE) / (p as u128 * m);
+        match u64::try_from(reference) {
+            Ok(r) => prop_assert_eq!(raw_for_usd(usd as u64, d, m, p), Ok(r)),
+            Err(_) => prop_assert_eq!(raw_for_usd(usd as u64, d, m, p), Err(safu_core::CoreError::Overflow)),
+        }
+    }
+
+    #[test]
+    fn full_range_raw_and_price_never_overflow_once_the_value_fits(raw in any::<u64>(), p in any::<u64>(), d in 21u8..=255, m in 1u128..=(MULT_SCALE * 1_000)) {
+        // raw × price × m ≤ (2^64)^2 × 10^15, so at 21+ decimals the value is below 3.5 × 10^18 < u64::MAX (E2).
+        prop_assert!(collateral_value(raw, d, m, p).is_ok());
+    }
+
+    #[test]
     fn effective_multiplier_boundary(now in any::<i64>(), ts in any::<i64>(), cur in any::<u128>(), new in any::<u128>()) {
         let got = effective_multiplier(now, cur, new, ts);
         prop_assert_eq!(got, if now >= ts { new } else { cur });
