@@ -127,6 +127,25 @@ jobs:
       - name: LiteSVM tests
         run: cargo test --locked
 
+      # Cross-language proof: the Python verdict engine (verdict/engine.py, tx.py) builds a real
+      # transaction and fires it at the just-built backstop.so, not at a Python port of the parser.
+      # Runs here, not in the `verdict` job, because only this job has the compiled program.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install solders
+        working-directory: .
+        run: python -m pip install solders==0.26.0
+
+      - name: Generate a throwaway devnet oracle key
+        working-directory: .
+        run: python3 verdict/generate_oracle_key.py
+
+      - name: Verdict engine vs. the real backstop.so (LiteSVM)
+        working-directory: .
+        run: python3 verdict/verify_litesvm.py
+
   audit:
     name: dependency audit gate
     runs-on: ubuntu-latest
