@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "generator": "crates/safu-core/examples/gen_vectors.rs (safu-core 0.1.0), seed 0x5afec0de20260914",
+  "generator": "crates/safu-core/examples/gen_vectors.rs (safu-core 0.2.0), seed 0x5afec0de20260914",
   "integers": "every integer is a decimal string; u128 does not survive JSON numbers",
   "cases": [
     {"args":{"amount":"1000","bps":"5000"},"expect":{"ok":"500"},"fn":"apply_bps","name":"half"},

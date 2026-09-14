@@ -23,7 +23,8 @@ custom-panic = []
 [dependencies]
 anchor-lang = "=1.1.2"
 anchor-spl = { version = "=1.1.2", features = ["token_2022", "token_2022_extensions"] }
-safu-core = { path = "../../../crates/safu-core" }
+# Exact pin (U6): a safu-core change must be adopted here on purpose, never picked up silently.
+safu-core = { path = "../../../crates/safu-core", version = "=0.2.0" }
 
 [dev-dependencies]
 litesvm = { version = "0.10.0", features = ["precompiles"] }

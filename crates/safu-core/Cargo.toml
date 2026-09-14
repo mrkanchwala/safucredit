@@ -1,6 +1,6 @@
 [package]
 name = "safu-core"
-version = "0.1.0"
+version = "0.2.0"
 description = "SAFU Credit shared math: integer fixed-point, no floats, no allocation, no chain dependencies"
 license = "Apache-2.0"
 edition = "2021"
