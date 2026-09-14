@@ -1,0 +1,29 @@
+[package]
+name = "backstop"
+version = "0.1.0"
+description = "SAFU Credit: backer capital, wrongful-liquidation payouts, bad-debt cover"
+license.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "backstop"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+anchor-debug = []
+custom-heap = []
+custom-panic = []
+
+[dependencies]
+anchor-lang = "=1.0.2"
+anchor-spl = { version = "=1.0.2", features = ["token", "token_2022"] }
+safu-core = { path = "../../../crates/safu-core" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

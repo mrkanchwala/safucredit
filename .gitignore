@@ -1,0 +1,16 @@
+.anchor
+.DS_Store
+target
+**/*.rs.bk
+node_modules
+test-ledger
+.yarn
+.surfpool
+__pycache__
+.venv
+.env
+# Keypairs and recorded API responses never go to a public remote
+*-keypair.json
+keys/
+# CMC redistribution terms unverified: recordings stay local until checked
+verdict/recordings/
