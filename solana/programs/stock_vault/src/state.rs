@@ -1,0 +1,181 @@
+use anchor_lang::prelude::*;
+
+use crate::errors::VaultError;
+
+pub const VCONFIG_SEED: &[u8] = b"vconfig";
+pub const MARKET_SEED: &[u8] = b"market";
+pub const COLL_VAULT_SEED: &[u8] = b"coll_vault";
+pub const USDC_VAULT_SEED: &[u8] = b"usdc_vault";
+pub const POSITION_SEED: &[u8] = b"position";
+pub const SUPPLIER_SEED: &[u8] = b"supplier";
+
+/// Layout version of every account in this program (upgradeability U4).
+pub const ACCOUNT_VERSION: u8 = 1;
+/// Price samples kept for the TWAP.
+pub const TWAP_SLOTS: usize = 16;
+/// Every borrower is covered for 100% of a proven wrongful-liquidation loss (founder decision 2026-09-14).
+pub const FULL_COVERAGE_BPS: u32 = 10_000;
+
+#[account]
+#[derive(InitSpace)]
+pub struct VaultConfig {
+    pub version: u8,
+    pub admin: Pubkey,
+    /// Pushes prices through the mock adapter on devnet. Separate key from the verdict oracle.
+    pub feed_authority: Pubkey,
+    pub paused: bool,
+    pub bump: u8,
+    pub reserved: [u8; 64],
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq, InitSpace)]
+pub struct RateParams {
+    pub base_bps: u32,
+    pub slope1_bps: u32,
+    pub slope2_bps: u32,
+    pub kink_bps: u32,
+}
+
+/// Admin-settable within hard bounds (U2). Values and the evidence behind each:
+/// `outputs/2026-09-14_stocklana-market-config-research.md` §2b (research-ops).
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq, InitSpace)]
+pub struct MarketParams {
+    /// Borrowing limit. AAPLx: 4_000 (matched to the market leader).
+    pub ltv_bps: u32,
+    /// Liquidation line. AAPLx: 5_000.
+    pub liq_threshold_bps: u32,
+    /// Dynamic liquidation bonus: max(min, LTV − threshold), capped at max and at 100% − LTV. 100 / 500.
+    pub min_liq_bonus_bps: u32,
+    pub max_liq_bonus_bps: u32,
+    /// Above this LTV the whole debt may be liquidated at once. 9_500.
+    pub insolvency_ltv_bps: u32,
+    /// Share of debt repayable per liquidation below the insolvency line. 2_500.
+    pub close_factor_bps: u32,
+    /// USDC base units per liquidation, sized from measured collateral liquidity ($100K).
+    pub max_liquidation_debt: u64,
+    /// Single-update spike cap vs TWAP. 500 (US LULD Tier 1 band).
+    pub deviation_cap_bps: u32,
+    /// Issuer-recommended pause around every multiplier activation. 900 s.
+    pub activation_pause_secs: i64,
+    /// A multiplier change above this is a split / reverse split. 500.
+    pub split_cap_bps: u32,
+    /// Longest a split can hold risk actions while waiting for a market-open price. 86_400 s.
+    pub split_max_hold_secs: i64,
+    /// Borrow / withdraw need a price at most this old while the market is open. 3_600 s.
+    pub borrow_max_price_age_secs: i64,
+    /// Liquidation price age limit while open (feed's own 0.5% / 24h guarantee + 1h). 90_000 s.
+    pub liquidation_max_price_age_open_secs: i64,
+    /// Any action while the underlying market is closed (longest US closure ≈ 89.5h). 345_600 s.
+    pub max_price_age_closed_secs: i64,
+    pub rate: RateParams,
+    /// Total USDC that may be lent (backstop sizing rule, 10:1). Base units.
+    pub borrow_cap: u64,
+    /// Total raw collateral accepted.
+    pub collateral_cap_raw: u64,
+}
+
+impl MarketParams {
+    /// Hard bounds in code, so an admin mistake cannot configure something unsafe.
+    pub fn validate(&self) -> Result<()> {
+        let ok = self.ltv_bps > 0
+            && self.ltv_bps <= 8_000
+            && self.liq_threshold_bps > self.ltv_bps
+            && self.liq_threshold_bps <= 9_000
+            && self.min_liq_bonus_bps <= self.max_liq_bonus_bps
+            && self.max_liq_bonus_bps <= 2_000
+            && self.insolvency_ltv_bps > self.liq_threshold_bps
+            && self.insolvency_ltv_bps <= 10_000
+            && self.close_factor_bps > 0
+            && self.close_factor_bps <= 10_000
+            && self.max_liquidation_debt > 0
+            && self.deviation_cap_bps >= 50
+            && self.deviation_cap_bps <= 2_000
+            && (0..=3_600).contains(&self.activation_pause_secs)
+            && self.split_cap_bps > 0
+            && self.split_cap_bps <= 10_000
+            && (0..=7 * 86_400).contains(&self.split_max_hold_secs)
+            && (60..=86_400).contains(&self.borrow_max_price_age_secs)
+            && (self.borrow_max_price_age_secs..=2 * 86_400)
+                .contains(&self.liquidation_max_price_age_open_secs)
+            && (3_600..=7 * 86_400).contains(&self.max_price_age_closed_secs)
+            && self.rate.kink_bps > 0
+            && self.rate.kink_bps < 10_000
+            && self.rate.base_bps <= 5_000
+            && self.rate.slope1_bps <= 20_000
+            && self.rate.slope2_bps <= 100_000
+            && self.borrow_cap > 0
+            && self.collateral_cap_raw > 0;
+        require!(ok, VaultError::InvalidMarketParams);
+        Ok(())
+    }
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, Default, PartialEq, Eq, InitSpace)]
+pub struct PriceState {
+    /// Ring buffer, USD per whole share with 8 decimals.
+    pub prices: [u64; TWAP_SLOTS],
+    pub timestamps: [i64; TWAP_SLOTS],
+    /// Next write position.
+    pub head: u8,
+    pub count: u8,
+    pub last_price: u64,
+    pub last_update: i64,
+    pub last_close: u64,
+    /// Whether the underlying equity market was open at the last accepted update.
+    pub market_open: bool,
+    /// Set when an update broke the spike cap. Blocks borrowing and liquidation until cleared.
+    pub flagged: bool,
+    /// The rejected price, so a second consecutive update confirming it can be accepted.
+    pub flagged_price: u64,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct Market {
+    pub version: u8,
+    pub bump: u8,
+    pub collateral_mint: Pubkey,
+    pub usdc_mint: Pubkey,
+    pub collateral_decimals: u8,
+    pub usdc_decimals: u8,
+    pub params: MarketParams,
+    pub price: PriceState,
+    /// USDC held, tracked internally. Never inferred from the vault balance (donation attacks).
+    pub cash: u64,
+    pub total_supply_shares: u128,
+    pub total_borrow_shares: u128,
+    /// Debt index, 1.0 == safu_core::lending::INDEX_SCALE.
+    pub borrow_index: u128,
+    pub last_accrual_ts: i64,
+    /// Sum of all positions' raw collateral, for reconciliation against the vault (review D4).
+    pub total_collateral_raw: u64,
+    pub bad_debt: u64,
+    pub issuer_halt: bool,
+    pub liq_seq: u64,
+    pub reserved: [u8; 64],
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct Position {
+    pub version: u8,
+    pub bump: u8,
+    pub market: Pubkey,
+    pub owner: Pubkey,
+    pub raw_collateral: u64,
+    pub debt_shares: u128,
+    /// Coverage in force when this loan was opened (U3: later changes never shrink an open loan's cover).
+    pub coverage_bps: u32,
+    pub reserved: [u8; 32],
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct Supplier {
+    pub version: u8,
+    pub bump: u8,
+    pub market: Pubkey,
+    pub owner: Pubkey,
+    pub shares: u128,
+    pub reserved: [u8; 32],
+}
