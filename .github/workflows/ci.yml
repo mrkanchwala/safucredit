@@ -64,9 +64,11 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Pinned to the version the suite was verified with locally. The mirror itself has no dependencies.
-      - name: Install pytest
-        run: python -m pip install pytest==9.1.1
+      # Pinned to the versions the suite was verified with locally. solders added 2026-09-14 when
+      # engine.py/tx.py started building real Solana instructions (Pubkey, Keypair, Instruction) --
+      # the comment above used to say "no dependencies"; that stopped being true then.
+      - name: Install dependencies
+        run: python -m pip install pytest==9.1.1 solders==0.26.0
 
       - name: Run
         run: python -m pytest -q
