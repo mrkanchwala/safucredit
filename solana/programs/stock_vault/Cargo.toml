@@ -32,6 +32,7 @@ solana-transaction = "3.0.2"
 solana-signer = "3.0.0"
 solana-keypair = "3.0.1"
 spl-token-2022-interface = "=2.1.0"
+spl-token-interface = "=2.0.0"
 solana-system-interface = { version = "2.0.0", features = ["bincode"] }
 
 [lints.rust]

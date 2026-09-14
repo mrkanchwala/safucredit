@@ -110,7 +110,9 @@ impl MarketParams {
     }
 }
 
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, Default, PartialEq, Eq, InitSpace)]
+#[derive(
+    AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, Default, PartialEq, Eq, InitSpace,
+)]
 pub struct PriceState {
     /// Ring buffer, USD per whole share with 8 decimals.
     pub prices: [u64; TWAP_SLOTS],

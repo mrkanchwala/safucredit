@@ -172,14 +172,24 @@ pub mod stock_vault {
             ctx.accounts.usdc_mint.decimals,
         )?;
 
-        market.cash = market.cash.checked_add(amount).ok_or(VaultError::MathOverflow)?;
+        market.cash = market
+            .cash
+            .checked_add(amount)
+            .ok_or(VaultError::MathOverflow)?;
         market.total_supply_shares = market
             .total_supply_shares
             .checked_add(shares)
             .ok_or(VaultError::MathOverflow)?;
         let supplier = &mut ctx.accounts.supplier;
-        supplier.shares = supplier.shares.checked_add(shares).ok_or(VaultError::MathOverflow)?;
-        emit!(Supplied { owner: supplier.owner, amount, shares });
+        supplier.shares = supplier
+            .shares
+            .checked_add(shares)
+            .ok_or(VaultError::MathOverflow)?;
+        emit!(Supplied {
+            owner: supplier.owner,
+            amount,
+            shares
+        });
         Ok(())
     }
 
@@ -225,7 +235,11 @@ pub mod stock_vault {
             amount,
             ctx.accounts.usdc_mint.decimals,
         )?;
-        emit!(SupplyWithdrawn { owner: ctx.accounts.owner.key(), amount, shares });
+        emit!(SupplyWithdrawn {
+            owner: ctx.accounts.owner.key(),
+            amount,
+            shares
+        });
         Ok(())
     }
 
@@ -237,7 +251,10 @@ pub mod stock_vault {
             .total_collateral_raw
             .checked_add(amount)
             .ok_or(VaultError::MathOverflow)?;
-        require!(new_total <= market.params.collateral_cap_raw, VaultError::CapReached);
+        require!(
+            new_total <= market.params.collateral_cap_raw,
+            VaultError::CapReached
+        );
 
         token_interface::transfer_checked(
             CpiContext::new(
@@ -259,7 +276,10 @@ pub mod stock_vault {
             .raw_collateral
             .checked_add(amount)
             .ok_or(VaultError::MathOverflow)?;
-        emit!(CollateralDeposited { owner: position.owner, amount });
+        emit!(CollateralDeposited {
+            owner: position.owner,
+            amount
+        });
         Ok(())
     }
 
@@ -315,7 +335,10 @@ pub mod stock_vault {
             amount,
             ctx.accounts.collateral_mint.decimals,
         )?;
-        emit!(CollateralWithdrawn { owner: ctx.accounts.owner.key(), amount });
+        emit!(CollateralWithdrawn {
+            owner: ctx.accounts.owner.key(),
+            amount
+        });
         Ok(())
     }
 
@@ -340,7 +363,12 @@ pub mod stock_vault {
         let price = risk_price(market, now, PriceUse::Borrow)?;
 
         let position = &mut ctx.accounts.position;
-        let value = value_of(market, position.raw_collateral, schedule.effective(now), price)?;
+        let value = value_of(
+            market,
+            position.raw_collateral,
+            schedule.effective(now),
+            price,
+        )?;
         let debt = logic::core(debt_for_shares(position.debt_shares, market.borrow_index))?;
         let new_debt = debt.checked_add(amount).ok_or(VaultError::MathOverflow)?;
         let limit = logic::core(max_borrow(value, market.params.ltv_bps))?;
@@ -349,7 +377,10 @@ pub mod stock_vault {
         let borrowed_after = total_borrows(market)?
             .checked_add(amount)
             .ok_or(VaultError::MathOverflow)?;
-        require!(borrowed_after <= market.params.borrow_cap, VaultError::CapReached);
+        require!(
+            borrowed_after <= market.params.borrow_cap,
+            VaultError::CapReached
+        );
 
         if position.debt_shares == 0 {
             position.coverage_bps = FULL_COVERAGE_BPS;
@@ -382,7 +413,11 @@ pub mod stock_vault {
             amount,
             ctx.accounts.usdc_mint.decimals,
         )?;
-        emit!(Borrowed { owner: ctx.accounts.owner.key(), amount, shares });
+        emit!(Borrowed {
+            owner: ctx.accounts.owner.key(),
+            amount,
+            shares
+        });
         Ok(())
     }
 
@@ -419,8 +454,15 @@ pub mod stock_vault {
 
         position.debt_shares -= burn;
         market.total_borrow_shares = market.total_borrow_shares.saturating_sub(burn);
-        market.cash = market.cash.checked_add(pay).ok_or(VaultError::MathOverflow)?;
-        emit!(Repaid { owner: position.owner, amount: pay, shares: burn });
+        market.cash = market
+            .cash
+            .checked_add(pay)
+            .ok_or(VaultError::MathOverflow)?;
+        emit!(Repaid {
+            owner: position.owner,
+            amount: pay,
+            shares: burn
+        });
         Ok(())
     }
 }
