@@ -20,10 +20,24 @@ pub enum VerdictError {
     VerdictExpired,
     #[msg("Verdict deadline is too far in the future")]
     VerdictDeadlineTooFar,
-    #[msg("Payout must be greater than zero")]
-    ZeroPayout,
-    #[msg("Tier must be 1, 2 or 3")]
-    InvalidTier,
+    #[msg("The claim must be filed within the claim window of the liquidation")]
+    ClaimWindowExpired,
+    #[msg("Check (b)'s reference-after timestamp is outside the allowed wait window")]
+    InvalidAfterWindow,
+    #[msg("The 60-day gate has not elapsed yet")]
+    GateNotElapsed,
+    #[msg("Claim is not in the expected status for this instruction")]
+    WrongClaimStatus,
+    #[msg("Cooldown has not elapsed yet")]
+    CooldownNotElapsed,
+    #[msg("Claim has not gone stale yet")]
+    NotYetStale,
+    #[msg("Queued claim has not reached the claim window yet")]
+    NotYetExpired,
+    #[msg("Borrower already has an unresolved claim in this market")]
+    BorrowerClaimsFull,
+    #[msg("Payout address cannot be a privileged role")]
+    PrivilegedPayout,
     #[msg("Signer is not authorized for this action")]
     Unauthorized,
     #[msg("Parameter is outside its hard bounds")]
@@ -36,8 +50,6 @@ pub enum VerdictError {
     NoWithdrawalPending,
     #[msg("Withdrawal delay has not elapsed")]
     WithdrawalNotReady,
-    #[msg("Backers cannot exit while a claim is outstanding")]
-    ClaimsOutstanding,
     #[msg("Attestation does not match the liquidation record supplied")]
     RecordMismatch,
     #[msg("Liquidation happened while the issuer had intervened; never covered")]

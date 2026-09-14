@@ -7,7 +7,7 @@ pub mod verdict;
 
 use errors::VerdictError;
 use state::*;
-use verdict::{VerdictArgs, MAX_VERDICT_TTL_SECS};
+use verdict::{FactsArgs, MAX_VERDICT_TTL_SECS};
 
 /// `amount × numerator / denominator`, rounded down.
 fn mul_div_floor(amount: u128, numerator: u128, denominator: u128) -> Result<u128> {
@@ -17,63 +17,99 @@ fn mul_div_floor(amount: u128, numerator: u128, denominator: u128) -> Result<u12
         .ok_or_else(|| VerdictError::MathOverflow.into())
 }
 
+/// `reserved_total` as bps of `cash`. `u128::MAX` when cash is zero, so every band treats an empty
+/// pool as maximally utilised rather than dividing by zero.
+fn utilisation_bps(reserved_total: u64, cash: u64) -> u128 {
+    if cash == 0 {
+        return u128::MAX;
+    }
+    (reserved_total as u128 * 10_000) / cash as u128
+}
+
+/// Daily admission cap band (LOCKED verdict spec: 25/10/3% by utilisation).
+fn admission_cap_bps(reserved_total: u64, cash: u64) -> u32 {
+    let u = utilisation_bps(reserved_total, cash);
+    if u < UTIL_LOW_BPS {
+        ADMISSION_CAP_LOW_BPS
+    } else if u < UTIL_MID_BPS {
+        ADMISSION_CAP_MID_BPS
+    } else {
+        ADMISSION_CAP_HIGH_BPS
+    }
+}
+
+/// Daily outflow cap band, per claim (LOCKED verdict spec: 5/3/1% by utilisation).
+fn outflow_cap_bps(reserved_total: u64, cash: u64) -> u32 {
+    let u = utilisation_bps(reserved_total, cash);
+    if u < UTIL_LOW_BPS {
+        OUTFLOW_CAP_LOW_BPS
+    } else if u < UTIL_MID_BPS {
+        OUTFLOW_CAP_MID_BPS
+    } else {
+        OUTFLOW_CAP_HIGH_BPS
+    }
+}
+
+fn roll_admission_day(config: &mut BackstopConfig, now: i64) {
+    let today = now.div_euclid(DAY_SECS);
+    if config.admission_day != today {
+        config.admission_day = today;
+        config.admitted_today = 0;
+    }
+}
+
+/// Attempts to admit `claim` (already priced, `claim.loss` set) against `config`'s current caps
+/// and solvency. Never errors on "doesn't fit" — over any limit queues rather than rejects
+/// (LOCKED verdict spec); returns whether it was admitted.
+fn try_admit(config: &mut BackstopConfig, claim: &mut Claim, now: i64) -> Result<bool> {
+    roll_admission_day(config, now);
+    let loss = claim.loss;
+    let cap_bps = admission_cap_bps(config.reserved_total, config.cash);
+    let admission_cap =
+        safu_core::apply_bps(config.cash, cap_bps).map_err(|_| VerdictError::MathOverflow)?;
+    let per_claim_cap = safu_core::apply_bps(config.cash, config.per_claim_cap_bps)
+        .map_err(|_| VerdictError::MathOverflow)?;
+    let fits = loss <= per_claim_cap
+        && config
+            .admitted_today
+            .checked_add(loss)
+            .is_some_and(|v| v <= admission_cap)
+        && config
+            .reserved_total
+            .checked_add(loss)
+            .is_some_and(|v| v <= config.cash);
+    if fits {
+        config.reserved_total = config
+            .reserved_total
+            .checked_add(loss)
+            .ok_or(VerdictError::MathOverflow)?;
+        config.admitted_today = config
+            .admitted_today
+            .checked_add(loss)
+            .ok_or(VerdictError::MathOverflow)?;
+        claim.status = ClaimStatus::Active;
+        claim.admitted_at = now;
+        claim.cooldown_end = now
+            .checked_add(COOLDOWN_SECS)
+            .ok_or(VerdictError::MathOverflow)?;
+        claim.stream_end = claim
+            .cooldown_end
+            .checked_add(STREAM_SECS)
+            .ok_or(VerdictError::MathOverflow)?;
+        claim.snapshot_cash = config.cash;
+        claim.last_activity_ts = now;
+        Ok(true)
+    } else {
+        claim.status = ClaimStatus::Queued;
+        Ok(false)
+    }
+}
+
 declare_id!("H1hApKnNkYPsqQ9WVZGzqZQZYirxCLpXDj2uEmzMK3YV");
 
 #[program]
 pub mod backstop {
     use super::*;
-
-    /// Records an oracle-signed wrongful-liquidation verdict. The transaction must place the oracle's
-    /// Ed25519 precompile instruction directly before this one. Anyone may submit; the signature is the
-    /// authorization. The payout itself happens in a later instruction that consumes this attestation.
-    pub fn attest_verdict(ctx: Context<AttestVerdict>, args: VerdictArgs) -> Result<()> {
-        require!(args.payout > 0, VerdictError::ZeroPayout);
-        require!((1..=3).contains(&args.tier), VerdictError::InvalidTier);
-
-        let now = Clock::get()?.unix_timestamp;
-        require!(now <= args.deadline, VerdictError::VerdictExpired);
-        require!(
-            args.deadline
-                <= now
-                    .checked_add(MAX_VERDICT_TTL_SECS)
-                    .ok_or(VerdictError::VerdictDeadlineTooFar)?,
-            VerdictError::VerdictDeadlineTooFar
-        );
-
-        let config = &ctx.accounts.config;
-        let message = verdict::encode_message(&crate::ID, config.cluster_tag, &args);
-        verdict::verify_preceding_ed25519(
-            &ctx.accounts.instructions_sysvar.to_account_info(),
-            &config.verdict_oracle,
-            &message,
-        )?;
-
-        let attestation = &mut ctx.accounts.attestation;
-        attestation.version = ACCOUNT_VERSION;
-        attestation.liquidation_record = args.liquidation_record;
-        attestation.borrower = args.borrower;
-        attestation.payout = args.payout;
-        attestation.tier = args.tier;
-        attestation.verdict_hash = args.verdict_hash;
-        attestation.attested_at = now;
-        attestation.bump = ctx.bumps.attestation;
-
-        // Backers cannot exit between a verdict being attested and it being paid (A5 §9).
-        let config = &mut ctx.accounts.config;
-        config.open_claims = config
-            .open_claims
-            .checked_add(1)
-            .ok_or(VerdictError::MathOverflow)?;
-
-        emit!(VerdictAttested {
-            liquidation_record: args.liquidation_record,
-            borrower: args.borrower,
-            payout: args.payout,
-            tier: args.tier,
-            verdict_hash: args.verdict_hash,
-        });
-        Ok(())
-    }
 
     /// Only the program's upgrade authority may initialize, so nobody watching the deploy can call it
     /// first and take admin. Initialize before any `--final`: a program with no upgrade authority can
@@ -103,7 +139,9 @@ pub mod backstop {
         config.cash = 0;
         config.total_shares = 0;
         config.per_claim_cap_bps = per_claim_cap_bps;
-        config.open_claims = 0;
+        config.reserved_total = 0;
+        config.admission_day = 0;
+        config.admitted_today = 0;
         config.withdraw_delay_secs = withdraw_delay_secs;
         config.reserved = [0; 32];
         Ok(())
@@ -111,7 +149,7 @@ pub mod backstop {
 
     /// Rotates the verdict oracle key (U5). It is a throwaway per-chain Ed25519 key, so a leak has
     /// to be recoverable on-chain: without this, replacing it would need a program upgrade.
-    /// Signatures already attested stay valid; unattested ones signed by the old key stop verifying.
+    /// Claims already submitted stay valid; unsubmitted facts signed by the old key stop verifying.
     pub fn set_verdict_oracle(ctx: Context<AdminOnly>, verdict_oracle: Pubkey) -> Result<()> {
         ctx.accounts.config.verdict_oracle = verdict_oracle;
         emit!(VerdictOracleRotated { verdict_oracle });
@@ -119,7 +157,7 @@ pub mod backstop {
     }
 
     /// Admin-settable within hard bounds (U2), so neither knob can be set somewhere unsafe: a zero
-    /// per-claim cap would freeze every payout, and an unbounded withdrawal delay would trap backers.
+    /// per-claim cap would freeze every admission, and an unbounded withdrawal delay would trap backers.
     pub fn set_backstop_params(
         ctx: Context<AdminOnly>,
         per_claim_cap_bps: u32,
@@ -212,7 +250,7 @@ pub mod backstop {
     }
 
     /// Queues an exit. The delay exists so capital cannot leave in front of a verdict that is
-    /// already being prepared off-chain but not yet attested.
+    /// already being prepared off-chain but not yet submitted.
     pub fn request_withdraw(ctx: Context<BackerOnly>, shares: u128) -> Result<()> {
         require!(shares > 0, VerdictError::ZeroAmount);
         let backer = &mut ctx.accounts.backer;
@@ -226,16 +264,21 @@ pub mod backstop {
         Ok(())
     }
 
-    /// Takes the money out, but never while a claim is outstanding: an attested verdict is a
-    /// liability the remaining backers would otherwise be left holding alone.
+    /// Takes the money out, bounded by `cash − reserved_total`: only the claim amount an `Active`
+    /// claim actually reserves is off-limits, not the whole pool while any claim merely exists
+    /// (queued or held claims reserve nothing until they are actually admitted).
     pub fn finalize_withdraw(ctx: Context<FinalizeWithdraw>) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         let config_bump = ctx.accounts.config.bump;
-        let (cash, total_shares, delay, open_claims) = {
+        let (cash, total_shares, delay, reserved_total) = {
             let c = &ctx.accounts.config;
-            (c.cash, c.total_shares, c.withdraw_delay_secs, c.open_claims)
+            (
+                c.cash,
+                c.total_shares,
+                c.withdraw_delay_secs,
+                c.reserved_total,
+            )
         };
-        require!(open_claims == 0, VerdictError::ClaimsOutstanding);
 
         let backer = &mut ctx.accounts.backer;
         let shares = backer.withdraw_shares;
@@ -249,8 +292,9 @@ pub mod backstop {
 
         let amount = u64::try_from(mul_div_floor(shares, cash as u128, total_shares)?)
             .map_err(|_| VerdictError::MathOverflow)?;
+        let available = cash.saturating_sub(reserved_total);
         require!(
-            amount > 0 && amount <= cash,
+            amount > 0 && amount <= available,
             VerdictError::InsufficientBalance
         );
 
@@ -286,30 +330,77 @@ pub mod backstop {
         Ok(())
     }
 
-    /// Pays a borrower back for a liquidation the verdict engine proved was wrongful. Permissionless:
-    /// the oracle signature recorded in the attestation is the authorization, not the caller.
-    pub fn pay_wrongful_liquidation(ctx: Context<PayWrongfulLiquidation>) -> Result<()> {
-        let now = Clock::get()?.unix_timestamp;
-        let record = &ctx.accounts.liquidation_record;
-        let attestation = &ctx.accounts.attestation;
+    /// Opens the single-slot claim tracker for one (market, borrower) pair. Permissionless — anyone
+    /// may open it ahead of a borrower's first claim.
+    pub fn open_borrower_claims(ctx: Context<OpenBorrowerClaims>) -> Result<()> {
+        let bc = &mut ctx.accounts.borrower_claims;
+        bc.version = ACCOUNT_VERSION;
+        bc.bump = ctx.bumps.borrower_claims;
+        bc.market = ctx.accounts.market.key();
+        bc.borrower = ctx.accounts.borrower.key();
+        bc.open = Pubkey::default();
+        bc.reserved = [0; 32];
+        Ok(())
+    }
 
+    /// Records an oracle-signed facts payload for one liquidation and runs the verdict rules
+    /// on-chain (LOCKED verdict spec). The transaction must place the oracle's Ed25519 precompile
+    /// instruction directly before this one. Anyone may submit; the signature is the authorization.
+    ///
+    /// A structurally invalid submission (bad signature, expired deadline, mismatched record,
+    /// issuer-halted liquidation, self-dealt liquidation, a privileged payout address, or a
+    /// borrower with an unresolved claim already open) reverts the transaction. A submission that
+    /// checks out structurally but fails the wrongfulness rules — the price wasn't actually wrong,
+    /// the move held, or the loss nets to zero — is recorded on-chain as `Denied` with a reason
+    /// code, rather than reverting: a claims decision must be visible, not silently dropped.
+    pub fn submit_facts(ctx: Context<SubmitFacts>, args: FactsArgs) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        require!(now <= args.deadline, VerdictError::VerdictExpired);
+        require!(
+            args.deadline
+                <= now
+                    .checked_add(MAX_VERDICT_TTL_SECS)
+                    .ok_or(VerdictError::VerdictDeadlineTooFar)?,
+            VerdictError::VerdictDeadlineTooFar
+        );
+
+        let record = &ctx.accounts.liquidation_record;
+        require!(
+            (MIN_AFTER_WAIT_SECS..=MAX_AFTER_WAIT_SECS)
+                .contains(&args.after_ts.saturating_sub(record.ts)),
+            VerdictError::InvalidAfterWindow
+        );
+
+        let config = &ctx.accounts.config;
+        let message = verdict::encode_message(&crate::ID, config.cluster_tag, &args);
+        verdict::verify_preceding_ed25519(
+            &ctx.accounts.instructions_sysvar.to_account_info(),
+            &config.verdict_oracle,
+            &message,
+        )?;
+
+        let record = &ctx.accounts.liquidation_record;
         require_keys_eq!(
-            attestation.liquidation_record,
+            args.liquidation_record,
             record.key(),
             VerdictError::RecordMismatch
         );
+        require_keys_eq!(args.borrower, record.borrower, VerdictError::RecordMismatch);
         require_keys_eq!(
-            attestation.borrower,
-            record.borrower,
-            VerdictError::RecordMismatch
-        );
-        require_keys_eq!(
-            record.borrower,
             ctx.accounts.borrower.key(),
+            record.borrower,
             VerdictError::RecordMismatch
         );
-        // Spec 14a: an issuer freeze, pause or seizure is never covered, and the record captured
-        // whether the issuer had intervened at the moment of the liquidation.
+        require_keys_eq!(
+            ctx.accounts.market.key(),
+            record.market,
+            VerdictError::RecordMismatch
+        );
+        require!(
+            now.saturating_sub(record.ts) <= CLAIM_WINDOW_SECS,
+            VerdictError::ClaimWindowExpired
+        );
+        // Spec 14a: an issuer freeze, pause or seizure is never covered.
         require!(!record.issuer_halt, VerdictError::IssuerHaltedLiquidation);
         // Spec 13c: a borrower liquidating themselves is not a wrongful liquidation.
         require_keys_neq!(
@@ -318,9 +409,21 @@ pub mod backstop {
             VerdictError::SelfDealtLiquidation
         );
 
-        // A4: someone backing the pool cannot also be paid out of it. An absent account is fine; an
-        // existing one must hold nothing, including nothing queued for exit.
-        let backer_info = ctx.accounts.borrower_backer.to_account_info();
+        // D2: the frozen payout address can never be a privileged role.
+        require_keys_neq!(
+            record.payout,
+            ctx.accounts.config.key(),
+            VerdictError::PrivilegedPayout
+        );
+        require_keys_neq!(record.payout, config.admin, VerdictError::PrivilegedPayout);
+        require_keys_neq!(
+            record.payout,
+            config.verdict_oracle,
+            VerdictError::PrivilegedPayout
+        );
+        // A4, applied to the payout rather than the borrower: whoever actually receives the money
+        // cannot also share in what they are being paid from.
+        let backer_info = ctx.accounts.payout_backer.to_account_info();
         if !backer_info.data_is_empty() {
             require_keys_eq!(
                 *backer_info.owner,
@@ -335,15 +438,228 @@ pub mod backstop {
             );
         }
 
-        let (cash, cap_bps, config_bump) = {
-            let c = &ctx.accounts.config;
-            (c.cash, c.per_claim_cap_bps, c.bump)
+        // E8: one unresolved claim per (market, borrower) in this phase. A terminal occupant frees
+        // the slot for the new claim.
+        let bc = &mut ctx.accounts.borrower_claims;
+        if bc.open != Pubkey::default() {
+            let existing_info = ctx.accounts.existing_claim.to_account_info();
+            require_keys_eq!(existing_info.key(), bc.open, VerdictError::RecordMismatch);
+            require_keys_eq!(
+                *existing_info.owner,
+                crate::ID,
+                VerdictError::RecordMismatch
+            );
+            let data = existing_info.try_borrow_data()?;
+            let existing = Claim::try_deserialize(&mut &data[..])?;
+            drop(data);
+            require!(
+                existing.status.is_terminal(),
+                VerdictError::BorrowerClaimsFull
+            );
+        }
+
+        let cap_bps = ctx.accounts.market.params.deviation_cap_bps;
+        let price_was_wrong =
+            safu_core::price::deviation_exceeded(record.price_fp, args.ref_at_liq, cap_bps)
+                .map_err(|_| VerdictError::MathOverflow)?;
+        let move_did_not_hold =
+            safu_core::price::deviation_exceeded(record.price_fp, args.ref_after, cap_bps)
+                .map_err(|_| VerdictError::MathOverflow)?;
+        let loss = safu_core::loss::wrongful_loss(
+            record.seized_raw,
+            record.collateral_decimals,
+            record.multiplier_fp,
+            args.ref_at_liq,
+            record.debt_repaid,
+        )
+        .map_err(|_| VerdictError::MathOverflow)?;
+
+        let claim = &mut ctx.accounts.claim;
+        claim.version = ACCOUNT_VERSION;
+        claim.bump = ctx.bumps.claim;
+        claim.market = ctx.accounts.market.key();
+        claim.borrower = record.borrower;
+        claim.liquidation_record = record.key();
+        claim.payout = record.payout;
+        claim.submitted_at = now;
+        claim.liquidated_at = record.ts;
+        claim.evidence_hash = args.evidence_hash;
+        claim.streamed = 0;
+        claim.releasable_at = 0;
+        claim.admitted_at = 0;
+        claim.cooldown_end = 0;
+        claim.stream_end = 0;
+        claim.snapshot_cash = 0;
+        claim.last_pull_day = 0;
+        claim.pulled_today = 0;
+        claim.last_activity_ts = 0;
+        claim.reserved = [0; 24];
+
+        let deny = if !price_was_wrong {
+            Some(deny_reason::PRICE_NOT_WRONG)
+        } else if !move_did_not_hold {
+            Some(deny_reason::MOVE_HELD)
+        } else if loss == 0 {
+            Some(deny_reason::ZERO_LOSS)
+        } else {
+            None
         };
-        // E4: capped and disclosed rather than queued pro-rata. The shortfall is recorded on the
-        // receipt so it is visible rather than silently dropped.
-        let cap = safu_core::apply_bps(cash, cap_bps).map_err(|_| VerdictError::MathOverflow)?;
-        let paid = attestation.payout.min(cap);
-        require!(paid > 0, VerdictError::NothingToPay);
+
+        if let Some(reason) = deny {
+            claim.status = ClaimStatus::Denied;
+            claim.deny_reason = reason;
+            claim.loss = 0;
+        } else {
+            claim.loss = loss;
+            claim.deny_reason = deny_reason::NONE;
+            let loan_age = record.ts.saturating_sub(record.borrow_age_ts);
+            if loan_age < GATE_SECS {
+                claim.status = ClaimStatus::PendingTime;
+                claim.releasable_at = record.borrow_age_ts.saturating_add(GATE_SECS);
+            } else {
+                let config = &mut ctx.accounts.config;
+                try_admit(config, claim, now)?;
+            }
+        }
+
+        ctx.accounts.borrower_claims.open = ctx.accounts.claim.key();
+
+        let claim = &ctx.accounts.claim;
+        emit!(FactsSubmitted {
+            claim: claim.key(),
+            liquidation_record: claim.liquidation_record,
+            borrower: claim.borrower,
+            status: claim.status,
+            deny_reason: claim.deny_reason,
+            loss: claim.loss,
+        });
+        Ok(())
+    }
+
+    /// Releases a `PendingTime` claim once the 60-day gate has elapsed, attempting admission at
+    /// full value. Permissionless.
+    pub fn unlock_claim(ctx: Context<UpdateClaim>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let claim = &mut ctx.accounts.claim;
+        require!(
+            claim.status == ClaimStatus::PendingTime,
+            VerdictError::WrongClaimStatus
+        );
+        require!(now >= claim.releasable_at, VerdictError::GateNotElapsed);
+        let config = &mut ctx.accounts.config;
+        try_admit(config, claim, now)?;
+        emit!(ClaimStatusChanged {
+            claim: claim.key(),
+            status: claim.status
+        });
+        Ok(())
+    }
+
+    /// Re-checks a `Queued` claim against the current caps and solvency. Permissionless; callable
+    /// as often as anyone likes — cash growing or utilisation falling is what lets it through.
+    pub fn try_release_queued(ctx: Context<UpdateClaim>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let claim = &mut ctx.accounts.claim;
+        require!(
+            claim.status == ClaimStatus::Queued,
+            VerdictError::WrongClaimStatus
+        );
+        let config = &mut ctx.accounts.config;
+        try_admit(config, claim, now)?;
+        emit!(ClaimStatusChanged {
+            claim: claim.key(),
+            status: claim.status
+        });
+        Ok(())
+    }
+
+    /// A `Queued` claim that never fit inside the claim window expires. It reserved nothing, so
+    /// nothing is released.
+    pub fn expire_queued(ctx: Context<UpdateClaim>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let claim = &mut ctx.accounts.claim;
+        require!(
+            claim.status == ClaimStatus::Queued,
+            VerdictError::WrongClaimStatus
+        );
+        require!(
+            now.saturating_sub(claim.liquidated_at) > CLAIM_WINDOW_SECS,
+            VerdictError::NotYetExpired
+        );
+        claim.status = ClaimStatus::Expired;
+        emit!(ClaimStatusChanged {
+            claim: claim.key(),
+            status: claim.status
+        });
+        Ok(())
+    }
+
+    /// An `Active` claim with no pull for `INACTIVITY_EXPIRY_SECS` returns its unpaid remainder to
+    /// the backstop by simply un-reserving it — nothing was ever transferred for that remainder.
+    pub fn expire_stale(ctx: Context<UpdateClaim>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let claim = &mut ctx.accounts.claim;
+        require!(
+            claim.status == ClaimStatus::Active,
+            VerdictError::WrongClaimStatus
+        );
+        require!(
+            now.saturating_sub(claim.last_activity_ts) >= INACTIVITY_EXPIRY_SECS,
+            VerdictError::NotYetStale
+        );
+        let remaining = claim.loss.saturating_sub(claim.streamed);
+        claim.status = ClaimStatus::Expired;
+        let config = &mut ctx.accounts.config;
+        config.reserved_total = config.reserved_total.saturating_sub(remaining);
+        emit!(ClaimStatusChanged {
+            claim: claim.key(),
+            status: claim.status
+        });
+        Ok(())
+    }
+
+    /// Pulls whatever has vested and fits today's outflow cap to the claim's frozen payout ATA.
+    /// Permissionless — the payout address, not the caller, receives the funds.
+    pub fn claim_stream(ctx: Context<ClaimStream>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let claim = &mut ctx.accounts.claim;
+        require!(
+            claim.status == ClaimStatus::Active,
+            VerdictError::WrongClaimStatus
+        );
+        require!(now >= claim.cooldown_end, VerdictError::CooldownNotElapsed);
+
+        let elapsed = now.saturating_sub(claim.cooldown_end).max(0);
+        let vested = if elapsed >= STREAM_SECS {
+            claim.loss
+        } else {
+            u64::try_from(mul_div_floor(
+                claim.loss as u128,
+                elapsed as u128,
+                STREAM_SECS as u128,
+            )?)
+            .map_err(|_| VerdictError::MathOverflow)?
+        };
+        let available = vested.saturating_sub(claim.streamed);
+        require!(available > 0, VerdictError::NothingToPay);
+
+        let today = now.div_euclid(DAY_SECS);
+        if claim.last_pull_day != today {
+            claim.last_pull_day = today;
+            claim.pulled_today = 0;
+        }
+
+        let (cash, reserved_total, config_bump) = {
+            let c = &ctx.accounts.config;
+            (c.cash, c.reserved_total, c.bump)
+        };
+        let cap_bps = outflow_cap_bps(reserved_total, cash);
+        let base = cash.max(claim.snapshot_cash);
+        let outflow_cap =
+            safu_core::apply_bps(base, cap_bps).map_err(|_| VerdictError::MathOverflow)?;
+        let room = outflow_cap.saturating_sub(claim.pulled_today);
+        let pull = available.min(room).min(cash);
+        require!(pull > 0, VerdictError::NothingToPay);
 
         let seeds: &[&[&[u8]]] = &[&[CONFIG_SEED, &[config_bump]]];
         token_interface::transfer_checked(
@@ -352,35 +668,46 @@ pub mod backstop {
                 TransferChecked {
                     from: ctx.accounts.usdc_vault.to_account_info(),
                     mint: ctx.accounts.usdc_mint.to_account_info(),
-                    to: ctx.accounts.borrower_usdc.to_account_info(),
+                    to: ctx.accounts.payout_usdc.to_account_info(),
                     authority: ctx.accounts.config.to_account_info(),
                 },
                 seeds,
             ),
-            paid,
+            pull,
             ctx.accounts.usdc_mint.decimals,
         )?;
 
-        let receipt = &mut ctx.accounts.receipt;
-        receipt.version = ACCOUNT_VERSION;
-        receipt.bump = ctx.bumps.receipt;
-        receipt.liquidation_record = record.key();
-        receipt.borrower = record.borrower;
-        receipt.attested = attestation.payout;
-        receipt.paid = paid;
-        receipt.verdict_hash = attestation.verdict_hash;
-        receipt.paid_at = now;
-        receipt.reserved = [0; 32];
+        claim.streamed = claim
+            .streamed
+            .checked_add(pull)
+            .ok_or(VerdictError::MathOverflow)?;
+        claim.pulled_today = claim
+            .pulled_today
+            .checked_add(pull)
+            .ok_or(VerdictError::MathOverflow)?;
+        claim.last_activity_ts = now;
+        let completed = claim.streamed == claim.loss;
+        if completed {
+            claim.status = ClaimStatus::Completed;
+        }
+        let streamed = claim.streamed;
+        let claim_key = claim.key();
 
         let config = &mut ctx.accounts.config;
-        config.cash -= paid;
-        config.open_claims = config.open_claims.saturating_sub(1);
+        config.cash = config
+            .cash
+            .checked_sub(pull)
+            .ok_or(VerdictError::MathOverflow)?;
+        config.reserved_total = config
+            .reserved_total
+            .checked_sub(pull)
+            .ok_or(VerdictError::MathOverflow)?;
 
-        emit!(WrongfulLiquidationPaid {
-            liquidation_record: receipt.liquidation_record,
-            borrower: receipt.borrower,
-            attested: receipt.attested,
-            paid,
+        emit!(ClaimStreamed {
+            claim: claim_key,
+            pull,
+            streamed,
+            completed
         });
         Ok(())
     }
@@ -418,16 +745,16 @@ pub mod backstop {
         let owed = market.bad_debt_cumulative.saturating_sub(cover.total_paid);
         require!(owed > 0, VerdictError::NoBadDebt);
 
-        let (cash, cap_bps, config_bump) = {
+        let (cash, reserved_total, cap_bps, config_bump) = {
             let c = &ctx.accounts.config;
-            (c.cash, c.per_claim_cap_bps, c.bump)
+            (c.cash, c.reserved_total, c.per_claim_cap_bps, c.bump)
         };
-        // Bounded by the same per-call share as a claim, and for a second reason beyond fairness:
-        // an uncapped payment could take the pool to exactly zero while shares were still
-        // outstanding, leaving the share price undefined and no deposit ever able to price itself
-        // again. With every outgoing path capped below 100%, cash cannot reach zero unless the last
-        // backer withdraws, which clears the shares with it.
-        let cap = safu_core::apply_bps(cash, cap_bps).map_err(|_| VerdictError::MathOverflow)?;
+        // Bounded by the same per-call share as a claim admission, and applied to cash already net
+        // of every Active claim's reservation — bad-debt cover must not eat into money a claim has
+        // already reserved, or `claim_stream` would be short later.
+        let available = cash.saturating_sub(reserved_total);
+        let cap =
+            safu_core::apply_bps(available, cap_bps).map_err(|_| VerdictError::MathOverflow)?;
         let paid = owed.min(cap);
         require!(paid > 0, VerdictError::NothingToPay);
 
@@ -463,31 +790,6 @@ pub mod backstop {
         });
         Ok(())
     }
-}
-
-#[derive(Accounts)]
-#[instruction(args: VerdictArgs)]
-pub struct AttestVerdict<'info> {
-    #[account(mut)]
-    pub payer: Signer<'info>,
-
-    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
-    pub config: Account<'info, BackstopConfig>,
-
-    #[account(
-        init,
-        payer = payer,
-        space = 8 + VerdictAttestation::INIT_SPACE,
-        seeds = [ATTESTATION_SEED, args.liquidation_record.as_ref()],
-        bump,
-    )]
-    pub attestation: Account<'info, VerdictAttestation>,
-
-    /// CHECK: address-constrained to the instructions sysvar; read only through the checked loaders.
-    #[account(address = solana_instructions_sysvar::ID)]
-    pub instructions_sysvar: UncheckedAccount<'info>,
-
-    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -581,42 +883,101 @@ pub struct FinalizeWithdraw<'info> {
 }
 
 #[derive(Accounts)]
-pub struct PayWrongfulLiquidation<'info> {
+pub struct OpenBorrowerClaims<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
-    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
-    pub config: Box<Account<'info, BackstopConfig>>,
-    #[account(
-        seeds = [ATTESTATION_SEED, attestation.liquidation_record.as_ref()],
-        bump = attestation.bump,
-    )]
-    pub attestation: Box<Account<'info, VerdictAttestation>>,
-    /// Owned by the lending vault program — Anchor's `Owner` check is what proves this record was
-    /// written by the vault and not fabricated.
-    pub liquidation_record: Box<Account<'info, stock_vault::state::LiquidationRecord>>,
-    /// `init` is the idempotency: a replayed payout transaction cannot create this twice.
+    pub market: Box<Account<'info, stock_vault::state::Market>>,
+    /// CHECK: identifies which borrower this tracks. No signature required — opening the tracker
+    /// is permissionless and holds no funds.
+    pub borrower: UncheckedAccount<'info>,
     #[account(
         init,
         payer = payer,
-        space = 8 + ClaimReceipt::INIT_SPACE,
-        seeds = [CLAIM_SEED, liquidation_record.key().as_ref()],
+        space = 8 + BorrowerClaims::INIT_SPACE,
+        seeds = [BORROWER_CLAIMS_SEED, market.key().as_ref(), borrower.key().as_ref()],
         bump,
     )]
-    pub receipt: Box<Account<'info, ClaimReceipt>>,
-    /// CHECK: matched against the liquidation record's borrower; holds no data we read.
+    pub borrower_claims: Box<Account<'info, BorrowerClaims>>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+#[instruction(args: FactsArgs)]
+pub struct SubmitFacts<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>,
+
+    // `mut`: an old-enough loan admits straight into `Active` during this instruction, which
+    // writes `reserved_total` and the admission-day counters — without `mut` Anchor never
+    // serializes those writes back, and they are silently lost.
+    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, BackstopConfig>>,
+
+    pub market: Box<Account<'info, stock_vault::state::Market>>,
+
+    /// Owned by the lending vault program — Anchor's `Owner` check is what proves this record was
+    /// written by the vault and not fabricated.
+    pub liquidation_record: Box<Account<'info, stock_vault::state::LiquidationRecord>>,
+
+    /// CHECK: matched against the liquidation record's borrower.
     pub borrower: UncheckedAccount<'info>,
-    #[account(mut, token::mint = usdc_mint, token::authority = borrower, token::token_program = usdc_token_program)]
-    pub borrower_usdc: Box<InterfaceAccount<'info, TokenAccount>>,
-    /// CHECK: the borrower's Backer PDA. May legitimately not exist; when it does, it is decoded and
-    /// required to hold nothing (A4 self-dealing).
-    #[account(seeds = [BACKER_SEED, borrower.key().as_ref()], bump)]
-    pub borrower_backer: UncheckedAccount<'info>,
+
+    #[account(
+        mut,
+        seeds = [BORROWER_CLAIMS_SEED, market.key().as_ref(), borrower.key().as_ref()],
+        bump = borrower_claims.bump,
+    )]
+    pub borrower_claims: Box<Account<'info, BorrowerClaims>>,
+
+    /// CHECK: only read when `borrower_claims.open` is non-default; deserialized and validated
+    /// manually as a `Claim` owned by this program. Any account may be passed when the slot is
+    /// free — it is never touched in that branch.
+    pub existing_claim: UncheckedAccount<'info>,
+
+    /// `init` is the idempotency: a second facts submission for the same liquidation cannot create
+    /// this twice, so a replayed transaction cannot open a second claim.
+    #[account(
+        init,
+        payer = payer,
+        space = 8 + Claim::INIT_SPACE,
+        seeds = [CLAIM_SEED, args.liquidation_record.as_ref()],
+        bump,
+    )]
+    pub claim: Box<Account<'info, Claim>>,
+
+    /// CHECK: the payout address's Backer PDA. May legitimately not exist; when it does, it is
+    /// decoded and required to hold nothing (A4, applied to the payout rather than the borrower).
+    #[account(seeds = [BACKER_SEED, liquidation_record.payout.as_ref()], bump)]
+    pub payout_backer: UncheckedAccount<'info>,
+
+    /// CHECK: address-constrained to the instructions sysvar; read only through the checked loaders.
+    #[account(address = solana_instructions_sysvar::ID)]
+    pub instructions_sysvar: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UpdateClaim<'info> {
+    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, BackstopConfig>>,
+    #[account(mut, seeds = [CLAIM_SEED, claim.liquidation_record.as_ref()], bump = claim.bump)]
+    pub claim: Box<Account<'info, Claim>>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimStream<'info> {
+    #[account(mut, seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, BackstopConfig>>,
+    #[account(mut, seeds = [CLAIM_SEED, claim.liquidation_record.as_ref()], bump = claim.bump)]
+    pub claim: Box<Account<'info, Claim>>,
     #[account(address = config.usdc_mint, mint::token_program = usdc_token_program)]
     pub usdc_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(mut, token::mint = usdc_mint, token::authority = claim.payout, token::token_program = usdc_token_program)]
+    pub payout_usdc: Box<InterfaceAccount<'info, TokenAccount>>,
     #[account(mut, seeds = [USDC_VAULT_SEED], bump, token::token_program = usdc_token_program)]
     pub usdc_vault: Box<InterfaceAccount<'info, TokenAccount>>,
     pub usdc_token_program: Interface<'info, TokenInterface>,
-    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -679,15 +1040,6 @@ pub struct WithdrawFinalized {
 }
 
 #[event]
-pub struct WrongfulLiquidationPaid {
-    pub liquidation_record: Pubkey,
-    pub borrower: Pubkey,
-    /// What the oracle said was owed; `paid` is lower when the per-claim cap bit.
-    pub attested: u64,
-    pub paid: u64,
-}
-
-#[event]
 pub struct BadDebtReimbursed {
     pub market: Pubkey,
     pub paid: u64,
@@ -695,10 +1047,25 @@ pub struct BadDebtReimbursed {
 }
 
 #[event]
-pub struct VerdictAttested {
+pub struct FactsSubmitted {
+    pub claim: Pubkey,
     pub liquidation_record: Pubkey,
     pub borrower: Pubkey,
-    pub payout: u64,
-    pub tier: u8,
-    pub verdict_hash: [u8; 32],
+    pub status: ClaimStatus,
+    pub deny_reason: u16,
+    pub loss: u64,
+}
+
+#[event]
+pub struct ClaimStatusChanged {
+    pub claim: Pubkey,
+    pub status: ClaimStatus,
+}
+
+#[event]
+pub struct ClaimStreamed {
+    pub claim: Pubkey,
+    pub pull: u64,
+    pub streamed: u64,
+    pub completed: bool,
 }

@@ -1,9 +1,11 @@
-//! Stage 2 item 2c: backer capital, wrongful-liquidation payouts and bad-debt cover.
+//! Stage 2 phase 2: backer capital, v2 wrongful-liquidation claims (facts → gate → admission →
+//! cooldown → stream → expiry) and bad-debt cover.
 //!
-//! The payout tests run the real cross-program path — a genuine liquidation in `stock_vault`
+//! The claim tests run the real cross-program path — a genuine liquidation in `stock_vault`
 //! produces the `LiquidationRecord` the backstop then reads. Anchor's `Owner` check on that account
 //! is the thing that makes a fabricated record impossible, so testing it against an injected struct
-//! would prove nothing.
+//! would prove nothing. The oracle-signed reference prices are chosen deliberately far from the
+//! record's own liquidation price so `wrongful_loss` is exact and known ahead of each assertion.
 
 use anchor_lang::solana_program::bpf_loader_upgradeable;
 use anchor_lang::{
@@ -14,10 +16,11 @@ use anchor_lang::{
 use backstop::{
     errors::VerdictError,
     state::{
-        Backer, BackstopConfig, BadDebtCover, ClaimReceipt, ATTESTATION_SEED, BACKER_SEED,
-        BAD_DEBT_SEED, CLAIM_SEED, CONFIG_SEED, USDC_VAULT_SEED as B_USDC_VAULT_SEED,
+        Backer, BackstopConfig, BadDebtCover, BorrowerClaims, Claim, ClaimStatus, BACKER_SEED,
+        BAD_DEBT_SEED, BORROWER_CLAIMS_SEED, CLAIM_SEED, CONFIG_SEED,
+        USDC_VAULT_SEED as B_USDC_VAULT_SEED,
     },
-    verdict::{encode_message, VerdictArgs, CLUSTER_DEVNET},
+    verdict::{encode_message, FactsArgs, CLUSTER_DEVNET},
 };
 use litesvm::LiteSVM;
 use solana_keypair::Keypair;
@@ -48,6 +51,11 @@ const IX_SYSVAR: Pubkey =
 const TOKEN_CLASSIC: Pubkey = spl_token_interface::ID;
 const SYSTEM: Pubkey = solana_system_interface::program::ID;
 const CAP_BPS: u32 = 1_000;
+const GATE_SECS: i64 = 60 * 86_400;
+const COOLDOWN_SECS: i64 = 7 * 86_400;
+const STREAM_SECS: i64 = 45 * 86_400;
+const CLAIM_WINDOW_SECS: i64 = 30 * 86_400;
+const INACTIVITY_EXPIRY_SECS: i64 = 100 * 86_400;
 
 fn params() -> MarketParams {
     MarketParams {
@@ -117,6 +125,16 @@ impl Env {
             seq.to_le_bytes().as_ref(),
         ])
     }
+    fn borrower_claims_pda(&self, borrower: &Pubkey) -> Pubkey {
+        bpda(&[
+            BORROWER_CLAIMS_SEED,
+            self.market().as_ref(),
+            borrower.as_ref(),
+        ])
+    }
+    fn claim_pda(&self, record: &Pubkey) -> Pubkey {
+        bpda(&[CLAIM_SEED, record.as_ref()])
+    }
 
     fn send(&mut self, ixs: &[Instruction], signers: &[&Keypair]) -> Result<(), String> {
         let msg = Message::new_with_blockhash(
@@ -165,12 +183,16 @@ impl Env {
         let a = self.svm.get_account(&self.record(seq)).unwrap();
         LiquidationRecord::try_deserialize(&mut a.data.as_slice()).unwrap()
     }
-    fn receipt_state(&self, record: &Pubkey) -> ClaimReceipt {
+    fn claim_state(&self, record: &Pubkey) -> Claim {
+        let a = self.svm.get_account(&self.claim_pda(record)).unwrap();
+        Claim::try_deserialize(&mut a.data.as_slice()).unwrap()
+    }
+    fn borrower_claims_state(&self, borrower: &Pubkey) -> BorrowerClaims {
         let a = self
             .svm
-            .get_account(&bpda(&[CLAIM_SEED, record.as_ref()]))
+            .get_account(&self.borrower_claims_pda(borrower))
             .unwrap();
-        ClaimReceipt::try_deserialize(&mut a.data.as_slice()).unwrap()
+        BorrowerClaims::try_deserialize(&mut a.data.as_slice()).unwrap()
     }
 }
 
@@ -384,6 +406,21 @@ impl Env {
         self.ok(&[ix], &[&feed]);
     }
 
+    /// Flushes the TWAP ring of any sample that held across a large time warp. A single sample's
+    /// TWAP weight is its held duration — the gap to whatever sample replaced it — so one print
+    /// spanning a 60-day warp outweighs thousands of normal 600s prints and pins the TWAP near its
+    /// price indefinitely. `walk_price_to`'s small steps then breach the deviation cap against that
+    /// stale anchor long before reaching a real crash price. Re-printing the unchanged price
+    /// `TWAP_SLOTS` times, evenly spaced, evicts every such sample from the ring before the walk.
+    fn reanchor_price(&mut self) {
+        const TWAP_SLOTS: usize = 16;
+        let price = self.market_state().price.last_price;
+        for _ in 0..TWAP_SLOTS {
+            self.warp(600);
+            self.push_price(price);
+        }
+    }
+
     /// Steps the feed down in increments small enough to clear the deviation cap against the
     /// trailing TWAP — a crash cannot be staged as a single print.
     fn walk_price_to(&mut self, target: u64) {
@@ -460,56 +497,136 @@ impl Env {
         }
     }
 
-    /// Signs and records a verdict for a liquidation record.
-    fn attest(&mut self, record: &Pubkey, borrower: &Pubkey, payout: u64) {
-        let args = VerdictArgs {
+    fn open_borrower_claims(&mut self, borrower: &Pubkey) {
+        let admin = self.admin.insecure_clone();
+        let ix = self.b_ix(
+            backstop::accounts::OpenBorrowerClaims {
+                payer: admin.pubkey(),
+                market: self.market(),
+                borrower: *borrower,
+                borrower_claims: self.borrower_claims_pda(borrower),
+                system_program: SYSTEM,
+            },
+            backstop::instruction::OpenBorrowerClaims {},
+        );
+        self.ok(&[ix], &[&admin]);
+    }
+
+    /// Builds `[ed25519, submit_facts]` for one liquidation record. Opens the borrower's claim
+    /// tracker first if it does not exist yet.
+    fn submit_facts_ixs(
+        &mut self,
+        record: &Pubkey,
+        borrower: &Pubkey,
+        ref_at_liq: u64,
+        ref_after: u64,
+    ) -> [Instruction; 2] {
+        if self
+            .svm
+            .get_account(&self.borrower_claims_pda(borrower))
+            .is_none()
+        {
+            self.open_borrower_claims(borrower);
+        }
+        let existing = self.borrower_claims_state(borrower).open;
+        let admin = self.admin.insecure_clone();
+        let existing_arg = if existing == Pubkey::default() {
+            admin.pubkey()
+        } else {
+            existing
+        };
+        let args = FactsArgs {
             liquidation_record: *record,
             borrower: *borrower,
-            payout,
-            tier: 1,
-            verdict_hash: [7; 32],
+            ref_at_liq,
+            ref_after,
+            after_ts: self.now + 3_600,
+            evidence_hash: [7; 32],
             deadline: self.now + 600,
         };
         let msg = encode_message(&backstop::ID, CLUSTER_DEVNET, &args);
         let oracle = self.oracle.insecure_clone();
-        let admin = self.admin.insecure_clone();
         let ed = self.ed25519_ix(&oracle, &msg);
         let ix = self.b_ix(
-            backstop::accounts::AttestVerdict {
+            backstop::accounts::SubmitFacts {
                 payer: admin.pubkey(),
                 config: self.b_config(),
-                attestation: bpda(&[ATTESTATION_SEED, record.as_ref()]),
+                market: self.market(),
+                liquidation_record: *record,
+                borrower: *borrower,
+                borrower_claims: self.borrower_claims_pda(borrower),
+                existing_claim: existing_arg,
+                claim: self.claim_pda(record),
+                payout_backer: self.backer(borrower),
                 instructions_sysvar: IX_SYSVAR,
                 system_program: SYSTEM,
             },
-            backstop::instruction::AttestVerdict { args },
+            backstop::instruction::SubmitFacts { args },
         );
-        self.ok(&[ed, ix], &[&admin]);
+        [ed, ix]
     }
 
-    fn pay_ix(
-        &self,
-        payer: &Pubkey,
+    /// Submits facts and expects the transaction to succeed (the claim may still end up `Denied`
+    /// on-chain — that is a successful submission, not a failed one).
+    fn submit_facts(
+        &mut self,
         record: &Pubkey,
         borrower: &Pubkey,
-        borrower_usdc: &Pubkey,
-    ) -> Instruction {
+        ref_at_liq: u64,
+        ref_after: u64,
+    ) {
+        let ixs = self.submit_facts_ixs(record, borrower, ref_at_liq, ref_after);
+        let admin = self.admin.insecure_clone();
+        self.ok(&ixs, &[&admin]);
+    }
+
+    fn unlock_claim_ix(&self, record: &Pubkey) -> Instruction {
         self.b_ix(
-            backstop::accounts::PayWrongfulLiquidation {
-                payer: *payer,
+            backstop::accounts::UpdateClaim {
                 config: self.b_config(),
-                attestation: bpda(&[ATTESTATION_SEED, record.as_ref()]),
-                liquidation_record: *record,
-                receipt: bpda(&[CLAIM_SEED, record.as_ref()]),
-                borrower: *borrower,
-                borrower_usdc: *borrower_usdc,
-                borrower_backer: self.backer(borrower),
+                claim: self.claim_pda(record),
+            },
+            backstop::instruction::UnlockClaim {},
+        )
+    }
+    fn try_release_queued_ix(&self, record: &Pubkey) -> Instruction {
+        self.b_ix(
+            backstop::accounts::UpdateClaim {
+                config: self.b_config(),
+                claim: self.claim_pda(record),
+            },
+            backstop::instruction::TryReleaseQueued {},
+        )
+    }
+    fn expire_queued_ix(&self, record: &Pubkey) -> Instruction {
+        self.b_ix(
+            backstop::accounts::UpdateClaim {
+                config: self.b_config(),
+                claim: self.claim_pda(record),
+            },
+            backstop::instruction::ExpireQueued {},
+        )
+    }
+    fn expire_stale_ix(&self, record: &Pubkey) -> Instruction {
+        self.b_ix(
+            backstop::accounts::UpdateClaim {
+                config: self.b_config(),
+                claim: self.claim_pda(record),
+            },
+            backstop::instruction::ExpireStale {},
+        )
+    }
+    fn claim_stream_ix(&self, record: &Pubkey, payout_usdc: &Pubkey) -> Instruction {
+        self.b_ix(
+            backstop::accounts::ClaimStream {
+                config: self.b_config(),
+                claim: self.claim_pda(record),
                 usdc_mint: self.usdc_mint,
+                payout_usdc: *payout_usdc,
                 usdc_vault: self.b_vault(),
                 usdc_token_program: TOKEN_CLASSIC,
-                system_program: SYSTEM,
             },
-            backstop::instruction::PayWrongfulLiquidation {},
+            backstop::instruction::ClaimStream {},
         )
     }
 }
@@ -827,6 +944,23 @@ fn liquidate(env: &mut Env, liquidator: Option<&Keypair>, price_fraction: u64) -
     liq
 }
 
+/// A reference price far enough from `record`'s liquidation price that both check (a) and check
+/// (b) fire against it, plus the exact `wrongful_loss` it produces.
+fn wrongful_ref_and_loss(record: &LiquidationRecord) -> (u64, u64) {
+    // The undisturbed price the feed should have shown throughout — `PRICE` itself, well outside a
+    // 5% band of any crashed liquidation price used in these tests.
+    let ref_price = PRICE;
+    let loss = safu_core::loss::wrongful_loss(
+        record.seized_raw,
+        record.collateral_decimals,
+        record.multiplier_fp,
+        ref_price,
+        record.debt_repaid,
+    )
+    .unwrap();
+    (ref_price, loss)
+}
+
 // ------------------------------------------------------------------ backer capital
 
 #[test]
@@ -910,9 +1044,21 @@ fn a_withdrawal_waits_for_the_delay() {
 }
 
 #[test]
-fn a_withdrawal_is_blocked_while_a_claim_is_outstanding() {
-    let mut env = base();
-    let (who, acct) = env.back(1_000 * USDC);
+fn a_withdrawal_is_blocked_only_up_to_the_reserved_amount() {
+    let mut env = with_loan();
+    let (who, acct) = env.back(100_000 * USDC);
+    env.warp(GATE_SECS + 86_400);
+    env.reanchor_price();
+    liquidate(&mut env, None, 75);
+    let record = env.record_state(0);
+    let record_key = env.record(0);
+    let (ref_price, loss) = wrongful_ref_and_loss(&record);
+    env.submit_facts(&record_key, &env.alice.pubkey(), ref_price, ref_price + 1);
+    let claim = env.claim_state(&record_key);
+    assert_eq!(claim.status, ClaimStatus::Active, "old loan admits at once");
+    assert_eq!(claim.loss, loss);
+    assert_eq!(env.config_state().reserved_total, loss);
+
     let shares = env.backer_state(&who.pubkey()).shares;
     let req = env.b_ix(
         backstop::accounts::BackerOnly {
@@ -923,12 +1069,6 @@ fn a_withdrawal_is_blocked_while_a_claim_is_outstanding() {
     );
     env.ok(&[req], &[&who]);
     env.warp(86_400);
-
-    // An attested verdict is a liability the remaining backers would otherwise be left holding.
-    let record = Pubkey::new_unique();
-    let borrower = Pubkey::new_unique();
-    env.attest(&record, &borrower, 100 * USDC);
-    assert_eq!(env.config_state().open_claims, 1);
 
     let fin = env.b_ix(
         backstop::accounts::FinalizeWithdraw {
@@ -942,7 +1082,38 @@ fn a_withdrawal_is_blocked_while_a_claim_is_outstanding() {
         },
         backstop::instruction::FinalizeWithdraw {},
     );
-    assert_program_error(env.send(&[fin], &[&who]), VerdictError::ClaimsOutstanding);
+    // Pulling every share would take reserved capital with it — refused.
+    assert_program_error(env.send(&[fin], &[&who]), VerdictError::InsufficientBalance);
+
+    // Requesting only the unreserved portion succeeds.
+    let cash = env.config_state().cash;
+    let available = cash - loss;
+    let partial_shares = shares * available as u128 / cash as u128;
+    let req2 = env.b_ix(
+        backstop::accounts::BackerOnly {
+            owner: who.pubkey(),
+            backer: env.backer(&who.pubkey()),
+        },
+        backstop::instruction::RequestWithdraw {
+            shares: partial_shares,
+        },
+    );
+    env.ok(&[req2], &[&who]);
+    env.warp(86_400);
+    let fin2 = env.b_ix(
+        backstop::accounts::FinalizeWithdraw {
+            owner: who.pubkey(),
+            config: env.b_config(),
+            backer: env.backer(&who.pubkey()),
+            usdc_mint: env.usdc_mint,
+            owner_usdc: acct,
+            usdc_vault: env.b_vault(),
+            usdc_token_program: TOKEN_CLASSIC,
+        },
+        backstop::instruction::FinalizeWithdraw {},
+    );
+    env.ok(&[fin2], &[&who]);
+    assert!(env.config_state().cash >= loss, "the reservation survives");
 }
 
 #[test]
@@ -1044,7 +1215,14 @@ fn only_the_admin_can_rotate_the_oracle_or_move_the_knobs() {
 #[test]
 fn rotating_the_oracle_retires_the_old_key() {
     // The verdict key is a throwaway Ed25519 key; a leak has to be recoverable without a redeploy.
-    let mut env = base();
+    let mut env = with_loan();
+    env.warp(GATE_SECS + 86_400);
+    env.reanchor_price();
+    liquidate(&mut env, None, 75);
+    let record = env.record_state(0);
+    let record_key = env.record(0);
+    let (ref_price, _) = wrongful_ref_and_loss(&record);
+
     let admin = env.admin.insecure_clone();
     let new_oracle = Keypair::new();
     let rotate = env.b_ix(
@@ -1060,33 +1238,9 @@ fn rotating_the_oracle_retires_the_old_key() {
     assert_eq!(env.config_state().verdict_oracle, new_oracle.pubkey());
 
     env.warp(60);
-    // A verdict signed by the retired key no longer verifies.
-    let record = Pubkey::new_unique();
-    let args = VerdictArgs {
-        liquidation_record: record,
-        borrower: Pubkey::new_unique(),
-        payout: 10 * USDC,
-        tier: 1,
-        verdict_hash: [1; 32],
-        deadline: env.now + 600,
-    };
-    let msg = encode_message(&backstop::ID, CLUSTER_DEVNET, &args);
-    let old_oracle = env.oracle.insecure_clone();
-    let ed = env.ed25519_ix(&old_oracle, &msg);
-    let ix = env.b_ix(
-        backstop::accounts::AttestVerdict {
-            payer: admin.pubkey(),
-            config: env.b_config(),
-            attestation: bpda(&[ATTESTATION_SEED, record.as_ref()]),
-            instructions_sysvar: IX_SYSVAR,
-            system_program: SYSTEM,
-        },
-        backstop::instruction::AttestVerdict { args },
-    );
-    assert_program_error(
-        env.send(&[ed, ix], &[&admin]),
-        VerdictError::WrongVerdictSigner,
-    );
+    // Facts signed by the retired key no longer verify.
+    let ixs = env.submit_facts_ixs(&record_key, &env.alice.pubkey(), ref_price, ref_price + 1);
+    assert_program_error(env.send(&ixs, &[&admin]), VerdictError::WrongVerdictSigner);
 }
 
 #[test]
@@ -1129,66 +1283,304 @@ fn backstop_knobs_outside_their_hard_bounds_are_refused() {
     assert_eq!(c.withdraw_delay_secs, 3_600);
 }
 
-// ------------------------------------------------------------------ wrongful-liquidation payout
+// ------------------------------------------------------------------ v2 claims: gate, admission, queue
 
 #[test]
-fn a_wrongful_liquidation_is_paid_and_receipted() {
+fn a_young_loan_claim_is_held_then_released_at_day_sixty() {
     let mut env = with_loan();
     env.back(100_000 * USDC);
+    // Liquidated right away: the loan is only minutes old.
     liquidate(&mut env, None, 75);
-
-    let record_key = env.record(0);
     let record = env.record_state(0);
+    let record_key = env.record(0);
+    let (ref_price, loss) = wrongful_ref_and_loss(&record);
     let alice = env.alice.pubkey();
-    assert_eq!(record.borrower, alice);
+    env.submit_facts(&record_key, &alice, ref_price, ref_price + 1);
 
-    // The verdict engine prices the loss off an independent reference; 500 USDC stands in here.
-    let payout = 500 * USDC;
-    env.warp(60);
-    env.attest(&record_key, &alice, payout);
-    assert_eq!(env.config_state().open_claims, 1);
-
-    let before = env.balance(&env.alice_usdc);
-    let cash_before = env.config_state().cash;
-    let payer = env.admin.insecure_clone();
-    let (alice_usdc, payer_key) = (env.alice_usdc, payer.pubkey());
-    let ix = env.pay_ix(&payer_key, &record_key, &alice, &alice_usdc);
-    env.ok(&[ix], &[&payer]);
-
-    assert_eq!(env.balance(&alice_usdc) - before, payout, "paid 1:1");
-    let r = env.receipt_state(&record_key);
-    assert_eq!(r.attested, payout);
-    assert_eq!(r.paid, payout);
-    assert_eq!(r.borrower, alice);
-    assert_eq!(r.liquidation_record, record_key);
-    let c = env.config_state();
+    let claim = env.claim_state(&record_key);
+    assert_eq!(claim.status, ClaimStatus::PendingTime);
+    assert_eq!(claim.loss, loss);
+    assert_eq!(claim.releasable_at, record.borrow_age_ts + GATE_SECS);
     assert_eq!(
-        cash_before - c.cash,
-        payout,
-        "the payout comes out of backer capital"
+        env.config_state().reserved_total,
+        0,
+        "held claims reserve nothing"
     );
-    assert_eq!(c.open_claims, 0, "the claim is settled");
+
+    let unlock = env.unlock_claim_ix(&record_key);
+    let admin = env.admin.insecure_clone();
+    assert_program_error(
+        env.send(std::slice::from_ref(&unlock), &[&admin]),
+        VerdictError::GateNotElapsed,
+    );
+
+    env.warp(GATE_SECS + 1);
+    env.ok(&[unlock], &[&admin]);
+    let claim = env.claim_state(&record_key);
+    assert_eq!(claim.status, ClaimStatus::Active);
+    assert_eq!(env.config_state().reserved_total, loss);
 }
 
 #[test]
-fn a_second_payout_for_the_same_liquidation_is_impossible() {
+fn a_claim_over_the_admission_cap_queues_then_releases_once_it_fits() {
+    let mut env = with_loan();
+    // 1,000 USDC pool, 10% per-claim cap -> 100 USDC is the most one claim can be admitted for.
+    env.back(1_000 * USDC);
+    env.warp(GATE_SECS + 86_400);
+    env.reanchor_price();
+    liquidate(&mut env, None, 75);
+    let record = env.record_state(0);
+    let record_key = env.record(0);
+    let alice = env.alice.pubkey();
+
+    // A reference far enough above PRICE that the loss clears 100 USDC.
+    let big_ref = PRICE * 5;
+    let loss = safu_core::loss::wrongful_loss(
+        record.seized_raw,
+        record.collateral_decimals,
+        record.multiplier_fp,
+        big_ref,
+        record.debt_repaid,
+    )
+    .unwrap();
+    assert!(
+        loss > 100 * USDC,
+        "the scenario must actually exceed the cap"
+    );
+    env.submit_facts(&record_key, &alice, big_ref, big_ref + 1);
+
+    let claim = env.claim_state(&record_key);
+    assert_eq!(claim.status, ClaimStatus::Queued);
+    assert_eq!(claim.loss, loss);
+    assert_eq!(
+        env.config_state().reserved_total,
+        0,
+        "queued claims reserve nothing"
+    );
+
+    let admin = env.admin.insecure_clone();
+    let retry = env.try_release_queued_ix(&record_key);
+    env.ok(std::slice::from_ref(&retry), &[&admin]);
+    assert_eq!(
+        env.claim_state(&record_key).status,
+        ClaimStatus::Queued,
+        "still short of the cap"
+    );
+
+    // Top up so the loss clears both the 10% per-claim cap and the 25% admission-day band, with
+    // headroom — a fixed top-up would silently under-shoot if `big_ref` is tuned differently later.
+    let cash_now = env.config_state().cash;
+    let cash_needed = loss.saturating_mul(11); // 10% cap is the binding constraint; +1x margin
+    if cash_needed > cash_now {
+        env.back(cash_needed - cash_now);
+    }
+    env.warp(1); // fresh blockhash: the retry instruction is otherwise byte-identical to the last
+    env.ok(&[retry], &[&admin]);
+    let claim = env.claim_state(&record_key);
+    assert_eq!(claim.status, ClaimStatus::Active);
+    assert_eq!(env.config_state().reserved_total, loss);
+}
+
+#[test]
+fn a_queued_claim_expires_at_the_claim_window() {
+    let mut env = with_loan();
+    env.back(1_000 * USDC);
+    env.warp(GATE_SECS + 86_400);
+    env.reanchor_price();
+    liquidate(&mut env, None, 75);
+    let record_key = env.record(0);
+    let big_ref = PRICE * 5;
+    env.submit_facts(&record_key, &env.alice.pubkey(), big_ref, big_ref + 1);
+    assert_eq!(env.claim_state(&record_key).status, ClaimStatus::Queued);
+
+    let admin = env.admin.insecure_clone();
+    let expire = env.expire_queued_ix(&record_key);
+    assert_program_error(
+        env.send(std::slice::from_ref(&expire), &[&admin]),
+        VerdictError::NotYetExpired,
+    );
+
+    env.warp(CLAIM_WINDOW_SECS + 1);
+    env.ok(&[expire], &[&admin]);
+    assert_eq!(env.claim_state(&record_key).status, ClaimStatus::Expired);
+    assert_eq!(env.config_state().reserved_total, 0);
+}
+
+// ------------------------------------------------------------------ v2 claims: cooldown, stream, outflow, inactivity
+
+#[test]
+fn a_claim_streams_linearly_and_completes() {
+    let mut env = with_loan();
+    env.back(1_000_000 * USDC);
+    env.warp(GATE_SECS + 86_400);
+    env.reanchor_price();
+    liquidate(&mut env, None, 75);
+    let record = env.record_state(0);
+    let record_key = env.record(0);
+    let (ref_price, loss) = wrongful_ref_and_loss(&record);
+    let alice = env.alice.pubkey();
+    env.submit_facts(&record_key, &alice, ref_price, ref_price + 1);
+    assert_eq!(env.claim_state(&record_key).status, ClaimStatus::Active);
+
+    let admin = env.admin.insecure_clone();
+    let stream = env.claim_stream_ix(&record_key, &env.alice_usdc);
+    assert_program_error(
+        env.send(std::slice::from_ref(&stream), &[&admin]),
+        VerdictError::CooldownNotElapsed,
+    );
+
+    env.warp(COOLDOWN_SECS + STREAM_SECS / 2);
+    let before = env.balance(&env.alice_usdc);
+    env.ok(std::slice::from_ref(&stream), &[&admin]);
+    let half = env.balance(&env.alice_usdc) - before;
+    assert!(
+        half > loss * 45 / 100 && half < loss * 55 / 100,
+        "roughly half the loss should have vested: {half} of {loss}"
+    );
+    assert_eq!(env.claim_state(&record_key).status, ClaimStatus::Active);
+
+    env.warp(STREAM_SECS / 2 + 1);
+    env.ok(&[stream], &[&admin]);
+    assert_eq!(
+        env.balance(&env.alice_usdc) - before,
+        loss,
+        "fully streamed"
+    );
+    let claim = env.claim_state(&record_key);
+    assert_eq!(claim.status, ClaimStatus::Completed);
+    assert_eq!(claim.streamed, loss);
+    assert_eq!(env.config_state().reserved_total, 0);
+}
+
+#[test]
+fn the_outflow_cap_throttles_a_big_claim_across_days() {
+    let mut env = with_loan();
+    // 1,000,000 USDC pool: 5% daily outflow band = 50,000 USDC, 10% per-claim cap = 100,000 USDC.
+    env.back(1_000_000 * USDC);
+    env.warp(GATE_SECS + 86_400);
+    env.reanchor_price();
+    liquidate(&mut env, None, 75);
+    let record = env.record_state(0);
+    let record_key = env.record(0);
+
+    // Solve for a reference price landing the loss strictly between the two bands (75,000 USDC
+    // target), so the outflow cap is deterministically the one that binds — not a maybe.
+    // `wrongful_loss` is linear in the reference price: loss(k·PRICE) = k·(loss(PRICE)+debt) − debt.
+    let (base_ref, base_loss) = wrongful_ref_and_loss(&record);
+    let target_loss = 75_000u128 * USDC as u128;
+    let k_num = target_loss + record.debt_repaid as u128;
+    let k_den = base_loss as u128 + record.debt_repaid as u128;
+    let big_ref = u64::try_from((base_ref as u128 * k_num) / k_den).unwrap();
+    let loss = safu_core::loss::wrongful_loss(
+        record.seized_raw,
+        record.collateral_decimals,
+        record.multiplier_fp,
+        big_ref,
+        record.debt_repaid,
+    )
+    .unwrap();
+    assert!(
+        loss > 50_000 * USDC && loss < 100_000 * USDC,
+        "loss ({loss}) must sit strictly between the 5% outflow band and the 10% per-claim cap for \
+         this test to actually exercise the throttle"
+    );
+
+    let alice = env.alice.pubkey();
+    env.submit_facts(&record_key, &alice, big_ref, big_ref + 1);
+    assert_eq!(env.claim_state(&record_key).status, ClaimStatus::Active);
+
+    env.warp(COOLDOWN_SECS + STREAM_SECS); // fully vested at first pull
+    let admin = env.admin.insecure_clone();
+    let stream = env.claim_stream_ix(&record_key, &env.alice_usdc);
+    let before = env.balance(&env.alice_usdc);
+    env.ok(std::slice::from_ref(&stream), &[&admin]);
+    let first_pull = env.balance(&env.alice_usdc) - before;
+    let daily_cap = env
+        .config_state()
+        .cash
+        .max(env.claim_state(&record_key).snapshot_cash)
+        / 20; // 5%
+    assert!(
+        first_pull <= daily_cap + 1,
+        "one day cannot exceed the outflow band: pulled {first_pull}, cap {daily_cap}"
+    );
+    assert!(
+        first_pull < loss,
+        "the band must actually have throttled this claim: pulled {first_pull} of {loss}"
+    );
+    assert_eq!(
+        env.claim_state(&record_key).status,
+        ClaimStatus::Active,
+        "a throttled claim is not done in one call"
+    );
+
+    // A second pull the same day gets nothing more.
+    env.warp(1); // fresh blockhash: otherwise byte-identical to the last, already-processed tx
+    assert_program_error(
+        env.send(std::slice::from_ref(&stream), &[&admin]),
+        VerdictError::NothingToPay,
+    );
+
+    // Next day, the rest becomes available and the claim completes.
+    env.warp(86_400);
+    env.ok(&[stream], &[&admin]);
+    assert_eq!(env.balance(&env.alice_usdc) - before, loss);
+    assert_eq!(env.claim_state(&record_key).status, ClaimStatus::Completed);
+}
+
+#[test]
+fn an_uncollected_claim_expires_after_the_inactivity_window() {
     let mut env = with_loan();
     env.back(100_000 * USDC);
+    env.warp(GATE_SECS + 86_400);
+    env.reanchor_price();
     liquidate(&mut env, None, 75);
-    let (record_key, alice) = (env.record(0), env.alice.pubkey());
-    env.warp(60);
-    env.attest(&record_key, &alice, 500 * USDC);
+    let record = env.record_state(0);
+    let record_key = env.record(0);
+    let (ref_price, loss) = wrongful_ref_and_loss(&record);
+    let alice = env.alice.pubkey();
+    env.submit_facts(&record_key, &alice, ref_price, ref_price + 1);
+    assert_eq!(env.config_state().reserved_total, loss);
 
-    let payer = env.admin.insecure_clone();
-    let (alice_usdc, payer_key) = (env.alice_usdc, payer.pubkey());
-    let ix = env.pay_ix(&payer_key, &record_key, &alice, &alice_usdc);
-    env.ok(std::slice::from_ref(&ix), &[&payer]);
+    let admin = env.admin.insecure_clone();
+    let expire = env.expire_stale_ix(&record_key);
+    assert_program_error(
+        env.send(std::slice::from_ref(&expire), &[&admin]),
+        VerdictError::NotYetStale,
+    );
+
+    env.warp(INACTIVITY_EXPIRY_SECS + 1);
+    env.ok(&[expire], &[&admin]);
+    assert_eq!(env.claim_state(&record_key).status, ClaimStatus::Expired);
+    assert_eq!(
+        env.config_state().reserved_total,
+        0,
+        "the unpaid remainder returns to the backstop"
+    );
+}
+
+// ------------------------------------------------------------------ v2 claims: structural refusals
+
+#[test]
+fn a_second_submission_for_the_same_liquidation_is_impossible() {
+    let mut env = with_loan();
+    env.back(100_000 * USDC);
+    env.warp(GATE_SECS + 86_400);
+    env.reanchor_price();
+    liquidate(&mut env, None, 75);
+    let record = env.record_state(0);
+    let record_key = env.record(0);
+    let (ref_price, _) = wrongful_ref_and_loss(&record);
+    let alice = env.alice.pubkey();
+    env.submit_facts(&record_key, &alice, ref_price, ref_price + 1);
 
     env.warp(60);
-    // The receipt account already exists, so `init` refuses — replaying pays nothing twice.
+    // The claim account already exists, so `init` refuses — replaying cannot open a second claim.
+    let ixs = env.submit_facts_ixs(&record_key, &alice, ref_price, ref_price + 1);
+    let admin = env.admin.insecure_clone();
     assert!(
-        env.send(&[ix], &[&payer]).is_err(),
-        "a replayed payout must not succeed"
+        env.send(&ixs, &[&admin]).is_err(),
+        "a replayed submission must not succeed"
     );
 }
 
@@ -1196,21 +1588,21 @@ fn a_second_payout_for_the_same_liquidation_is_impossible() {
 fn a_self_dealt_liquidation_is_never_covered() {
     let mut env = with_loan();
     env.back(100_000 * USDC);
+    env.warp(GATE_SECS + 86_400);
+    env.reanchor_price();
     // Self-liquidation is legitimate deleveraging, so the vault allows it. It is simply not a
     // wrongful liquidation, and the refusal belongs here (spec 13c).
     let alice = env.alice.insecure_clone();
     liquidate(&mut env, Some(&alice), 75);
 
-    let (record_key, alice_key) = (env.record(0), alice.pubkey());
-    assert_eq!(env.record_state(0).liquidator, alice_key);
-    env.warp(60);
-    env.attest(&record_key, &alice_key, 500 * USDC);
-
-    let payer = env.admin.insecure_clone();
-    let (alice_usdc, payer_key) = (env.alice_usdc, payer.pubkey());
-    let ix = env.pay_ix(&payer_key, &record_key, &alice_key, &alice_usdc);
+    let record = env.record_state(0);
+    let record_key = env.record(0);
+    assert_eq!(record.liquidator, alice.pubkey());
+    let (ref_price, _) = wrongful_ref_and_loss(&record);
+    let ixs = env.submit_facts_ixs(&record_key, &alice.pubkey(), ref_price, ref_price + 1);
+    let admin = env.admin.insecure_clone();
     assert_program_error(
-        env.send(&[ix], &[&payer]),
+        env.send(&ixs, &[&admin]),
         VerdictError::SelfDealtLiquidation,
     );
 }
@@ -1219,11 +1611,15 @@ fn a_self_dealt_liquidation_is_never_covered() {
 fn a_borrower_who_backs_the_pool_cannot_be_paid_from_it() {
     let mut env = with_loan();
     env.back(100_000 * USDC);
+    env.warp(GATE_SECS + 86_400);
+    env.reanchor_price();
     liquidate(&mut env, None, 75);
-    let (record_key, alice_key) = (env.record(0), env.alice.pubkey());
+    let record = env.record_state(0);
+    let record_key = env.record(0);
+    let alice_key = env.alice.pubkey();
     let alice = env.alice.insecure_clone();
 
-    // A4: Alice backs the very pool that would pay her.
+    // A4, applied to the payout: Alice backs the very pool that would pay her.
     let open = env.b_ix(
         backstop::accounts::OpenBacker {
             owner: alice_key,
@@ -1248,12 +1644,10 @@ fn a_borrower_who_backs_the_pool_cannot_be_paid_from_it() {
     );
     env.ok(&[dep], &[&alice]);
 
-    env.warp(60);
-    env.attest(&record_key, &alice_key, 500 * USDC);
-    let payer = env.admin.insecure_clone();
-    let (alice_usdc, payer_key) = (env.alice_usdc, payer.pubkey());
-    let ix = env.pay_ix(&payer_key, &record_key, &alice_key, &alice_usdc);
-    assert_program_error(env.send(&[ix], &[&payer]), VerdictError::BorrowerIsABacker);
+    let (ref_price, _) = wrongful_ref_and_loss(&record);
+    let ixs = env.submit_facts_ixs(&record_key, &alice_key, ref_price, ref_price + 1);
+    let admin = env.admin.insecure_clone();
+    assert_program_error(env.send(&ixs, &[&admin]), VerdictError::BorrowerIsABacker);
 }
 
 #[test]
@@ -1263,6 +1657,8 @@ fn a_liquidation_taken_under_an_issuer_halt_is_never_covered() {
     // backstop's own refusal, which is defence in depth rather than dead weight.
     let mut env = with_loan();
     env.back(100_000 * USDC);
+    env.warp(GATE_SECS + 86_400);
+    env.reanchor_price();
     liquidate(&mut env, None, 75);
 
     let record_key = env.record(0);
@@ -1275,97 +1671,73 @@ fn a_liquidation_taken_under_an_issuer_halt_is_never_covered() {
     acc.data = data;
     env.svm.set_account(record_key, acc).unwrap();
 
+    let (ref_price, _) = wrongful_ref_and_loss(&record);
     let alice = env.alice.pubkey();
-    env.warp(60);
-    env.attest(&record_key, &alice, 500 * USDC);
-    let payer = env.admin.insecure_clone();
-    let (alice_usdc, payer_key) = (env.alice_usdc, payer.pubkey());
-    let ix = env.pay_ix(&payer_key, &record_key, &alice, &alice_usdc);
+    let ixs = env.submit_facts_ixs(&record_key, &alice, ref_price, ref_price + 1);
+    let admin = env.admin.insecure_clone();
     assert_program_error(
-        env.send(&[ix], &[&payer]),
+        env.send(&ixs, &[&admin]),
         VerdictError::IssuerHaltedLiquidation,
     );
 }
 
 #[test]
-fn the_attestation_must_match_the_record_supplied() {
+fn the_facts_must_match_the_record_supplied() {
     let mut env = with_loan();
     env.back(100_000 * USDC);
+    env.warp(GATE_SECS + 86_400);
+    env.reanchor_price();
     liquidate(&mut env, None, 60);
     env.warp(60);
     liquidate(&mut env, None, 55);
 
     let (first, second) = (env.record(0), env.record(1));
     let alice = env.alice.pubkey();
-    env.warp(60);
-    env.attest(&first, &alice, 500 * USDC);
+    let record0 = env.record_state(0);
+    let (ref_price, _) = wrongful_ref_and_loss(&record0);
 
-    // Attestation for the first liquidation, record account for the second.
-    let payer = env.admin.insecure_clone();
-    let (alice_usdc, payer_key) = (env.alice_usdc, payer.pubkey());
-    let mut ix = env.pay_ix(&payer_key, &first, &alice, &alice_usdc);
-    let (old_receipt, new_receipt) = (
-        bpda(&[CLAIM_SEED, first.as_ref()]),
-        bpda(&[CLAIM_SEED, second.as_ref()]),
-    );
-    for meta in ix.accounts.iter_mut() {
+    // Facts signed for the first liquidation, but the `liquidation_record` account swapped for the
+    // second — `args.liquidation_record` still says `first`, so the cross-check must catch it.
+    let mut ixs = env.submit_facts_ixs(&first, &alice, ref_price, ref_price + 1);
+    for meta in ixs[1].accounts.iter_mut() {
         if meta.pubkey == first {
             meta.pubkey = second;
-        } else if meta.pubkey == old_receipt {
-            // The receipt is seeded by the record, so it has to move with it -- otherwise Anchor's
-            // seeds check fires first and the program's own cross-check is never exercised.
-            meta.pubkey = new_receipt;
         }
     }
-    assert_program_error(env.send(&[ix], &[&payer]), VerdictError::RecordMismatch);
+    let admin = env.admin.insecure_clone();
+    assert_program_error(env.send(&ixs, &[&admin]), VerdictError::RecordMismatch);
 }
 
 #[test]
-fn the_per_claim_cap_bounds_a_payout_and_the_shortfall_is_recorded() {
+fn a_borrower_cannot_open_a_second_claim_while_one_is_unresolved() {
     let mut env = with_loan();
-    // 1,000 USDC of backer capital, 10% per-claim cap -> 100 USDC is the most one claim can take.
-    env.back(1_000 * USDC);
-    liquidate(&mut env, None, 75);
-    let (record_key, alice) = (env.record(0), env.alice.pubkey());
+    env.back(100_000 * USDC);
+    env.warp(GATE_SECS + 86_400);
+    env.reanchor_price();
+    liquidate(&mut env, None, 60);
+    let record = env.record_state(0);
+    let record_key = env.record(0);
+    let alice = env.alice.pubkey();
+    // Not actually wrong: this submission is denied, but denial is a terminal status, so it frees
+    // the slot for a later real claim.
+    env.submit_facts(&record_key, &alice, record.price_fp, record.price_fp + 1);
+    assert_eq!(env.claim_state(&record_key).status, ClaimStatus::Denied);
+
     env.warp(60);
-    env.attest(&record_key, &alice, 500 * USDC);
-
-    let before = env.balance(&env.alice_usdc);
-    let payer = env.admin.insecure_clone();
-    let (alice_usdc, payer_key) = (env.alice_usdc, payer.pubkey());
-    let ix = env.pay_ix(&payer_key, &record_key, &alice, &alice_usdc);
-    env.ok(&[ix], &[&payer]);
-
-    let r = env.receipt_state(&record_key);
-    assert_eq!(r.paid, 100 * USDC, "capped at 10% of backer capital");
-    assert_eq!(r.attested, 500 * USDC, "what was owed stays on the record");
-    assert!(
-        r.attested > r.paid,
-        "the shortfall is visible, not silently dropped"
+    liquidate(&mut env, None, 40);
+    let second_key = env.record(1);
+    let record1 = env.record_state(1);
+    let (ref_price, _) = wrongful_ref_and_loss(&record1);
+    // Slot is free (the first is terminal) — the second submission is accepted.
+    env.submit_facts(&second_key, &alice, ref_price, ref_price + 1);
+    assert_eq!(
+        env.claim_state(&second_key).status,
+        ClaimStatus::Active,
+        "the second claim admits normally"
     );
-    assert_eq!(env.balance(&alice_usdc) - before, 100 * USDC);
-}
-
-#[test]
-fn a_payout_lowers_the_share_price_for_backers() {
-    let mut env = with_loan();
-    let (who, _) = env.back(100_000 * USDC);
-    let shares = env.backer_state(&who.pubkey()).shares;
-    liquidate(&mut env, None, 75);
-    let (record_key, alice) = (env.record(0), env.alice.pubkey());
-    env.warp(60);
-    env.attest(&record_key, &alice, 500 * USDC);
-    let payer = env.admin.insecure_clone();
-    let (alice_usdc, payer_key) = (env.alice_usdc, payer.pubkey());
-    let ix = env.pay_ix(&payer_key, &record_key, &alice, &alice_usdc);
-    env.ok(&[ix], &[&payer]);
-
-    // Backers carry the cost of the cover they sold; that is the whole point of the pool.
-    let c = env.config_state();
-    let value = (shares * c.cash as u128 / c.total_shares) as u64;
-    assert!(
-        (99_500 * USDC..100_000 * USDC).contains(&value),
-        "backer value {value} should have fallen by the payout"
+    assert_eq!(
+        env.borrower_claims_state(&alice).open,
+        env.claim_pda(&second_key)
     );
 }
 

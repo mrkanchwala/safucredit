@@ -12,12 +12,13 @@ use solana_instructions_sysvar::{load_current_index_checked, load_instruction_at
 
 use crate::errors::VerdictError;
 
-/// Domain tag. Bump the version when the message layout changes; old signatures then stop verifying.
-pub const DOMAIN: &[u8; 17] = b"SAFU_STOCKLANA_V1";
-/// DOMAIN(17) + program id(32) + cluster(1) + liquidation record(32) + borrower(32) + payout(8) + tier(1)
-/// + verdict hash(32) + deadline(8).
-pub const MESSAGE_LEN: usize = 163;
-/// A signed verdict must be attested within this window.
+/// Domain tag (v2: the oracle signs facts, not a payout amount — see the LOCKED verdict spec).
+/// Bump the version when the message layout changes; old signatures then stop verifying.
+pub const DOMAIN: &[u8; 17] = b"SAFU_STOCKLANA_V2";
+/// DOMAIN(17) + program id(32) + cluster(1) + liquidation record(32) + borrower(32) +
+/// ref_at_liq(8) + ref_after(8) + after_ts(8) + evidence hash(32) + deadline(8).
+pub const MESSAGE_LEN: usize = 178;
+/// A signed verdict must be submitted within this window of being signed.
 pub const MAX_VERDICT_TTL_SECS: i64 = 86_400;
 
 pub const CLUSTER_LOCALNET: u8 = 0;
@@ -31,31 +32,38 @@ const DATA_START: usize = SIGNATURE_OFFSETS_START + SIGNATURE_OFFSETS_SERIALIZED
 const PUBKEY_LEN: usize = 32;
 const SIGNATURE_LEN: usize = 64;
 
+/// The oracle-signed facts (LOCKED verdict spec): a reference price at the liquidation, a reference
+/// price after a wait to prove the move didn't hold, and an evidence hash. No payout amount, no
+/// tier — the program computes and bounds the loss itself from these plus on-chain state.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug, PartialEq, Eq)]
-pub struct VerdictArgs {
+pub struct FactsArgs {
     pub liquidation_record: Pubkey,
     pub borrower: Pubkey,
-    /// USDC base units, paid 1:1. Never a multiple of the loss.
-    pub payout: u64,
-    /// Wallet tier 1..=3 (A/B/C), sets the payout ceiling.
-    pub tier: u8,
+    /// USD per whole share, 8 decimals, independent of the feed that liquidated.
+    pub ref_at_liq: u64,
+    /// Same reference source, sampled `after_ts`.
+    pub ref_after: u64,
+    /// Unix seconds the second sample was taken. Must be `MIN_AFTER_WAIT_SECS..=MAX_AFTER_WAIT_SECS`
+    /// after the liquidation.
+    pub after_ts: i64,
     /// sha256 over the verdict evidence, including the archived reference-price responses.
-    pub verdict_hash: [u8; 32],
-    /// Unix seconds. The attestation must land at or before this time.
+    pub evidence_hash: [u8; 32],
+    /// Unix seconds. The submission must land at or before this time.
     pub deadline: i64,
 }
 
 /// The exact bytes the oracle signs.
-pub fn encode_message(program_id: &Pubkey, cluster_tag: u8, args: &VerdictArgs) -> Vec<u8> {
+pub fn encode_message(program_id: &Pubkey, cluster_tag: u8, args: &FactsArgs) -> Vec<u8> {
     let mut m = Vec::with_capacity(MESSAGE_LEN);
     m.extend_from_slice(DOMAIN);
     m.extend_from_slice(program_id.as_ref());
     m.push(cluster_tag);
     m.extend_from_slice(args.liquidation_record.as_ref());
     m.extend_from_slice(args.borrower.as_ref());
-    m.extend_from_slice(&args.payout.to_le_bytes());
-    m.push(args.tier);
-    m.extend_from_slice(&args.verdict_hash);
+    m.extend_from_slice(&args.ref_at_liq.to_le_bytes());
+    m.extend_from_slice(&args.ref_after.to_le_bytes());
+    m.extend_from_slice(&args.after_ts.to_le_bytes());
+    m.extend_from_slice(&args.evidence_hash);
     m.extend_from_slice(&args.deadline.to_le_bytes());
     debug_assert_eq!(m.len(), MESSAGE_LEN);
     m
@@ -165,13 +173,14 @@ pub fn verify_preceding_ed25519(
 mod tests {
     use super::*;
 
-    fn args() -> VerdictArgs {
-        VerdictArgs {
+    fn args() -> FactsArgs {
+        FactsArgs {
             liquidation_record: Pubkey::new_from_array([7; 32]),
             borrower: Pubkey::new_from_array([8; 32]),
-            payout: 150_000_000,
-            tier: 1,
-            verdict_hash: [9; 32],
+            ref_at_liq: 40_000_000_000,
+            ref_after: 40_100_000_000,
+            after_ts: 1_000_003_600,
+            evidence_hash: [9; 32],
             deadline: 1_800_000_000,
         }
     }
@@ -212,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn message_is_exactly_163_bytes_and_starts_with_domain() {
+    fn message_is_exactly_178_bytes_and_starts_with_domain() {
         let m = encode_message(&Pubkey::new_from_array([1; 32]), CLUSTER_DEVNET, &args());
         assert_eq!(m.len(), MESSAGE_LEN);
         assert_eq!(&m[..17], DOMAIN);
@@ -229,14 +238,15 @@ mod tests {
             &args(),
         ));
         variants.push(encode_message(&pid, CLUSTER_MAINNET, &args()));
-        for f in 0..6 {
+        for f in 0..7 {
             let mut a = args();
             match f {
                 0 => a.liquidation_record = Pubkey::new_from_array([70; 32]),
                 1 => a.borrower = Pubkey::new_from_array([80; 32]),
-                2 => a.payout += 1,
-                3 => a.tier = 2,
-                4 => a.verdict_hash[0] ^= 1,
+                2 => a.ref_at_liq += 1,
+                3 => a.ref_after += 1,
+                4 => a.after_ts += 1,
+                5 => a.evidence_hash[0] ^= 1,
                 _ => a.deadline += 1,
             }
             variants.push(encode_message(&pid, CLUSTER_DEVNET, &a));
