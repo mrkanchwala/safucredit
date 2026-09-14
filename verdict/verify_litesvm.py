@@ -89,7 +89,16 @@ def build_backstop_config(
     b += _i64(0)  # admission_day
     b += _u64(0)  # admitted_today
     b += _i64(0)  # withdraw_delay_secs
-    b += bytes(32)  # reserved
+    b += _u64(0)  # inventory_cost_total (phase 3)
+    b += _u32(1_000)  # per_liq_cap_bps
+    b += _u32(2_500)  # daily_liq_cap_bps
+    b += _i64(0)  # liq_day
+    b += _u64(0)  # liq_spent_today
+    b += _u32(200)  # resale_discount_bps
+    b += _i64(4 * 86_400)  # resale_floor_secs
+    b += _u32(1_000)  # fee_share_bps
+    b += _u64(10_000_000)  # min_pool_repay
+    b += bytes(16)  # reserved
     return bytes(b)
 
 
@@ -130,6 +139,7 @@ def build_market(*, collateral_mint: Pubkey, usdc_mint: Pubkey, deviation_cap_bp
     b += _u32(0) + _u32(0) + _u32(0) + _u32(0)  # RateParams: base/slope1/slope2/kink
     b += _u64(1_000_000_000_000)  # borrow_cap
     b += _u64(1_000_000_000_000)  # collateral_cap_raw
+    b += _u32(1_500)  # backer_interest_share_bps (15%, phase 3 addendum)
     # PriceState
     b += bytes(8 * 16)  # prices[16]
     b += bytes(8 * 16)  # timestamps[16]
@@ -156,6 +166,9 @@ def build_market(*, collateral_mint: Pubkey, usdc_mint: Pubkey, deviation_cap_bp
     # ramp_from: LiquidationTerms (5 x u32)
     b += _u32(0) + _u32(0) + _u32(0) + _u32(0) + _u32(0)
     b += _i64(0)  # ramp_start_ts
+    b += _u64(0)  # backer_interest_owed (phase 3 addendum)
+    b += _u64(0)  # backer_interest_cumulative
+    b += _u64(0)  # backer_interest_paid_cumulative
     b += bytes(12)  # reserved
     return bytes(b)
 

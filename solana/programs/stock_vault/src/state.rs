@@ -99,6 +99,9 @@ pub struct MarketParams {
     pub borrow_cap: u64,
     /// Total raw collateral accepted.
     pub collateral_cap_raw: u64,
+    /// Share of accrued borrower interest credited to backers, bounded <= 5_000 (founder-locked at
+    /// 1_500 = 15%; eng review addendum 2026-09-14). A change applies to interest accrued after it.
+    pub backer_interest_share_bps: u32,
 }
 
 impl MarketParams {
@@ -141,7 +144,8 @@ impl MarketParams {
             && self.rate.slope1_bps <= 20_000
             && self.rate.slope2_bps <= 100_000
             && self.borrow_cap > 0
-            && self.collateral_cap_raw > 0;
+            && self.collateral_cap_raw > 0
+            && self.backer_interest_share_bps <= 5_000;
         require!(ok, VaultError::InvalidMarketParams);
         Ok(())
     }
@@ -204,6 +208,14 @@ pub struct Market {
     /// Taken from the old 40 reserved bytes (20 + 8), so the account size is unchanged (U4).
     pub ramp_from: LiquidationTerms,
     pub ramp_start_ts: i64,
+    /// Interest credited to backers but not yet paid out (eng review addendum). Excluded from
+    /// `total_assets`, so lenders' share price reflects only their 85% (2c pattern, in reverse).
+    pub backer_interest_owed: u64,
+    /// Monotonic total ever credited, mirrored by `InterestAbsorbed.total_absorbed` on the backstop
+    /// side so repeat `absorb_interest` calls settle only the remainder.
+    pub backer_interest_cumulative: u64,
+    /// Monotonic total ever transferred to the pool via `pay_backer_interest`.
+    pub backer_interest_paid_cumulative: u64,
     pub reserved: [u8; 12],
 }
 

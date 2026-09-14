@@ -94,6 +94,7 @@ fn market_params() -> MarketParams {
         },
         borrow_cap: 500_000 * USDC,
         collateral_cap_raw: 2_000 * 100_000_000,
+        backer_interest_share_bps: 1_500,
     }
 }
 
@@ -132,7 +133,16 @@ fn setup(cluster_tag: u8) -> Env {
         admission_day: 0,
         admitted_today: 0,
         withdraw_delay_secs: 0,
-        reserved: [0; 32],
+        inventory_cost_total: 0,
+        per_liq_cap_bps: 1_000,
+        daily_liq_cap_bps: 2_500,
+        liq_day: 0,
+        liq_spent_today: 0,
+        resale_discount_bps: 200,
+        resale_floor_secs: 4 * 86_400,
+        fee_share_bps: 1_000,
+        min_pool_repay: 10 * USDC,
+        reserved: [0; 16],
     };
     set_state(&mut svm, config_pda, backstop::ID, &config);
 
@@ -159,6 +169,9 @@ fn setup(cluster_tag: u8) -> Env {
         observed_multiplier_fp: safu_core::MULT_SCALE,
         ramp_from: market_params().liquidation_terms(),
         ramp_start_ts: 0,
+        backer_interest_owed: 0,
+        backer_interest_cumulative: 0,
+        backer_interest_paid_cumulative: 0,
         reserved: [0; 12],
     };
     set_state(&mut svm, market_key, stock_vault::ID, &market);

@@ -25,9 +25,9 @@ anchor-lang = "=1.1.2"
 anchor-spl = { version = "=1.1.2", features = ["token", "token_2022"] }
 # Exact pin (U6): a safu-core change must be adopted here on purpose, never picked up silently.
 safu-core = { path = "../../../crates/safu-core", version = "=0.2.0" }
-# Read-only: gives Anchor the vault's account types, so `Account<T>` enforces that a
-# LiquidationRecord or Market really is owned by the vault program.
-stock_vault = { path = "../stock_vault", features = ["no-entrypoint"] }
+# Gives Anchor the vault's account types (so `Account<T>` enforces real ownership) and, via `cpi`
+# (phase 3), the `stock_vault::cpi::liquidate` helper the pool uses to liquidate through the vault.
+stock_vault = { path = "../stock_vault", features = ["cpi"] }
 # Both already resolved in the vetted lockfile at these versions (transitive via anchor-lang).
 solana-instructions-sysvar = "3.0.1"
 solana-sdk-ids = "3.1.0"

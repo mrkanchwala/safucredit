@@ -81,6 +81,7 @@ fn params() -> MarketParams {
         },
         borrow_cap: 500_000 * USDC,
         collateral_cap_raw: 2_000 * ONE_SHARE,
+        backer_interest_share_bps: 1_500,
     }
 }
 

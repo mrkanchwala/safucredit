@@ -72,6 +72,7 @@ fn params() -> MarketParams {
         },
         borrow_cap: 500_000 * USDC,
         collateral_cap_raw: 2_000 * ONE_SHARE,
+        backer_interest_share_bps: 1_500,
     }
 }
 
@@ -1526,6 +1527,64 @@ fn a_withdrawal_cannot_take_cash_that_is_lent_out() {
     let ix = env.withdraw_supply_ix(&bob.pubkey(), &env.bob_usdc, part);
     env.ok(&[ix], &[&bob]);
     assert_eq!(env.supplier_state(&bob.pubkey()).shares, all - part);
+}
+
+// ------------------------------------------------------------------ backers' interest share (eng review addendum)
+
+#[test]
+fn backers_earn_their_locked_share_of_accrued_interest() {
+    let mut env = full();
+    let alice = env.alice.insecure_clone();
+    let admin = env.admin.insecure_clone();
+    let borrow = env.borrow_ix(&alice.pubkey(), &env.alice_usdc, 1_000 * USDC);
+    env.ok(&[borrow], &[&alice]);
+
+    let before = stock_vault::logic::total_borrows(&env.market_state()).unwrap();
+    env.warp(365 * 86_400);
+    // update_market_params calls accrue() before anything else, with no other side effect when the
+    // params supplied are unchanged -- the cleanest way to force accrual without also borrowing/repaying.
+    let ix = update_params_ix(&admin.pubkey(), &env.coll_mint, params());
+    env.ok(&[ix], &[&admin]);
+
+    let market = env.market_state();
+    let after = stock_vault::logic::total_borrows(&market).unwrap();
+    let interest = after - before;
+    assert!(interest > 0, "a year of accrual must produce real interest");
+
+    let expected_share = (interest as u128 * 1_500 / 10_000) as u64; // params().backer_interest_share_bps
+    assert_eq!(market.backer_interest_owed, expected_share);
+    assert_eq!(market.backer_interest_cumulative, expected_share);
+    assert_eq!(market.backer_interest_paid_cumulative, 0);
+}
+
+#[test]
+fn total_assets_excludes_owed_backer_interest() {
+    let mut env = full();
+    let alice = env.alice.insecure_clone();
+    let admin = env.admin.insecure_clone();
+    let borrow = env.borrow_ix(&alice.pubkey(), &env.alice_usdc, 1_000 * USDC);
+    env.ok(&[borrow], &[&alice]);
+    env.warp(365 * 86_400);
+    let ix = update_params_ix(&admin.pubkey(), &env.coll_mint, params());
+    env.ok(&[ix], &[&admin]);
+
+    let market = env.market_state();
+    assert!(market.backer_interest_owed > 0);
+    let gross = market.cash + stock_vault::logic::total_borrows(&market).unwrap();
+    assert_eq!(
+        stock_vault::logic::total_assets(&market).unwrap(),
+        gross - market.backer_interest_owed
+    );
+}
+
+#[test]
+fn backer_interest_share_bps_over_the_bound_is_refused() {
+    let mut env = with_market();
+    let admin = env.admin.insecure_clone();
+    let mut bad = params();
+    bad.backer_interest_share_bps = 5_001; // bound is <= 5_000
+    let ix = update_params_ix(&admin.pubkey(), &env.coll_mint, bad);
+    assert_program_error(env.send(&[ix], &[&admin]), VaultError::InvalidMarketParams);
 }
 
 #[test]

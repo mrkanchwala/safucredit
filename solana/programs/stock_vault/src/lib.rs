@@ -191,6 +191,9 @@ pub mod stock_vault {
         market.observed_multiplier_fp = schedule.effective(now);
         market.ramp_from = params.liquidation_terms();
         market.ramp_start_ts = now;
+        market.backer_interest_owed = 0;
+        market.backer_interest_cumulative = 0;
+        market.backer_interest_paid_cumulative = 0;
         market.reserved = [0; 12];
 
         emit!(MarketCreated {
@@ -689,6 +692,57 @@ pub mod stock_vault {
             market: market_key,
             absorbed,
             bad_debt_remaining: market.bad_debt,
+        });
+        Ok(())
+    }
+
+    /// Pays backers their accrued interest share to the registered pool (eng review addendum,
+    /// founder-locked 15%). Permissionless, and -- like `absorb_bad_debt_cover` -- a plain token
+    /// transfer only: the market never calls the backstop program. Capped at `market.cash`: under
+    /// high utilization the payment waits until enough cash exists rather than borrowing against
+    /// principal, and nothing is lost while it waits.
+    pub fn pay_backer_interest(ctx: Context<PayBackerInterest>) -> Result<()> {
+        let owed = ctx.accounts.market.backer_interest_owed;
+        let pay = owed.min(ctx.accounts.market.cash);
+        require!(pay > 0, VaultError::ZeroAmount);
+
+        let market_info = ctx.accounts.market.to_account_info();
+        let collateral_mint = ctx.accounts.market.collateral_mint;
+        let bump = [ctx.accounts.market.bump];
+        let seeds: &[&[&[u8]]] = &[&[MARKET_SEED, collateral_mint.as_ref(), &bump]];
+        token_interface::transfer_checked(
+            CpiContext::new_with_signer(
+                ctx.accounts.usdc_token_program.key(),
+                TransferChecked {
+                    from: ctx.accounts.usdc_vault.to_account_info(),
+                    mint: ctx.accounts.usdc_mint.to_account_info(),
+                    to: ctx.accounts.pool_usdc_vault.to_account_info(),
+                    authority: market_info,
+                },
+                seeds,
+            ),
+            pay,
+            ctx.accounts.usdc_mint.decimals,
+        )?;
+
+        let market = &mut ctx.accounts.market;
+        market.cash = market
+            .cash
+            .checked_sub(pay)
+            .ok_or(VaultError::MathOverflow)?;
+        market.backer_interest_owed = market
+            .backer_interest_owed
+            .checked_sub(pay)
+            .ok_or(VaultError::MathOverflow)?;
+        market.backer_interest_paid_cumulative = market
+            .backer_interest_paid_cumulative
+            .checked_add(pay)
+            .ok_or(VaultError::MathOverflow)?;
+
+        emit!(BackerInterestPaid {
+            market: market.key(),
+            paid: pay,
+            owed_remaining: market.backer_interest_owed,
         });
         Ok(())
     }
@@ -1213,6 +1267,24 @@ pub struct SyncIssuerState<'info> {
 }
 
 #[derive(Accounts)]
+pub struct PayBackerInterest<'info> {
+    #[account(seeds = [VCONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, VaultConfig>>,
+    #[account(mut, seeds = [MARKET_SEED, market.collateral_mint.as_ref()], bump = market.bump)]
+    pub market: Box<Account<'info, Market>>,
+    #[account(address = market.usdc_mint, mint::token_program = usdc_token_program)]
+    pub usdc_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(mut, seeds = [USDC_VAULT_SEED, market.key().as_ref()], bump, token::token_program = usdc_token_program)]
+    pub usdc_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// The registered pool's own USDC vault -- constrained to `config.pool_liquidator` so interest
+    /// can only ever be paid to the pool the vault admin actually registered, never to an arbitrary
+    /// caller-supplied account.
+    #[account(mut, token::mint = usdc_mint, token::authority = config.pool_liquidator, token::token_program = usdc_token_program)]
+    pub pool_usdc_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub usdc_token_program: Interface<'info, TokenInterface>,
+}
+
+#[derive(Accounts)]
 pub struct Liquidate<'info> {
     /// Pays the record's rent. Separate from `liquidator` so the backstop pool, whose key is a program-owned
     /// PDA that cannot fund an account, can liquidate with a crank wallet paying the rent (eng review A1).
@@ -1401,4 +1473,11 @@ pub struct Repaid {
     pub owner: Pubkey,
     pub amount: u64,
     pub shares: u128,
+}
+
+#[event]
+pub struct BackerInterestPaid {
+    pub market: Pubkey,
+    pub paid: u64,
+    pub owed_remaining: u64,
 }

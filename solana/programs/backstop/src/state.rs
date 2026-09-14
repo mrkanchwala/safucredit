@@ -6,6 +6,10 @@ pub const CLAIM_SEED: &[u8] = b"claim";
 pub const BORROWER_CLAIMS_SEED: &[u8] = b"bclaims";
 pub const BAD_DEBT_SEED: &[u8] = b"bd";
 pub const USDC_VAULT_SEED: &[u8] = b"busdc";
+/// Phase 3 (pool-as-liquidator, eng review addendum).
+pub const INVENTORY_SEED: &[u8] = b"inv";
+pub const INVENTORY_VAULT_SEED: &[u8] = b"invault";
+pub const INTEREST_SEED: &[u8] = b"interest";
 
 /// Current layout version of every account in this program (upgradeability U4).
 pub const ACCOUNT_VERSION: u8 = 1;
@@ -29,6 +33,26 @@ pub const MIN_AFTER_WAIT_SECS: i64 = 3_600;
 pub const MAX_AFTER_WAIT_SECS: i64 = 4 * 86_400;
 /// Day-bucket length for the admission and outflow counters.
 pub const DAY_SECS: i64 = 86_400;
+
+/// Phase 3 (pool-as-liquidator): pool draw caps, locked at 10% per liquidation / 25% per day.
+/// Ceilings bound the admin setter; A5's per-cluster floors land in phase 5.
+pub const MAX_PER_LIQ_CAP_BPS: u32 = 2_000;
+pub const MAX_DAILY_LIQ_CAP_BPS: u32 = 5_000;
+pub const DEFAULT_PER_LIQ_CAP_BPS: u32 = 1_000;
+pub const DEFAULT_DAILY_LIQ_CAP_BPS: u32 = 2_500;
+/// Resale: never below cost for this long after acquisition (locked default 4 days), and never at
+/// more than this discount off the healthy price.
+pub const MAX_RESALE_DISCOUNT_BPS: u32 = 1_000;
+pub const DEFAULT_RESALE_DISCOUNT_BPS: u32 = 200;
+pub const MIN_RESALE_FLOOR_SECS: i64 = 0;
+pub const MAX_RESALE_FLOOR_SECS: i64 = 30 * 86_400;
+pub const DEFAULT_RESALE_FLOOR_SECS: i64 = 4 * 86_400;
+/// Crank fee: bounded <= 20% of the liquidation bonus (D6), so the pool never pays more than it gains.
+pub const MAX_FEE_SHARE_BPS: u32 = 2_000;
+pub const DEFAULT_FEE_SHARE_BPS: u32 = 1_000;
+/// Dust-repay fee farming guard (E6). Bounded generously; a real liquidation is always far above it.
+pub const MAX_MIN_POOL_REPAY: u64 = 1_000_000_000; // $1,000 at 6 decimals
+pub const DEFAULT_MIN_POOL_REPAY: u64 = 10_000_000; // $10
 
 /// Utilisation bands (bps of `reserved_total` over `cash`) that set the admission and outflow caps.
 pub const UTIL_LOW_BPS: u128 = 2_000;
@@ -81,8 +105,30 @@ pub struct BackstopConfig {
     pub admitted_today: u64,
     /// Delay between requesting an exit and taking the money.
     pub withdraw_delay_secs: i64,
+    /// Phase 3 (pool-as-liquidator). Sum of every market's `Inventory.cost_total`: while positive,
+    /// `deposit` and `finalize_withdraw` refuse (D4) -- backers cannot buy in cheap right after a
+    /// liquidation or exit before a crash-holding is resolved.
+    pub inventory_cost_total: u64,
+    /// Max share of `cash` a single `pool_liquidate` call may spend.
+    pub per_liq_cap_bps: u32,
+    /// Max share of `cash` `pool_liquidate` may spend across one day, combined.
+    pub daily_liq_cap_bps: u32,
+    /// Day bucket (`now / DAY_SECS`) `liq_spent_today` is tracking. Separate from the claim
+    /// admission day counter -- liquidation draws and claim admissions are different budgets.
+    pub liq_day: i64,
+    pub liq_spent_today: u64,
+    /// Resale discount off the healthy price, and how long a fresh acquisition may not be resold
+    /// below its own cost (locked: never below cost for the first 4 days).
+    pub resale_discount_bps: u32,
+    pub resale_floor_secs: i64,
+    /// Crank fee, as a share of the liquidation bonus the pool captured (D6). Paid to whoever calls
+    /// `pool_liquidate`, from cash, after the CPI succeeds.
+    pub fee_share_bps: u32,
+    /// Below this, `pool_liquidate` does not fire -- a real liquidation is always well above it; this
+    /// only blocks dust-repay fee farming (E6).
+    pub min_pool_repay: u64,
     /// Room for later fields without a migration (U4).
-    pub reserved: [u8; 32],
+    pub reserved: [u8; 16],
 }
 
 /// One backer's stake in the pool.
@@ -194,5 +240,35 @@ pub struct BorrowerClaims {
     pub borrower: Pubkey,
     /// `Pubkey::default()` when free. Cleared to the new claim once the occupant is terminal.
     pub open: Pubkey,
+    pub reserved: [u8; 32],
+}
+
+/// One per market (phase 3). Collateral the pool holds after liquidating through it, priced at cost
+/// until resold. `cost_total` doubles as this market's contribution to `BackstopConfig.inventory_cost_total`
+/// (the deposit/withdraw pause signal, D4) and as the resale floor's basis.
+#[account]
+#[derive(InitSpace)]
+pub struct Inventory {
+    pub version: u8,
+    pub bump: u8,
+    pub market: Pubkey,
+    /// Raw collateral currently held.
+    pub raw: u64,
+    /// USDC the pool paid to acquire what it currently holds. Falls pro-rata to raw sold on resale.
+    pub cost_total: u64,
+    pub last_acquired_at: i64,
+    pub reserved: [u8; 32],
+}
+
+/// Running total of interest the pool has recognised from one market, mirroring
+/// `Market.backer_interest_paid_cumulative` so repeat `absorb_interest` calls settle only the
+/// remainder and a raw donation into the USDC vault is never counted (2c pattern, in reverse).
+#[account]
+#[derive(InitSpace)]
+pub struct InterestAbsorbed {
+    pub version: u8,
+    pub bump: u8,
+    pub market: Pubkey,
+    pub total_absorbed: u64,
     pub reserved: [u8; 32],
 }

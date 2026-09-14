@@ -162,15 +162,21 @@ pub fn total_borrows(m: &Market) -> Result<u64> {
     core(debt_for_shares(m.total_borrow_shares, m.borrow_index))
 }
 
-/// Supplier-owned value: cash plus what borrowers still owe.
+/// Supplier-owned value: cash plus what borrowers still owe, minus interest already credited to
+/// backers (eng review addendum -- `backer_interest_owed` is the backers' 15%, excluded here so
+/// lenders' share price reflects only their 85%).
 ///
 /// `bad_debt` is deliberately NOT subtracted here. Writing debt off already removes its shares from
 /// `total_borrow_shares`, so the loss lands on suppliers at that moment through `total_borrows`;
 /// subtracting it again would charge them twice. The field is a memo of what the backstop owes this
 /// market, and is reduced when the backstop pays it in.
 pub fn total_assets(m: &Market) -> Result<u64> {
-    m.cash
+    let gross = m
+        .cash
         .checked_add(total_borrows(m)?)
+        .ok_or(VaultError::MathOverflow)?;
+    gross
+        .checked_sub(m.backer_interest_owed)
         .ok_or_else(|| VaultError::MathOverflow.into())
 }
 
@@ -182,11 +188,16 @@ pub fn reconciliation_short(vault_amount: u64, m: &Market) -> bool {
     vault_amount < m.total_collateral_raw
 }
 
+/// Grows `borrow_index` by the elapsed time's borrow rate, then credits backers their share of the
+/// interest that just accrued (eng review addendum, founder-locked 15%). The share is computed from
+/// the actual growth in `total_borrows` over this step -- not the rate directly -- so it can never
+/// drift from what borrowers are really being charged.
 pub fn accrue(m: &mut Market, now: i64) -> Result<()> {
     if now <= m.last_accrual_ts {
         return Ok(());
     }
-    let util = core(utilization_bps(total_borrows(m)?, m.cash))?;
+    let before = total_borrows(m)?;
+    let util = core(utilization_bps(before, m.cash))?;
     let curve = RateCurve {
         base_bps: m.params.rate.base_bps,
         slope1_bps: m.params.rate.slope1_bps,
@@ -197,6 +208,25 @@ pub fn accrue(m: &mut Market, now: i64) -> Result<()> {
     let elapsed = u64::try_from(now - m.last_accrual_ts).map_err(|_| VaultError::MathOverflow)?;
     m.borrow_index = core(accrue_index(m.borrow_index, rate, elapsed))?;
     m.last_accrual_ts = now;
+
+    let after = total_borrows(m)?;
+    let interest = after.saturating_sub(before);
+    if interest > 0 && m.params.backer_interest_share_bps > 0 {
+        let share = u64::try_from(mul_div_floor(
+            interest as u128,
+            m.params.backer_interest_share_bps as u128,
+            BPS,
+        )?)
+        .map_err(|_| VaultError::MathOverflow)?;
+        m.backer_interest_owed = m
+            .backer_interest_owed
+            .checked_add(share)
+            .ok_or(VaultError::MathOverflow)?;
+        m.backer_interest_cumulative = m
+            .backer_interest_cumulative
+            .checked_add(share)
+            .ok_or(VaultError::MathOverflow)?;
+    }
     Ok(())
 }
 

@@ -143,7 +143,16 @@ pub mod backstop {
         config.admission_day = 0;
         config.admitted_today = 0;
         config.withdraw_delay_secs = withdraw_delay_secs;
-        config.reserved = [0; 32];
+        config.inventory_cost_total = 0;
+        config.per_liq_cap_bps = DEFAULT_PER_LIQ_CAP_BPS;
+        config.daily_liq_cap_bps = DEFAULT_DAILY_LIQ_CAP_BPS;
+        config.liq_day = 0;
+        config.liq_spent_today = 0;
+        config.resale_discount_bps = DEFAULT_RESALE_DISCOUNT_BPS;
+        config.resale_floor_secs = DEFAULT_RESALE_FLOOR_SECS;
+        config.fee_share_bps = DEFAULT_FEE_SHARE_BPS;
+        config.min_pool_repay = DEFAULT_MIN_POOL_REPAY;
+        config.reserved = [0; 16];
         Ok(())
     }
 
@@ -177,6 +186,53 @@ pub mod backstop {
         Ok(())
     }
 
+    /// Pool-liquidation params, bounded (phase 3). A5's per-cluster floors land in phase 5; these are
+    /// generic ceilings only, so the demo can run fast today without leaving a mainnet admin free to
+    /// set anything unsafe later.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_pool_liquidation_params(
+        ctx: Context<AdminOnly>,
+        per_liq_cap_bps: u32,
+        daily_liq_cap_bps: u32,
+        resale_discount_bps: u32,
+        resale_floor_secs: i64,
+        fee_share_bps: u32,
+        min_pool_repay: u64,
+    ) -> Result<()> {
+        require!(
+            per_liq_cap_bps > 0 && per_liq_cap_bps <= MAX_PER_LIQ_CAP_BPS,
+            VerdictError::InvalidParams
+        );
+        require!(
+            daily_liq_cap_bps >= per_liq_cap_bps && daily_liq_cap_bps <= MAX_DAILY_LIQ_CAP_BPS,
+            VerdictError::InvalidParams
+        );
+        require!(
+            resale_discount_bps <= MAX_RESALE_DISCOUNT_BPS,
+            VerdictError::InvalidParams
+        );
+        require!(
+            (MIN_RESALE_FLOOR_SECS..=MAX_RESALE_FLOOR_SECS).contains(&resale_floor_secs),
+            VerdictError::InvalidParams
+        );
+        require!(
+            fee_share_bps <= MAX_FEE_SHARE_BPS,
+            VerdictError::InvalidParams
+        );
+        require!(
+            min_pool_repay <= MAX_MIN_POOL_REPAY,
+            VerdictError::InvalidParams
+        );
+        let config = &mut ctx.accounts.config;
+        config.per_liq_cap_bps = per_liq_cap_bps;
+        config.daily_liq_cap_bps = daily_liq_cap_bps;
+        config.resale_discount_bps = resale_discount_bps;
+        config.resale_floor_secs = resale_floor_secs;
+        config.fee_share_bps = fee_share_bps;
+        config.min_pool_repay = min_pool_repay;
+        Ok(())
+    }
+
     /// Hands the admin role over (U5). No renounce path: an unowned backstop could never rotate a
     /// leaked oracle key.
     pub fn set_admin(ctx: Context<AdminOnly>, admin: Pubkey) -> Result<()> {
@@ -201,6 +257,10 @@ pub mod backstop {
     pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
         require!(amount > 0, VerdictError::ZeroAmount);
         let config = &ctx.accounts.config;
+        require!(
+            config.inventory_cost_total == 0,
+            VerdictError::PausedForInventory
+        );
         let shares = if config.total_shares == 0 {
             amount as u128
         } else {
@@ -270,15 +330,17 @@ pub mod backstop {
     pub fn finalize_withdraw(ctx: Context<FinalizeWithdraw>) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
         let config_bump = ctx.accounts.config.bump;
-        let (cash, total_shares, delay, reserved_total) = {
+        let (cash, total_shares, delay, reserved_total, inventory_cost_total) = {
             let c = &ctx.accounts.config;
             (
                 c.cash,
                 c.total_shares,
                 c.withdraw_delay_secs,
                 c.reserved_total,
+                c.inventory_cost_total,
             )
         };
+        require!(inventory_cost_total == 0, VerdictError::PausedForInventory);
 
         let backer = &mut ctx.accounts.backer;
         let shares = backer.withdraw_shares;

@@ -66,4 +66,19 @@ pub enum VerdictError {
     MathOverflow,
     #[msg("Only the program's upgrade authority can initialize")]
     NotUpgradeAuthority,
+    // --- phase 3: pool-as-liquidator -----------------------------------------------------------
+    #[msg("Deposits and withdrawals pause while the pool holds inventory")]
+    PausedForInventory,
+    #[msg("Repay amount, after caps, is below the minimum the pool will liquidate for")]
+    BelowMinPoolRepay,
+    #[msg("write_off_inventory is only for a market the issuer has frozen or halted")]
+    NotFrozenOrHalted,
+    #[msg("Resale is blocked while the price is flagged or a corporate-action hold is active")]
+    ResaleBlocked,
+    #[msg("Sale price exceeds the buyer's max_price_per_share")]
+    PriceAboveMax,
+    #[msg("Nothing to buy: raw amount is zero or exceeds what the market's inventory holds")]
+    NothingToBuy,
+    #[msg("Inventory account does not belong to the market supplied")]
+    MarketMismatch,
 }
