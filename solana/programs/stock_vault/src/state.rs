@@ -37,6 +37,21 @@ pub struct RateParams {
     pub kink_bps: u32,
 }
 
+/// How long a tightening of the liquidation terms takes to reach existing loans (U3, founder 2026-09-14).
+/// Loosening applies at once. A constant, not a parameter: an admin must not be able to set it to zero.
+pub const LIQUIDATION_TERMS_RAMP_SECS: i64 = 7 * 86_400;
+
+/// The terms that decide when, and how hard, an existing loan is liquidated. Changes that tighten them
+/// ramp in over `LIQUIDATION_TERMS_RAMP_SECS`, so no borrower is liquidated overnight by a number change.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq, InitSpace)]
+pub struct LiquidationTerms {
+    pub liq_threshold_bps: u32,
+    pub insolvency_ltv_bps: u32,
+    pub close_factor_bps: u32,
+    pub min_liq_bonus_bps: u32,
+    pub max_liq_bonus_bps: u32,
+}
+
 /// Admin-settable within hard bounds (U2). Values and the evidence behind each:
 /// `outputs/2026-09-14_stocklana-market-config-research.md` §2b (research-ops).
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq, InitSpace)]
@@ -76,6 +91,16 @@ pub struct MarketParams {
 }
 
 impl MarketParams {
+    pub fn liquidation_terms(&self) -> LiquidationTerms {
+        LiquidationTerms {
+            liq_threshold_bps: self.liq_threshold_bps,
+            insolvency_ltv_bps: self.insolvency_ltv_bps,
+            close_factor_bps: self.close_factor_bps,
+            min_liq_bonus_bps: self.min_liq_bonus_bps,
+            max_liq_bonus_bps: self.max_liq_bonus_bps,
+        }
+    }
+
     /// Hard bounds in code, so an admin mistake cannot configure something unsafe.
     pub fn validate(&self) -> Result<()> {
         let ok = self.ltv_bps > 0
@@ -164,7 +189,11 @@ pub struct Market {
     /// unannounced-change guard compares the live value against. Seeded by `create_market`; 0 means
     /// "not yet observed", which the guard treats as no change rather than as a change from zero.
     pub observed_multiplier_fp: u128,
-    pub reserved: [u8; 40],
+    /// Where the current liquidation-terms ramp started from, and when (U3). The target is `params`.
+    /// Taken from the old 40 reserved bytes (20 + 8), so the account size is unchanged (U4).
+    pub ramp_from: LiquidationTerms,
+    pub ramp_start_ts: i64,
+    pub reserved: [u8; 12],
 }
 
 #[account]

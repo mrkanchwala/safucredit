@@ -22,6 +22,7 @@ use spl_token_2022_interface::{
     state::{Account as T22Account, Mint as T22Mint},
     ID as TOKEN_2022,
 };
+use stock_vault::state::LIQUIDATION_TERMS_RAMP_SECS;
 use stock_vault::{
     errors::VaultError,
     state::{
@@ -1285,6 +1286,42 @@ fn updating_params_accrues_first_and_still_enforces_the_bounds() {
     assert_program_error(env.send(&[ix], &[&admin]), VaultError::InvalidMarketParams);
 }
 
+#[test]
+fn loosening_applies_at_once_and_tightening_starts_from_the_live_terms() {
+    let mut env = full();
+    let admin = env.admin.insecure_clone();
+
+    // Loosen the liquidation line from 50% to 55%: in force immediately.
+    let mut looser = params();
+    looser.liq_threshold_bps = 5_500;
+    let ix = update_params_ix(&admin.pubkey(), &env.coll_mint, looser);
+    env.ok(&[ix], &[&admin]);
+    let m = env.market_state();
+    assert_eq!(m.ramp_from.liq_threshold_bps, 5_500);
+    assert_eq!(m.ramp_start_ts, env.now);
+
+    // Tighten to 45%: the ramp starts from the live 55%.
+    env.warp(60);
+    let mut tighter = params();
+    tighter.liq_threshold_bps = 4_500;
+    let ix = update_params_ix(&admin.pubkey(), &env.coll_mint, tighter);
+    env.ok(&[ix], &[&admin]);
+    let m = env.market_state();
+    assert_eq!(m.ramp_from.liq_threshold_bps, 5_500);
+    assert_eq!(m.params.liq_threshold_bps, 4_500);
+
+    // Half way through, tighten again to 42%: the new ramp continues from the live 50%, never back
+    // up at 55%, never jumping down.
+    env.warp(LIQUIDATION_TERMS_RAMP_SECS / 2);
+    let mut tighter_again = params();
+    tighter_again.liq_threshold_bps = 4_200;
+    let ix = update_params_ix(&admin.pubkey(), &env.coll_mint, tighter_again);
+    env.ok(&[ix], &[&admin]);
+    let m = env.market_state();
+    assert_eq!(m.ramp_from.liq_threshold_bps, 5_000);
+    assert_eq!(m.ramp_start_ts, env.now);
+}
+
 // ------------------------------------------------------------------ prices
 
 #[test]
@@ -2171,6 +2208,56 @@ fn exactly_at_the_threshold_is_not_liquidatable_but_one_step_past_it_is() {
     assert_program_error(env.send(&[ix], &[&liq]), VaultError::NotLiquidatable);
 
     env.walk_price_to(PRICE * 75 / 100);
+    let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 100 * USDC);
+    env.ok(&[ix], &[&liq]);
+}
+
+/// U3 (founder 2026-09-14): lowering the liquidation line must not liquidate an existing loan
+/// overnight. It reaches the loan linearly over seven days.
+#[test]
+fn tightening_the_liquidation_line_reaches_an_existing_loan_only_over_seven_days() {
+    let mut env = lending_env();
+    let (admin, alice, feed) = (
+        env.admin.insecure_clone(),
+        env.alice.insecure_clone(),
+        env.feed.insecure_clone(),
+    );
+    let (liq, lu, lc) = env.new_liquidator(10_000 * USDC);
+    let low = PRICE * 87 / 100;
+    let push_low = |env: &mut Env, secs: i64| {
+        env.warp(secs);
+        let ix = env.push_price_ix(&feed.pubkey(), low, true, PRICE);
+        env.ok(&[ix], &[&feed]);
+    };
+
+    // Borrowed at the 40% limit; a 13% fall puts the loan at about 46%, below today's 50% line.
+    env.walk_price_to(low);
+    for _ in 0..8 {
+        push_low(&mut env, 3_600);
+    }
+    // Each attempt repays a different amount: an identical failed transaction resent under the same
+    // blockhash is rejected as a duplicate before the program ever runs.
+    let attempt = |env: &mut Env, n: u64| {
+        let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), (100 + n) * USDC);
+        env.send(&[ix], &[&liq])
+    };
+    assert_program_error(attempt(&mut env, 0), VaultError::NotLiquidatable);
+
+    // The admin lowers the line to 42%, below where the loan now sits.
+    let mut tighter = params();
+    tighter.liq_threshold_bps = 4_200;
+    let ix = update_params_ix(&admin.pubkey(), &env.coll_mint, tighter);
+    env.ok(&[ix], &[&admin]);
+
+    // Immediately: still the old line.
+    assert_program_error(attempt(&mut env, 1), VaultError::NotLiquidatable);
+
+    // Two days in, the line is about 47.7%: still above the loan.
+    push_low(&mut env, 2 * 86_400);
+    assert_program_error(attempt(&mut env, 2), VaultError::NotLiquidatable);
+
+    // Seven days in, the new 42% line is fully in force and the loan can be liquidated.
+    push_low(&mut env, 5 * 86_400);
     let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 100 * USDC);
     env.ok(&[ix], &[&liq]);
 }

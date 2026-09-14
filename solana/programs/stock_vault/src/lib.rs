@@ -119,7 +119,9 @@ pub mod stock_vault {
         market.issuer_halt = false;
         market.liq_seq = 0;
         market.observed_multiplier_fp = schedule.effective(now);
-        market.reserved = [0; 40];
+        market.ramp_from = params.liquidation_terms();
+        market.ramp_start_ts = now;
+        market.reserved = [0; 12];
 
         emit!(MarketCreated {
             market: market.key(),
@@ -135,7 +137,22 @@ pub mod stock_vault {
         let now = Clock::get()?.unix_timestamp;
         let market = &mut ctx.accounts.market;
         accrue(market, now)?;
+        // U3: loosening applies at once; tightening reaches existing loans over seven days, starting
+        // from the terms in force right now (so a change made mid-ramp never jumps).
+        let live = effective_liquidation_terms(market, now);
+        let target = params.liquidation_terms();
+        market.ramp_from = ramp_start_terms(live, target);
+        market.ramp_start_ts = now;
         market.params = params;
+        if market.ramp_from != target {
+            emit!(LiquidationTermsTightening {
+                market: market.key(),
+                from: market.ramp_from,
+                to: target,
+                starts: now,
+                completes: now + LIQUIDATION_TERMS_RAMP_SECS,
+            });
+        }
         Ok(())
     }
 
@@ -622,27 +639,25 @@ pub mod stock_vault {
         let position = &mut ctx.accounts.position;
         let value = value_of(market, position.raw_collateral, multiplier_fp, price)?;
         let debt = logic::core(debt_for_shares(position.debt_shares, market.borrow_index))?;
+        // U3: the terms in force now, which may still be ramping toward a tightened `params`.
+        let terms = effective_liquidation_terms(market, now);
         require!(
-            logic::core(is_liquidatable(
-                debt,
-                value,
-                market.params.liq_threshold_bps
-            ))?,
+            logic::core(is_liquidatable(debt, value, terms.liq_threshold_bps))?,
             VaultError::NotLiquidatable
         );
 
         let ltv_bps = logic::core(current_ltv_bps(debt, value))?;
         let bonus_bps = logic::core(liquidation_bonus_bps(
             ltv_bps,
-            market.params.liq_threshold_bps,
-            market.params.min_liq_bonus_bps,
-            market.params.max_liq_bonus_bps,
+            terms.liq_threshold_bps,
+            terms.min_liq_bonus_bps,
+            terms.max_liq_bonus_bps,
         ))?;
         let allowed = logic::core(max_repay(
             debt,
             ltv_bps,
-            market.params.insolvency_ltv_bps,
-            market.params.close_factor_bps,
+            terms.insolvency_ltv_bps,
+            terms.close_factor_bps,
             market.params.max_liquidation_debt,
         ))?;
         let mut pay = repay_amount.min(allowed);
@@ -1122,6 +1137,17 @@ pub struct MarketCreated {
     pub market: Pubkey,
     pub collateral_mint: Pubkey,
     pub usdc_mint: Pubkey,
+}
+
+/// A parameter change tightened the liquidation terms. Existing loans reach `to` gradually, completing
+/// at `completes` (U3). Announced on-chain so borrowers can add collateral or repay in time.
+#[event]
+pub struct LiquidationTermsTightening {
+    pub market: Pubkey,
+    pub from: LiquidationTerms,
+    pub to: LiquidationTerms,
+    pub starts: i64,
+    pub completes: i64,
 }
 
 #[event]

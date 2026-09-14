@@ -9,13 +9,15 @@ use anchor_spl::token_2022::spl_token_2022::extension::{
 use anchor_spl::token_interface::get_mint_extension_data;
 use safu_core::{
     collateral::{collateral_value, effective_multiplier},
-    lending::{accrue_index, borrow_rate_bps, debt_for_shares, utilization_bps, RateCurve},
+    lending::{
+        accrue_index, borrow_rate_bps, debt_for_shares, ramp_bps, utilization_bps, RateCurve,
+    },
     price::{deviation_exceeded, twap, Sample},
     BPS, MULT_SCALE,
 };
 
 use crate::errors::VaultError;
-use crate::state::{Market, PriceState, TWAP_SLOTS};
+use crate::state::{LiquidationTerms, Market, PriceState, LIQUIDATION_TERMS_RAMP_SECS, TWAP_SLOTS};
 
 pub fn core<T>(r: safu_core::Result<T>) -> Result<T> {
     r.map_err(|e| VaultError::from(e).into())
@@ -299,4 +301,155 @@ pub fn value_of(m: &Market, raw: u64, multiplier_fp: u128, price: u64) -> Result
         multiplier_fp,
         price,
     ))
+}
+
+// ------------------------------------------------------------------ liquidation terms ramp (U3)
+
+/// Terms moving from `from` to `to`, each on its own straight line over the same window.
+pub fn interpolate_terms(
+    from: LiquidationTerms,
+    to: LiquidationTerms,
+    start: i64,
+    now: i64,
+) -> LiquidationTerms {
+    let r = |a, b| ramp_bps(a, b, start, now, LIQUIDATION_TERMS_RAMP_SECS);
+    LiquidationTerms {
+        liq_threshold_bps: r(from.liq_threshold_bps, to.liq_threshold_bps),
+        insolvency_ltv_bps: r(from.insolvency_ltv_bps, to.insolvency_ltv_bps),
+        close_factor_bps: r(from.close_factor_bps, to.close_factor_bps),
+        min_liq_bonus_bps: r(from.min_liq_bonus_bps, to.min_liq_bonus_bps),
+        max_liq_bonus_bps: r(from.max_liq_bonus_bps, to.max_liq_bonus_bps),
+    }
+}
+
+/// The liquidation terms in force at `now`: the ramp from `ramp_from` toward `params`.
+pub fn effective_liquidation_terms(m: &Market, now: i64) -> LiquidationTerms {
+    interpolate_terms(
+        m.ramp_from,
+        m.params.liquidation_terms(),
+        m.ramp_start_ts,
+        now,
+    )
+}
+
+/// Starting point of a new ramp toward `new`. A term the change LOOSENS jumps straight to its new
+/// value; a term it TIGHTENS starts from where it is right now, so a change mid-ramp never jumps.
+/// Tighter means: a lower liquidation line, a lower full-liquidation line, a larger close factor, a
+/// larger bonus.
+pub fn ramp_start_terms(current: LiquidationTerms, new: LiquidationTerms) -> LiquidationTerms {
+    LiquidationTerms {
+        liq_threshold_bps: current.liq_threshold_bps.max(new.liq_threshold_bps),
+        insolvency_ltv_bps: current.insolvency_ltv_bps.max(new.insolvency_ltv_bps),
+        close_factor_bps: current.close_factor_bps.min(new.close_factor_bps),
+        min_liq_bonus_bps: current.min_liq_bonus_bps.min(new.min_liq_bonus_bps),
+        max_liq_bonus_bps: current.max_liq_bonus_bps.min(new.max_liq_bonus_bps),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn terms(thr: u32, ins: u32, close: u32, min: u32, max: u32) -> LiquidationTerms {
+        LiquidationTerms {
+            liq_threshold_bps: thr,
+            insolvency_ltv_bps: ins,
+            close_factor_bps: close,
+            min_liq_bonus_bps: min,
+            max_liq_bonus_bps: max,
+        }
+    }
+
+    /// Deterministic generator of term sets that pass `MarketParams::validate`'s ordering rules.
+    fn valid(seed: &mut u64, ltv: u32) -> LiquidationTerms {
+        let mut next = |n: u32| {
+            *seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((*seed >> 33) % n as u64) as u32
+        };
+        let thr = ltv + 1 + next(9_000 - ltv);
+        let ins = thr + 1 + next(10_000 - thr);
+        let max = next(2_001);
+        let min = next(max + 1);
+        terms(thr, ins, 1 + next(10_000), min, max)
+    }
+
+    #[test]
+    fn loosening_is_instant_and_tightening_starts_where_the_terms_are() {
+        let week = LIQUIDATION_TERMS_RAMP_SECS;
+        let old = terms(5_000, 9_500, 2_500, 100, 500);
+        let tighter = terms(4_200, 9_000, 5_000, 200, 800);
+        let from = ramp_start_terms(old, tighter);
+        assert_eq!(
+            from, old,
+            "every term tightened, so every term starts at its old value"
+        );
+        assert_eq!(interpolate_terms(from, tighter, 0, 0), old);
+        assert_eq!(
+            interpolate_terms(from, tighter, 0, week / 2),
+            terms(4_600, 9_250, 3_750, 150, 650)
+        );
+        assert_eq!(interpolate_terms(from, tighter, 0, week), tighter);
+
+        let looser = terms(6_000, 9_800, 1_000, 50, 300);
+        let from = ramp_start_terms(old, looser);
+        assert_eq!(
+            from, looser,
+            "every term loosened, so the new values apply at once"
+        );
+        assert_eq!(interpolate_terms(from, looser, 0, 1), looser);
+    }
+
+    #[test]
+    fn a_second_change_mid_ramp_continues_from_the_live_value() {
+        let week = LIQUIDATION_TERMS_RAMP_SECS;
+        let old = terms(5_000, 9_500, 2_500, 100, 500);
+        let first = terms(4_200, 9_500, 2_500, 100, 500);
+        let from = ramp_start_terms(old, first);
+        let live = interpolate_terms(from, first, 0, week / 2);
+        assert_eq!(live.liq_threshold_bps, 4_600);
+        // Tighten further half way through: the new ramp starts at 46%, not back at 50%.
+        let second = terms(4_100, 9_500, 2_500, 100, 500);
+        let from2 = ramp_start_terms(live, second);
+        assert_eq!(from2.liq_threshold_bps, 4_600);
+        assert_eq!(
+            interpolate_terms(from2, second, week / 2, week / 2).liq_threshold_bps,
+            4_600
+        );
+        // Loosen half way through instead: applies at once.
+        let relief = terms(4_800, 9_500, 2_500, 100, 500);
+        assert_eq!(ramp_start_terms(live, relief).liq_threshold_bps, 4_800);
+    }
+
+    /// The ordering rules `validate` enforces on the target (liquidation line below the
+    /// full-liquidation line, above the borrow limit; min bonus at most max bonus) must hold at every
+    /// moment of every ramp, including chains of changes made mid-ramp.
+    #[test]
+    fn ordering_rules_hold_at_every_moment_of_any_chain_of_changes() {
+        let week = LIQUIDATION_TERMS_RAMP_SECS;
+        let mut seed = 0x5AFE_u64;
+        for _ in 0..400 {
+            let ltv = 1 + (seed % 7_999) as u32;
+            let mut current_target = valid(&mut seed, ltv);
+            let mut from = current_target;
+            let mut start = 0i64;
+            let mut t = 0i64;
+            for step in 0..6 {
+                t += (seed % (2 * week as u64)) as i64 + step;
+                let live = interpolate_terms(from, current_target, start, t);
+                let next = valid(&mut seed, ltv);
+                from = ramp_start_terms(live, next);
+                start = t;
+                current_target = next;
+                for probe in [0, 1, week / 7, week / 3, week / 2, week - 1, week, 2 * week] {
+                    let e = interpolate_terms(from, current_target, start, t + probe);
+                    assert!(e.liq_threshold_bps > ltv, "{e:?} ltv {ltv}");
+                    assert!(e.insolvency_ltv_bps > e.liq_threshold_bps, "{e:?}");
+                    assert!(e.min_liq_bonus_bps <= e.max_liq_bonus_bps, "{e:?}");
+                    assert!(e.insolvency_ltv_bps <= 10_000 && e.max_liq_bonus_bps <= 2_000);
+                }
+            }
+        }
+    }
 }

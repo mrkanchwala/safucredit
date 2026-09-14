@@ -4,7 +4,7 @@ use proptest::prelude::*;
 use safu_core::{
     collateral::{collateral_value, effective_multiplier, raw_for_usd},
     lending::{
-        debt_for_shares, is_liquidatable, max_borrow, seize_for_repay, shares_for_borrow,
+        debt_for_shares, is_liquidatable, max_borrow, ramp_bps, seize_for_repay, shares_for_borrow,
         shares_for_repay,
     },
     loss::{payout, wrongful_loss},
@@ -77,6 +77,14 @@ proptest! {
     fn full_range_raw_and_price_never_overflow_once_the_value_fits(raw in any::<u64>(), p in any::<u64>(), d in 21u8..=255, m in 1u128..=(MULT_SCALE * 1_000)) {
         // raw × price × m ≤ (2^64)^2 × 10^15, so at 21+ decimals the value is below 3.5 × 10^18 < u64::MAX (E2).
         prop_assert!(collateral_value(raw, d, m, p).is_ok());
+    }
+
+    #[test]
+    fn ramp_stays_between_its_ends_and_moves_one_way(from in any::<u32>(), to in any::<u32>(), start in -1_000_000_000i64..=1_000_000_000, a in any::<i64>(), b in any::<i64>(), d in 0i64..=10_000_000) {
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        let (x, y) = (ramp_bps(from, to, start, lo, d), ramp_bps(from, to, start, hi, d));
+        prop_assert!(x >= from.min(to) && x <= from.max(to));
+        if to >= from { prop_assert!(x <= y) } else { prop_assert!(x >= y) }
     }
 
     #[test]

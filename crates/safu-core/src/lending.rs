@@ -8,6 +8,29 @@ use crate::{
 pub const INDEX_SCALE: u128 = 1_000_000_000_000;
 pub const SECONDS_PER_YEAR: u128 = 31_536_000;
 
+/// A basis-point term moving linearly from `from` to `to` over `duration_secs` starting at `start` (U3).
+///
+/// Before `start` it is `from`; at or after `start + duration_secs` it is `to`. In between, the step is
+/// truncated toward `from`, so a ramp is never ahead of schedule. `duration_secs <= 0` means no ramp.
+/// Pure and panic-free: time arithmetic saturates.
+pub fn ramp_bps(from: u32, to: u32, start: i64, now: i64, duration_secs: i64) -> u32 {
+    if duration_secs <= 0 {
+        return to;
+    }
+    // Checked before the end: with `start` near i64::MAX the end saturates onto `start`, and a ramp
+    // must still read `from` at its own start rather than counting as already finished.
+    if now <= start {
+        return from;
+    }
+    if now >= start.saturating_add(duration_secs) {
+        return to;
+    }
+    let elapsed = (now - start) as i128;
+    let delta = to as i128 - from as i128;
+    // |delta| < 2^32 and elapsed < duration < 2^63, so the product fits in i128.
+    (from as i128 + delta * elapsed / duration_secs as i128) as u32
+}
+
 /// Largest debt allowed against `collateral_value` at `ltv_bps`.
 pub fn max_borrow(collateral_value: u64, ltv_bps: u32) -> Result<u64> {
     apply_bps(collateral_value, ltv_bps)
@@ -267,6 +290,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn ramp_moves_linearly_and_never_runs_ahead() {
+        let week = 7 * 86_400;
+        // 50% → 42% over a week.
+        assert_eq!(
+            ramp_bps(5_000, 4_200, 100, 99, week),
+            5_000,
+            "before the start"
+        );
+        assert_eq!(
+            ramp_bps(5_000, 4_200, 100, 100, week),
+            5_000,
+            "at the start"
+        );
+        assert_eq!(
+            ramp_bps(5_000, 4_200, 100, 100 + week / 2, week),
+            4_600,
+            "half way"
+        );
+        assert_eq!(ramp_bps(5_000, 4_200, 100, 100 + week, week), 4_200, "done");
+        assert_eq!(ramp_bps(5_000, 4_200, 100, i64::MAX, week), 4_200);
+        // One second in, the 0.0013 bps step truncates toward `from`: never ahead of schedule.
+        assert_eq!(ramp_bps(5_000, 4_200, 100, 101, week), 5_000);
+        // Upward ramps (a rising bonus) truncate toward `from` too.
+        assert_eq!(ramp_bps(100, 500, 0, 1, week), 100);
+        assert_eq!(ramp_bps(100, 500, 0, week / 4, week), 200);
+        // No ramp.
+        assert_eq!(ramp_bps(5_000, 4_200, 100, 100, 0), 4_200);
+        assert_eq!(ramp_bps(7, 7, 0, 5, week), 7);
+        // Saturating time arithmetic at the extremes.
+        assert_eq!(ramp_bps(1, u32::MAX, i64::MAX, i64::MAX, week), 1);
+        assert_eq!(
+            ramp_bps(u32::MAX, 0, i64::MIN, i64::MIN + 1, i64::MAX),
+            u32::MAX
+        );
     }
 
     #[test]
