@@ -3349,3 +3349,64 @@ fn heaviest_transactions_fit_solana_compute_and_size_limits() {
         );
     }
 }
+
+#[test]
+fn write_off_inventory_clears_a_halted_markets_inventory_and_lifts_the_pause() {
+    let mut env = with_loan();
+    let admin = env.admin.insecure_clone();
+    let market = env.market();
+    let alice = env.alice.pubkey();
+    let register = env.v_ix(
+        stock_vault::accounts::AdminOnly {
+            admin: admin.pubkey(),
+            config: vpda(&[VCONFIG_SEED]),
+        },
+        stock_vault::instruction::SetPoolLiquidator {
+            pool_liquidator: env.b_config(),
+        },
+    );
+    env.ok(&[register], &[&admin]);
+    env.back(100_000 * USDC);
+    let open_inv = env.open_inventory_ix(&admin.pubkey());
+    env.ok(&[open_inv], &[&admin]);
+    env.walk_price_to(PRICE * 75 / 100);
+    let (crank, crank_usdc) = env.new_funded(0);
+    let seq = env.market_state().liq_seq;
+    let ix = env.pool_liquidate_ix(&crank.pubkey(), &crank_usdc, seq, &alice, 50_000 * USDC);
+    env.ok(&[ix], &[&crank]);
+    let cost = env.inventory_state(&market).cost_total;
+    assert!(cost > 0 && env.config_state().inventory_cost_total == cost);
+
+    // The issuer burns out of the market's collateral vault; syncing halts the market.
+    let coll_vault = vpda(&[COLL_VAULT_SEED, market.as_ref()]);
+    let mut acc = env.svm.get_account(&coll_vault).unwrap();
+    let amount = u64::from_le_bytes(acc.data[64..72].try_into().unwrap());
+    acc.data[64..72].copy_from_slice(&(amount - ONE_SHARE).to_le_bytes());
+    env.svm.set_account(coll_vault, acc).unwrap();
+    let sync = env.v_ix(
+        stock_vault::accounts::SyncIssuerState {
+            market,
+            collateral_mint: env.coll_mint,
+            collateral_vault: coll_vault,
+        },
+        stock_vault::instruction::SyncIssuerState {},
+    );
+    env.ok(&[sync], &[&admin]);
+    assert!(env.market_state().issuer_halt);
+
+    let intruder = env.alice.insecure_clone();
+    let ix = env.write_off_inventory_ix(&intruder.pubkey());
+    assert_program_error(env.send(&[ix], &[&intruder]), VerdictError::Unauthorized);
+
+    let ix = env.write_off_inventory_ix(&admin.pubkey());
+    env.ok(&[ix], &[&admin]);
+    assert_eq!(env.inventory_state(&market).cost_total, 0);
+    assert_eq!(env.config_state().inventory_cost_total, 0);
+
+    // The deposit/withdraw pause is lifted: a new backer can deposit again.
+    env.back(USDC);
+
+    env.warp(1);
+    let ix = env.write_off_inventory_ix(&admin.pubkey());
+    assert_program_error(env.send(&[ix], &[&admin]), VerdictError::ZeroAmount);
+}

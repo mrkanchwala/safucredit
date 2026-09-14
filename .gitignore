@@ -15,3 +15,6 @@ keys/
 # CMC redistribution terms unverified: recordings stay local until checked
 verdict/recordings/
 .pytest_cache
+
+# Local demo runs: ledger, throwaway keypairs, replayed recordings
+.demo/

@@ -1,0 +1,5362 @@
+{
+  "address": "H1hApKnNkYPsqQ9WVZGzqZQZYirxCLpXDj2uEmzMK3YV",
+  "metadata": {
+    "name": "backstop",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "description": "SAFU Credit: backer capital, wrongful-liquidation payouts, bad-debt cover"
+  },
+  "instructions": [
+    {
+      "name": "absorb_interest",
+      "docs": [
+        "Recognises USDC `pay_backer_interest` has already moved into the pool's vault. Permissionless,",
+        "bounded by the unaccounted surplus actually sitting in the token account (2c pattern, in",
+        "reverse) -- a raw donation is never counted, and repeat calls settle only the remainder."
+      ],
+      "discriminator": [
+        1,
+        4,
+        237,
+        81,
+        164,
+        8,
+        6,
+        40
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "relations": [
+            "interest_absorbed"
+          ]
+        },
+        {
+          "name": "interest_absorbed",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  116,
+                  101,
+                  114,
+                  101,
+                  115,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "pool_usdc_vault",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  117,
+                  115,
+                  100,
+                  99
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "usdc_token_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "approve_override",
+      "docs": [
+        "Admin or co-signer only. The 2-of-2 override (LOCKED verdict spec): each approver submits",
+        "the same `ref_at_liq` once; the second matching, current-key approval executes. Skips",
+        "checks (a)/(b)/(c) and the 60-day gate. Never skips: record + borrower match, the",
+        "issuer-action exclusion, one payout per liquidation (a `Completed` claim is refused), the",
+        "on-chain loss formula, the per-claim cap, or solvency — `ref_at_liq` is supplied, not the",
+        "loss itself, and the loss is still computed on-chain via `safu_core::wrongful_loss`, then",
+        "still run through `try_admit`'s cap/solvency logic exactly like an ordinary admission.",
+        "A prior `Active` claim's unstreamed reservation is released and its `streamed` carried",
+        "forward, so the correction can never pay out on top of what already streamed."
+      ],
+      "discriminator": [
+        41,
+        2,
+        181,
+        184,
+        119,
+        133,
+        62,
+        52
+      ],
+      "accounts": [
+        {
+          "name": "caller",
+          "signer": true
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "relations": [
+            "claim"
+          ]
+        },
+        {
+          "name": "liquidation_record"
+        },
+        {
+          "name": "claim",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  108,
+                  97,
+                  105,
+                  109
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "liquidation_record"
+              }
+            ]
+          }
+        },
+        {
+          "name": "override_request",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  118,
+                  101,
+                  114,
+                  114,
+                  105,
+                  100,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "liquidation_record"
+              }
+            ]
+          }
+        },
+        {
+          "name": "payout_backer",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  97,
+                  99,
+                  107,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "liquidation_record.payout",
+                "account": "LiquidationRecord"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "ref_at_liq",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "buy_inventory",
+      "docs": [
+        "Buys collateral out of a market's inventory at the healthy price minus the discount, never",
+        "below the pool's own cost for the first `resale_floor_secs` after acquiring it, and never",
+        "while the price is flagged or a corporate-action hold is active (D5). Bounded by the",
+        "buyer's own `max_price_per_share` (slippage)."
+      ],
+      "discriminator": [
+        68,
+        137,
+        222,
+        247,
+        178,
+        242,
+        230,
+        199
+      ],
+      "accounts": [
+        {
+          "name": "buyer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "relations": [
+            "inventory"
+          ]
+        },
+        {
+          "name": "inventory",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  118
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_mint"
+        },
+        {
+          "name": "usdc_mint"
+        },
+        {
+          "name": "inventory_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "pool_usdc_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  117,
+                  115,
+                  100,
+                  99
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "buyer_usdc",
+          "writable": true
+        },
+        {
+          "name": "buyer_collateral",
+          "writable": true
+        },
+        {
+          "name": "collateral_token_program"
+        },
+        {
+          "name": "usdc_token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "raw",
+          "type": "u64"
+        },
+        {
+          "name": "max_price_per_share",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "cancel_claim",
+      "docs": [
+        "Admin-only. Cancels a held (`PendingTime`), `Queued`, or `Active` claim with a public",
+        "reason code (LOCKED verdict spec). An `Active` claim's unstreamed reservation is released",
+        "exactly as it would be on expiry. The 365-day no-coverage penalty applies only if real",
+        "money had actually left the pool for this claim (`streamed > 0`) — catching a mistake",
+        "before any payout moved costs the borrower nothing."
+      ],
+      "discriminator": [
+        179,
+        1,
+        212,
+        49,
+        81,
+        144,
+        221,
+        140
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "claim",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  108,
+                  97,
+                  105,
+                  109
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "claim.liquidation_record",
+                "account": "Claim"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "relations": [
+            "claim"
+          ]
+        },
+        {
+          "name": "borrower_claims",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  108,
+                  97,
+                  105,
+                  109,
+                  115
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "claim.borrower",
+                "account": "Claim"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "reason_code",
+          "type": "u16"
+        }
+      ]
+    },
+    {
+      "name": "claim_stream",
+      "docs": [
+        "Pulls whatever has vested and fits today's outflow cap to the claim's frozen payout ATA.",
+        "Permissionless — the payout address, not the caller, receives the funds."
+      ],
+      "discriminator": [
+        157,
+        247,
+        164,
+        226,
+        240,
+        158,
+        183,
+        36
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "claim",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  108,
+                  97,
+                  105,
+                  109
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "claim.liquidation_record",
+                "account": "Claim"
+              }
+            ]
+          }
+        },
+        {
+          "name": "usdc_mint"
+        },
+        {
+          "name": "payout_usdc",
+          "writable": true
+        },
+        {
+          "name": "usdc_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  117,
+                  115,
+                  100,
+                  99
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "usdc_token_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "cover_bad_debt",
+      "docs": [
+        "Reimburses a lending market for debt its collateral could not cover. Permissionless.",
+        "",
+        "What is owed is the market's own monotonic write-off total minus what this backstop has",
+        "already paid it, so repeat calls settle the remainder and never double-pay — no epochs to",
+        "keep in step. The USDC simply lands in the market's vault; the market recognises it through",
+        "its own `absorb_bad_debt_cover`, which is bounded by its outstanding bad debt."
+      ],
+      "discriminator": [
+        137,
+        228,
+        6,
+        238,
+        18,
+        142,
+        153,
+        232
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "docs": [
+            "Owned by the lending vault program, so its bad-debt counter cannot be fabricated."
+          ],
+          "relations": [
+            "cover"
+          ]
+        },
+        {
+          "name": "cover",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "market_usdc_vault",
+          "writable": true
+        },
+        {
+          "name": "usdc_mint"
+        },
+        {
+          "name": "usdc_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  117,
+                  115,
+                  100,
+                  99
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "usdc_token_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "deposit",
+      "docs": [
+        "Backer capital in. Shares are priced off `config.cash`, never the token account balance, so",
+        "a raw transfer into the vault cannot move the share price."
+      ],
+      "discriminator": [
+        242,
+        35,
+        198,
+        137,
+        82,
+        225,
+        242,
+        182
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "signer": true,
+          "relations": [
+            "backer"
+          ]
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "backer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  97,
+                  99,
+                  107,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "usdc_mint"
+        },
+        {
+          "name": "owner_usdc",
+          "writable": true
+        },
+        {
+          "name": "usdc_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  117,
+                  115,
+                  100,
+                  99
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "usdc_token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "expire_queued",
+      "docs": [
+        "A `Queued` claim that never fit inside the claim window expires. It reserved nothing, so",
+        "nothing is released."
+      ],
+      "discriminator": [
+        13,
+        198,
+        56,
+        192,
+        191,
+        87,
+        17,
+        62
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "claim",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  108,
+                  97,
+                  105,
+                  109
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "claim.liquidation_record",
+                "account": "Claim"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "expire_stale",
+      "docs": [
+        "An `Active` claim with no pull for its admitted `inactivity_secs` returns its unpaid remainder to",
+        "the backstop by simply un-reserving it — nothing was ever transferred for that remainder."
+      ],
+      "discriminator": [
+        78,
+        105,
+        16,
+        67,
+        30,
+        126,
+        71,
+        208
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "claim",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  108,
+                  97,
+                  105,
+                  109
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "claim.liquidation_record",
+                "account": "Claim"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "finalize_withdraw",
+      "docs": [
+        "Takes the money out, bounded by `cash − reserved_total`: only the claim amount an `Active`",
+        "claim actually reserves is off-limits, not the whole pool while any claim merely exists",
+        "(queued or held claims reserve nothing until they are actually admitted)."
+      ],
+      "discriminator": [
+        17,
+        72,
+        11,
+        172,
+        214,
+        42,
+        12,
+        23
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "signer": true,
+          "relations": [
+            "backer"
+          ]
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "backer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  97,
+                  99,
+                  107,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "usdc_mint"
+        },
+        {
+          "name": "owner_usdc",
+          "writable": true
+        },
+        {
+          "name": "usdc_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  117,
+                  115,
+                  100,
+                  99
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "usdc_token_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "initialize_backstop",
+      "docs": [
+        "Only the program's upgrade authority may initialize, so nobody watching the deploy can call it",
+        "first and take admin. Initialize before any `--final`: a program with no upgrade authority can",
+        "never be initialized."
+      ],
+      "discriminator": [
+        243,
+        251,
+        159,
+        14,
+        123,
+        12,
+        153,
+        1
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "program",
+          "docs": [
+            "This program. Proves `program_data` belongs to it, not to a program the caller deployed."
+          ],
+          "address": "H1hApKnNkYPsqQ9WVZGzqZQZYirxCLpXDj2uEmzMK3YV"
+        },
+        {
+          "name": "program_data"
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "usdc_mint"
+        },
+        {
+          "name": "usdc_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  117,
+                  115,
+                  100,
+                  99
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "usdc_token_program"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "verdict_oracle",
+          "type": "pubkey"
+        },
+        {
+          "name": "co_signer",
+          "type": "pubkey"
+        },
+        {
+          "name": "cluster_tag",
+          "type": "u8"
+        },
+        {
+          "name": "per_claim_cap_bps",
+          "type": "u32"
+        },
+        {
+          "name": "withdraw_delay_secs",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "open_backer",
+      "discriminator": [
+        239,
+        108,
+        246,
+        15,
+        10,
+        215,
+        25,
+        81
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "backer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  97,
+                  99,
+                  107,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "open_bad_debt_cover",
+      "discriminator": [
+        83,
+        3,
+        153,
+        123,
+        2,
+        11,
+        42,
+        107
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market"
+        },
+        {
+          "name": "cover",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  100
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "open_borrower_claims",
+      "docs": [
+        "Opens the single-slot claim tracker for one (market, borrower) pair. Permissionless — anyone",
+        "may open it ahead of a borrower's first claim."
+      ],
+      "discriminator": [
+        87,
+        18,
+        17,
+        173,
+        144,
+        165,
+        39,
+        12
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market"
+        },
+        {
+          "name": "borrower",
+          "docs": [
+            "is permissionless and holds no funds."
+          ]
+        },
+        {
+          "name": "borrower_claims",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  108,
+                  97,
+                  105,
+                  109,
+                  115
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "borrower"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "open_interest_absorbed",
+      "docs": [
+        "Opens the interest-recognition counter for one market (phase 3). Permissionless, one-time."
+      ],
+      "discriminator": [
+        186,
+        185,
+        145,
+        47,
+        2,
+        126,
+        215,
+        57
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market"
+        },
+        {
+          "name": "interest_absorbed",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  116,
+                  101,
+                  114,
+                  101,
+                  115,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "open_inventory",
+      "docs": [
+        "Opens the collateral-inventory tracker and its token vault for one market (phase 3).",
+        "Permissionless, one-time, ahead of that market's first pool liquidation."
+      ],
+      "discriminator": [
+        177,
+        173,
+        214,
+        95,
+        225,
+        29,
+        148,
+        200
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market"
+        },
+        {
+          "name": "inventory",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  118
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_mint"
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "inventory_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_token_program"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "open_override",
+      "docs": [
+        "Permissionless. Opens the 2-of-2 override request for one liquidation, ahead of the first",
+        "`approve_override` call."
+      ],
+      "discriminator": [
+        183,
+        186,
+        117,
+        4,
+        223,
+        217,
+        104,
+        10
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "liquidation_record"
+        },
+        {
+          "name": "override_request",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  111,
+                  118,
+                  101,
+                  114,
+                  114,
+                  105,
+                  100,
+                  101
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "liquidation_record"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "pool_liquidate",
+      "docs": [
+        "Liquidates a position through the vault with the pool itself as liquidator",
+        "(backstop-as-liquidator lock). A permissionless crank; the caller pays the new",
+        "`LiquidationRecord`'s rent (A1 -- the pool's key is a program PDA, it cannot fund an",
+        "account) and earns a slice of the bonus (D6). Bounded by the per-liquidation and daily",
+        "caps -- over either, this pays what caps and cash allow (E1): the position stays",
+        "liquidatable and an outside liquidator may act once the vault's own grace period elapses."
+      ],
+      "discriminator": [
+        221,
+        25,
+        238,
+        233,
+        156,
+        207,
+        130,
+        42
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "docs": [
+            "Pays the new LiquidationRecord's rent (A1) and receives the crank fee."
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_config",
+          "docs": [
+            "The vault's own config, required by the CPI; re-validated there, not here."
+          ]
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "relations": [
+            "inventory"
+          ]
+        },
+        {
+          "name": "position",
+          "docs": [
+            "against its own seeds, so a wrong position simply fails inside the CPI."
+          ],
+          "writable": true
+        },
+        {
+          "name": "record",
+          "docs": [
+            "vault's own seeds so a wrong address fails before the CPI runs, not inside it."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  105,
+                  113
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "market.liq_seq",
+                "account": "Market"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                233,
+                254,
+                86,
+                229,
+                85,
+                70,
+                32,
+                30,
+                221,
+                19,
+                246,
+                172,
+                173,
+                243,
+                118,
+                164,
+                13,
+                221,
+                209,
+                111,
+                175,
+                173,
+                185,
+                16,
+                133,
+                171,
+                198,
+                254,
+                137,
+                255,
+                202,
+                197
+              ]
+            }
+          }
+        },
+        {
+          "name": "collateral_mint"
+        },
+        {
+          "name": "usdc_mint"
+        },
+        {
+          "name": "pool_usdc_vault",
+          "docs": [
+            "The pool's own USDC -- doubles as the CPI's `liquidator_usdc`."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  117,
+                  115,
+                  100,
+                  99
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "inventory",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  118
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "inventory_vault",
+          "docs": [
+            "The pool's own collateral holding -- doubles as the CPI's `liquidator_collateral`."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault_collateral_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  108,
+                  108,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                233,
+                254,
+                86,
+                229,
+                85,
+                70,
+                32,
+                30,
+                221,
+                19,
+                246,
+                172,
+                173,
+                243,
+                118,
+                164,
+                13,
+                221,
+                209,
+                111,
+                175,
+                173,
+                185,
+                16,
+                133,
+                171,
+                198,
+                254,
+                137,
+                255,
+                202,
+                197
+              ]
+            }
+          }
+        },
+        {
+          "name": "vault_usdc_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  117,
+                  115,
+                  100,
+                  99,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                233,
+                254,
+                86,
+                229,
+                85,
+                70,
+                32,
+                30,
+                221,
+                19,
+                246,
+                172,
+                173,
+                243,
+                118,
+                164,
+                13,
+                221,
+                209,
+                111,
+                175,
+                173,
+                185,
+                16,
+                133,
+                171,
+                198,
+                254,
+                137,
+                255,
+                202,
+                197
+              ]
+            }
+          }
+        },
+        {
+          "name": "crank_usdc",
+          "writable": true
+        },
+        {
+          "name": "collateral_token_program"
+        },
+        {
+          "name": "usdc_token_program"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "stock_vault_program",
+          "address": "GkQw6VGDKYBWJtgtWUmFDkHNqGrnyjSviQeQzVMW35K2"
+        }
+      ],
+      "args": [
+        {
+          "name": "repay_amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "request_withdraw",
+      "docs": [
+        "Queues an exit. The delay exists so capital cannot leave in front of a verdict that is",
+        "already being prepared off-chain but not yet submitted."
+      ],
+      "discriminator": [
+        137,
+        95,
+        187,
+        96,
+        250,
+        138,
+        31,
+        182
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "signer": true,
+          "relations": [
+            "backer"
+          ]
+        },
+        {
+          "name": "backer",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  97,
+                  99,
+                  107,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "shares",
+          "type": "u128"
+        }
+      ]
+    },
+    {
+      "name": "revoke_attestation",
+      "docs": [
+        "Admin-only. Marks one specific signed-but-not-yet-submitted attestation revoked, so a",
+        "leaked-oracle-key scenario has an on-chain block even before anyone tries to submit it."
+      ],
+      "discriminator": [
+        12,
+        156,
+        103,
+        161,
+        194,
+        246,
+        211,
+        179
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "revoked",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  114,
+                  101,
+                  118,
+                  111,
+                  107,
+                  101
+                ]
+              },
+              {
+                "kind": "arg",
+                "path": "liquidation_record"
+              },
+              {
+                "kind": "arg",
+                "path": "evidence_hash"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "liquidation_record",
+          "type": "pubkey"
+        },
+        {
+          "name": "evidence_hash",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "set_admin",
+      "docs": [
+        "Hands the admin role over (U5). No renounce path: an unowned backstop could never rotate a",
+        "leaked oracle key."
+      ],
+      "discriminator": [
+        251,
+        163,
+        0,
+        52,
+        91,
+        194,
+        187,
+        92
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "admin",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "set_backstop_params",
+      "docs": [
+        "Admin-settable within hard bounds (U2), so neither knob can be set somewhere unsafe: a zero",
+        "per-claim cap would freeze every admission, and an unbounded withdrawal delay would trap backers."
+      ],
+      "discriminator": [
+        116,
+        86,
+        198,
+        41,
+        21,
+        163,
+        29,
+        221
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "per_claim_cap_bps",
+          "type": "u32"
+        },
+        {
+          "name": "withdraw_delay_secs",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "set_claim_timing",
+      "docs": [
+        "Phase 5 (A5): sets every claim timing at once, bounded per cluster by `require_claim_timing`.",
+        "Forward-only: a held claim keeps the `releasable_at` it was given at submission, and an admitted",
+        "claim keeps the cooldown, stream and inactivity window it was admitted under."
+      ],
+      "discriminator": [
+        182,
+        134,
+        58,
+        93,
+        47,
+        138,
+        0,
+        177
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "gate_secs",
+          "type": "i64"
+        },
+        {
+          "name": "cooldown_secs",
+          "type": "i64"
+        },
+        {
+          "name": "stream_secs",
+          "type": "i64"
+        },
+        {
+          "name": "inactivity_secs",
+          "type": "i64"
+        },
+        {
+          "name": "min_after_wait_secs",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "set_co_signer",
+      "docs": [
+        "Rotates the 2-of-2 override co-signer (phase 4). Same recoverability rationale as",
+        "`set_verdict_oracle`: a leaked co-signer key must be replaceable without a program upgrade."
+      ],
+      "discriminator": [
+        241,
+        11,
+        156,
+        229,
+        154,
+        96,
+        16,
+        198
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "co_signer",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "set_pool_liquidation_params",
+      "docs": [
+        "Pool-liquidation params, bounded (phase 3). A5's per-cluster floors land in phase 5; these are",
+        "generic ceilings only, so the demo can run fast today without leaving a mainnet admin free to",
+        "set anything unsafe later."
+      ],
+      "discriminator": [
+        58,
+        103,
+        198,
+        199,
+        105,
+        184,
+        31,
+        84
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "per_liq_cap_bps",
+          "type": "u32"
+        },
+        {
+          "name": "daily_liq_cap_bps",
+          "type": "u32"
+        },
+        {
+          "name": "resale_discount_bps",
+          "type": "u32"
+        },
+        {
+          "name": "resale_floor_secs",
+          "type": "i64"
+        },
+        {
+          "name": "fee_share_bps",
+          "type": "u32"
+        },
+        {
+          "name": "min_pool_repay",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "set_verdict_oracle",
+      "docs": [
+        "Rotates the verdict oracle key (U5). It is a throwaway per-chain Ed25519 key, so a leak has",
+        "to be recoverable on-chain: without this, replacing it would need a program upgrade.",
+        "Claims already submitted stay valid; unsubmitted facts signed by the old key stop verifying."
+      ],
+      "discriminator": [
+        62,
+        44,
+        185,
+        148,
+        118,
+        55,
+        35,
+        157
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "verdict_oracle",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "submit_facts",
+      "docs": [
+        "Records an oracle-signed facts payload for one liquidation and runs the verdict rules",
+        "on-chain (LOCKED verdict spec). The transaction must place the oracle's Ed25519 precompile",
+        "instruction directly before this one. Anyone may submit; the signature is the authorization.",
+        "",
+        "A structurally invalid submission (bad signature, expired deadline, mismatched record,",
+        "issuer-halted liquidation, self-dealt liquidation, a privileged payout address, or a",
+        "borrower with an unresolved claim already open) reverts the transaction. A submission that",
+        "checks out structurally but fails the wrongfulness rules — the price wasn't actually wrong,",
+        "the move held, or the loss nets to zero — is recorded on-chain as `Denied` with a reason",
+        "code, rather than reverting: a claims decision must be visible, not silently dropped."
+      ],
+      "discriminator": [
+        234,
+        249,
+        233,
+        115,
+        225,
+        105,
+        22,
+        87
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market"
+        },
+        {
+          "name": "liquidation_record",
+          "docs": [
+            "Owned by the lending vault program — Anchor's `Owner` check is what proves this record was",
+            "written by the vault and not fabricated."
+          ]
+        },
+        {
+          "name": "borrower"
+        },
+        {
+          "name": "borrower_claims",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  108,
+                  97,
+                  105,
+                  109,
+                  115
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "borrower"
+              }
+            ]
+          }
+        },
+        {
+          "name": "existing_claim",
+          "docs": [
+            "manually as a `Claim` owned by this program. Any account may be passed when the slot is",
+            "free — it is never touched in that branch."
+          ]
+        },
+        {
+          "name": "claim",
+          "docs": [
+            "`init` is the idempotency: a second facts submission for the same liquidation cannot create",
+            "this twice, so a replayed transaction cannot open a second claim."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  108,
+                  97,
+                  105,
+                  109
+                ]
+              },
+              {
+                "kind": "arg",
+                "path": "args.liquidation_record"
+              }
+            ]
+          }
+        },
+        {
+          "name": "payout_backer",
+          "docs": [
+            "decoded and required to hold nothing (A4, applied to the payout rather than the borrower)."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  97,
+                  99,
+                  107,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "liquidation_record.payout",
+                "account": "LiquidationRecord"
+              }
+            ]
+          }
+        },
+        {
+          "name": "revoked",
+          "docs": [
+            "marked this exact (liquidation_record, evidence_hash) pair revoked; never deserialized."
+          ],
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  114,
+                  101,
+                  118,
+                  111,
+                  107,
+                  101
+                ]
+              },
+              {
+                "kind": "arg",
+                "path": "args.liquidation_record"
+              },
+              {
+                "kind": "arg",
+                "path": "args.evidence_hash"
+              }
+            ]
+          }
+        },
+        {
+          "name": "instructions_sysvar",
+          "address": "Sysvar1nstructions1111111111111111111111111"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "args",
+          "type": {
+            "defined": {
+              "name": "FactsArgs"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "suspend_claim",
+      "docs": [
+        "Admin-only. Freezes a claim: every permissionless progression instruction (`unlock_claim`,",
+        "`try_release_queued`, `expire_queued`, `expire_stale`, `claim_stream`) refuses while",
+        "suspended."
+      ],
+      "discriminator": [
+        168,
+        71,
+        68,
+        65,
+        184,
+        203,
+        14,
+        65
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "claim",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  108,
+                  97,
+                  105,
+                  109
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "claim.liquidation_record",
+                "account": "Claim"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "try_release_queued",
+      "docs": [
+        "Re-checks a `Queued` claim against the current caps and solvency. Permissionless; callable",
+        "as often as anyone likes — cash growing or utilisation falling is what lets it through."
+      ],
+      "discriminator": [
+        127,
+        182,
+        71,
+        200,
+        223,
+        126,
+        88,
+        19
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "claim",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  108,
+                  97,
+                  105,
+                  109
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "claim.liquidation_record",
+                "account": "Claim"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "unlock_claim",
+      "docs": [
+        "Releases a `PendingTime` claim once the 60-day gate has elapsed, attempting admission at",
+        "full value. Permissionless."
+      ],
+      "discriminator": [
+        20,
+        67,
+        253,
+        195,
+        211,
+        246,
+        176,
+        71
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "claim",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  108,
+                  97,
+                  105,
+                  109
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "claim.liquidation_record",
+                "account": "Claim"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "unsuspend_claim",
+      "docs": [
+        "Admin-only. Un-freezes a claim, folding the just-ended suspension's duration into",
+        "`suspended_secs` so `expire_queued`/`expire_stale` never count time this claim spent",
+        "suspended (LOCKED verdict spec: \"expiry clocks stop while suspended and reset on",
+        "unsuspend\")."
+      ],
+      "discriminator": [
+        94,
+        32,
+        149,
+        107,
+        123,
+        135,
+        62,
+        172
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "claim",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  108,
+                  97,
+                  105,
+                  109
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "claim.liquidation_record",
+                "account": "Claim"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "write_off_inventory",
+      "docs": [
+        "Admin-only, bounded to a market the issuer has actually frozen or halted (E3): the only",
+        "case where `buy_inventory` can never clear the position on its own, because the token",
+        "account itself is frozen. Zeroes this market's cost basis so deposits/withdrawals can",
+        "resume; backers take the loss, same as any other issuer-seizure risk they carry."
+      ],
+      "discriminator": [
+        9,
+        220,
+        1,
+        46,
+        40,
+        203,
+        87,
+        9
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  98,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "relations": [
+            "inventory"
+          ]
+        },
+        {
+          "name": "collateral_mint"
+        },
+        {
+          "name": "inventory",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  105,
+                  110,
+                  118
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    }
+  ],
+  "accounts": [
+    {
+      "name": "Backer",
+      "discriminator": [
+        199,
+        128,
+        179,
+        190,
+        2,
+        66,
+        118,
+        252
+      ]
+    },
+    {
+      "name": "BackstopConfig",
+      "discriminator": [
+        51,
+        117,
+        28,
+        87,
+        198,
+        48,
+        159,
+        164
+      ]
+    },
+    {
+      "name": "BadDebtCover",
+      "discriminator": [
+        189,
+        69,
+        201,
+        180,
+        226,
+        138,
+        136,
+        250
+      ]
+    },
+    {
+      "name": "BorrowerClaims",
+      "discriminator": [
+        185,
+        75,
+        67,
+        68,
+        178,
+        239,
+        66,
+        251
+      ]
+    },
+    {
+      "name": "Claim",
+      "discriminator": [
+        155,
+        70,
+        22,
+        176,
+        123,
+        215,
+        246,
+        102
+      ]
+    },
+    {
+      "name": "InterestAbsorbed",
+      "discriminator": [
+        134,
+        14,
+        92,
+        184,
+        230,
+        30,
+        42,
+        87
+      ]
+    },
+    {
+      "name": "Inventory",
+      "discriminator": [
+        97,
+        218,
+        167,
+        233,
+        216,
+        170,
+        49,
+        27
+      ]
+    },
+    {
+      "name": "OverrideRequest",
+      "discriminator": [
+        15,
+        254,
+        65,
+        253,
+        51,
+        174,
+        124,
+        111
+      ]
+    },
+    {
+      "name": "RevokedAttestation",
+      "discriminator": [
+        40,
+        17,
+        219,
+        149,
+        165,
+        22,
+        221,
+        119
+      ]
+    }
+  ],
+  "events": [
+    {
+      "name": "AttestationRevokedEvent",
+      "discriminator": [
+        155,
+        254,
+        201,
+        146,
+        102,
+        212,
+        184,
+        44
+      ]
+    },
+    {
+      "name": "BadDebtReimbursed",
+      "discriminator": [
+        9,
+        173,
+        60,
+        39,
+        239,
+        124,
+        47,
+        66
+      ]
+    },
+    {
+      "name": "ClaimCancelled",
+      "discriminator": [
+        219,
+        39,
+        67,
+        208,
+        89,
+        48,
+        164,
+        167
+      ]
+    },
+    {
+      "name": "ClaimOverridden",
+      "discriminator": [
+        25,
+        16,
+        147,
+        246,
+        155,
+        229,
+        254,
+        150
+      ]
+    },
+    {
+      "name": "ClaimStatusChanged",
+      "discriminator": [
+        216,
+        31,
+        249,
+        76,
+        119,
+        54,
+        103,
+        65
+      ]
+    },
+    {
+      "name": "ClaimStreamed",
+      "discriminator": [
+        44,
+        158,
+        104,
+        86,
+        246,
+        203,
+        209,
+        88
+      ]
+    },
+    {
+      "name": "ClaimSuspendChanged",
+      "discriminator": [
+        66,
+        111,
+        207,
+        187,
+        63,
+        228,
+        149,
+        254
+      ]
+    },
+    {
+      "name": "ClaimTimingSet",
+      "discriminator": [
+        150,
+        122,
+        142,
+        82,
+        67,
+        240,
+        147,
+        102
+      ]
+    },
+    {
+      "name": "CoSignerRotated",
+      "discriminator": [
+        116,
+        211,
+        61,
+        169,
+        144,
+        197,
+        73,
+        230
+      ]
+    },
+    {
+      "name": "Deposited",
+      "discriminator": [
+        111,
+        141,
+        26,
+        45,
+        161,
+        35,
+        100,
+        57
+      ]
+    },
+    {
+      "name": "FactsSubmitted",
+      "discriminator": [
+        138,
+        169,
+        161,
+        193,
+        136,
+        55,
+        103,
+        129
+      ]
+    },
+    {
+      "name": "InterestAbsorbedEvent",
+      "discriminator": [
+        37,
+        17,
+        189,
+        68,
+        105,
+        180,
+        152,
+        157
+      ]
+    },
+    {
+      "name": "InventorySold",
+      "discriminator": [
+        5,
+        242,
+        97,
+        225,
+        76,
+        217,
+        76,
+        181
+      ]
+    },
+    {
+      "name": "InventoryWrittenOff",
+      "discriminator": [
+        161,
+        103,
+        242,
+        122,
+        64,
+        76,
+        57,
+        30
+      ]
+    },
+    {
+      "name": "PoolLiquidated",
+      "discriminator": [
+        246,
+        47,
+        14,
+        227,
+        96,
+        57,
+        101,
+        76
+      ]
+    },
+    {
+      "name": "VerdictOracleRotated",
+      "discriminator": [
+        206,
+        178,
+        78,
+        58,
+        11,
+        25,
+        168,
+        28
+      ]
+    },
+    {
+      "name": "WithdrawFinalized",
+      "discriminator": [
+        126,
+        103,
+        94,
+        154,
+        8,
+        130,
+        175,
+        176
+      ]
+    },
+    {
+      "name": "WithdrawRequested",
+      "discriminator": [
+        114,
+        16,
+        240,
+        206,
+        93,
+        128,
+        151,
+        39
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "MissingEd25519Instruction",
+      "msg": "No Ed25519 precompile instruction directly before this instruction"
+    },
+    {
+      "code": 6001,
+      "name": "MalformedEd25519Instruction",
+      "msg": "Ed25519 instruction data is malformed or offsets are out of bounds"
+    },
+    {
+      "code": 6002,
+      "name": "WrongSignatureCount",
+      "msg": "Ed25519 instruction must carry exactly one signature"
+    },
+    {
+      "code": 6003,
+      "name": "OffsetsOutsideEd25519Instruction",
+      "msg": "Ed25519 offsets must all point into the precompile instruction itself"
+    },
+    {
+      "code": 6004,
+      "name": "WrongVerdictSigner",
+      "msg": "Verdict was not signed by the configured oracle"
+    },
+    {
+      "code": 6005,
+      "name": "VerdictMessageMismatch",
+      "msg": "Signed message does not match this verdict"
+    },
+    {
+      "code": 6006,
+      "name": "VerdictNotTopLevel",
+      "msg": "Verdict must be attested by a top-level instruction"
+    },
+    {
+      "code": 6007,
+      "name": "VerdictExpired",
+      "msg": "Verdict deadline has passed"
+    },
+    {
+      "code": 6008,
+      "name": "VerdictDeadlineTooFar",
+      "msg": "Verdict deadline is too far in the future"
+    },
+    {
+      "code": 6009,
+      "name": "ClaimWindowExpired",
+      "msg": "The claim must be filed within the claim window of the liquidation"
+    },
+    {
+      "code": 6010,
+      "name": "InvalidAfterWindow",
+      "msg": "Check (b)'s reference-after timestamp is outside the allowed wait window"
+    },
+    {
+      "code": 6011,
+      "name": "GateNotElapsed",
+      "msg": "The 60-day gate has not elapsed yet"
+    },
+    {
+      "code": 6012,
+      "name": "WrongClaimStatus",
+      "msg": "Claim is not in the expected status for this instruction"
+    },
+    {
+      "code": 6013,
+      "name": "CooldownNotElapsed",
+      "msg": "Cooldown has not elapsed yet"
+    },
+    {
+      "code": 6014,
+      "name": "NotYetStale",
+      "msg": "Claim has not gone stale yet"
+    },
+    {
+      "code": 6015,
+      "name": "NotYetExpired",
+      "msg": "Queued claim has not reached the claim window yet"
+    },
+    {
+      "code": 6016,
+      "name": "BorrowerClaimsFull",
+      "msg": "Borrower already has an unresolved claim in this market"
+    },
+    {
+      "code": 6017,
+      "name": "PrivilegedPayout",
+      "msg": "Payout address cannot be a privileged role"
+    },
+    {
+      "code": 6018,
+      "name": "Unauthorized",
+      "msg": "Signer is not authorized for this action"
+    },
+    {
+      "code": 6019,
+      "name": "InvalidParams",
+      "msg": "Parameter is outside its hard bounds"
+    },
+    {
+      "code": 6020,
+      "name": "ZeroAmount",
+      "msg": "Amount must be greater than zero"
+    },
+    {
+      "code": 6021,
+      "name": "InsufficientBalance",
+      "msg": "Not enough shares or balance"
+    },
+    {
+      "code": 6022,
+      "name": "NoWithdrawalPending",
+      "msg": "No withdrawal has been requested"
+    },
+    {
+      "code": 6023,
+      "name": "WithdrawalNotReady",
+      "msg": "Withdrawal delay has not elapsed"
+    },
+    {
+      "code": 6024,
+      "name": "RecordMismatch",
+      "msg": "Attestation does not match the liquidation record supplied"
+    },
+    {
+      "code": 6025,
+      "name": "IssuerHaltedLiquidation",
+      "msg": "Liquidation happened while the issuer had intervened; never covered"
+    },
+    {
+      "code": 6026,
+      "name": "SelfDealtLiquidation",
+      "msg": "Liquidator and borrower are the same party"
+    },
+    {
+      "code": 6027,
+      "name": "BorrowerIsABacker",
+      "msg": "A backer cannot be paid from the pool they back"
+    },
+    {
+      "code": 6028,
+      "name": "NothingToPay",
+      "msg": "Backstop has no capital available to pay"
+    },
+    {
+      "code": 6029,
+      "name": "NoBadDebt",
+      "msg": "Market has no uncovered bad debt"
+    },
+    {
+      "code": 6030,
+      "name": "MathOverflow",
+      "msg": "Arithmetic overflow"
+    },
+    {
+      "code": 6031,
+      "name": "NotUpgradeAuthority",
+      "msg": "Only the program's upgrade authority can initialize"
+    },
+    {
+      "code": 6032,
+      "name": "PausedForInventory",
+      "msg": "Deposits and withdrawals pause while the pool holds inventory"
+    },
+    {
+      "code": 6033,
+      "name": "BelowMinPoolRepay",
+      "msg": "Repay amount, after caps, is below the minimum the pool will liquidate for"
+    },
+    {
+      "code": 6034,
+      "name": "NotFrozenOrHalted",
+      "msg": "write_off_inventory is only for a market the issuer has frozen or halted"
+    },
+    {
+      "code": 6035,
+      "name": "ResaleBlocked",
+      "msg": "Resale is blocked while the price is flagged or a corporate-action hold is active"
+    },
+    {
+      "code": 6036,
+      "name": "PriceAboveMax",
+      "msg": "Sale price exceeds the buyer's max_price_per_share"
+    },
+    {
+      "code": 6037,
+      "name": "NothingToBuy",
+      "msg": "Nothing to buy: raw amount is zero or exceeds what the market's inventory holds"
+    },
+    {
+      "code": 6038,
+      "name": "MarketMismatch",
+      "msg": "Inventory account does not belong to the market supplied"
+    },
+    {
+      "code": 6039,
+      "name": "RoleCollision",
+      "msg": "admin, verdict_oracle and co_signer must all be distinct"
+    },
+    {
+      "code": 6040,
+      "name": "PrivilegedBorrower",
+      "msg": "Borrower cannot be a privileged role"
+    },
+    {
+      "code": 6041,
+      "name": "AttestationRevoked",
+      "msg": "This attestation was revoked before submission"
+    },
+    {
+      "code": 6042,
+      "name": "ClaimNotCancellable",
+      "msg": "Claim is not in a cancellable status"
+    },
+    {
+      "code": 6043,
+      "name": "AlreadySuspended",
+      "msg": "Claim is already suspended"
+    },
+    {
+      "code": 6044,
+      "name": "NotSuspended",
+      "msg": "Claim is not suspended"
+    },
+    {
+      "code": 6045,
+      "name": "ClaimSuspended",
+      "msg": "This claim is suspended"
+    },
+    {
+      "code": 6046,
+      "name": "CallerNotAdminOrCoSigner",
+      "msg": "Caller is neither the admin nor the co-signer"
+    },
+    {
+      "code": 6047,
+      "name": "OverrideParamsMismatch",
+      "msg": "Override parameters do not match the pending request"
+    },
+    {
+      "code": 6048,
+      "name": "OverrideAlreadyExecuted",
+      "msg": "This override request has already executed"
+    },
+    {
+      "code": 6049,
+      "name": "ClaimAlreadyCompleted",
+      "msg": "A completed claim cannot be overridden"
+    }
+  ],
+  "types": [
+    {
+      "name": "AttestationRevokedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "liquidation_record",
+            "type": "pubkey"
+          },
+          {
+            "name": "evidence_hash",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "Backer",
+      "docs": [
+        "One backer's stake in the pool."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "version",
+            "type": "u8"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "shares",
+            "type": "u128"
+          },
+          {
+            "name": "withdraw_shares",
+            "docs": [
+              "Shares queued for exit, and when the queue started. Zero when no exit is pending."
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "withdraw_requested_at",
+            "type": "i64"
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "BackstopConfig",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "version",
+            "type": "u8"
+          },
+          {
+            "name": "admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "verdict_oracle",
+            "docs": [
+              "Throwaway per-chain Ed25519 key. Never the production KMS key."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "co_signer",
+            "docs": [
+              "Phase 4: the second signer of the 2-of-2 override. Always distinct from `admin` and",
+              "`verdict_oracle` (LOCKED verdict spec: \"admin ≠ oracle ≠ co-signer, at init and on every",
+              "setter\"), enforced at `initialize_backstop` and every one of the three setters."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "cluster_tag",
+            "docs": [
+              "Bound into every signed verdict so a devnet signature can never verify on mainnet."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "usdc_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "cash",
+            "docs": [
+              "Backer capital actually paid in, tracked internally. Never read from the token account, so a",
+              "raw transfer into the vault cannot move the share price (same rule as the lending market)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_shares",
+            "type": "u128"
+          },
+          {
+            "name": "per_claim_cap_bps",
+            "docs": [
+              "Ceiling on a single claim's admission, as a share of cash checked at admission time. A loss",
+              "above it never shrinks — it queues until cash grows or utilisation falls enough to admit it."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "reserved_total",
+            "docs": [
+              "Sum of `loss − streamed` across every `Active` claim. Backers may withdraw `cash −",
+              "reserved_total`; a queued or held claim reserves nothing until it is actually admitted."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "admission_day",
+            "docs": [
+              "Day bucket (`now / DAY_SECS`) the admission counter below is tracking."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "admitted_today",
+            "docs": [
+              "Cumulative loss admitted so far within `admission_day`."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "withdraw_delay_secs",
+            "docs": [
+              "Delay between requesting an exit and taking the money."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "inventory_cost_total",
+            "docs": [
+              "Phase 3 (pool-as-liquidator). Sum of every market's `Inventory.cost_total`: while positive,",
+              "`deposit` and `finalize_withdraw` refuse (D4) -- backers cannot buy in cheap right after a",
+              "liquidation or exit before a crash-holding is resolved."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "per_liq_cap_bps",
+            "docs": [
+              "Max share of `cash` a single `pool_liquidate` call may spend."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "daily_liq_cap_bps",
+            "docs": [
+              "Max share of `cash` `pool_liquidate` may spend across one day, combined."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "liq_day",
+            "docs": [
+              "Day bucket (`now / DAY_SECS`) `liq_spent_today` is tracking. Separate from the claim",
+              "admission day counter -- liquidation draws and claim admissions are different budgets."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "liq_spent_today",
+            "type": "u64"
+          },
+          {
+            "name": "resale_discount_bps",
+            "docs": [
+              "Resale discount off the healthy price, and how long a fresh acquisition may not be resold",
+              "below its own cost (locked: never below cost for the first 4 days)."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "resale_floor_secs",
+            "type": "i64"
+          },
+          {
+            "name": "fee_share_bps",
+            "docs": [
+              "Crank fee, as a share of the liquidation bonus the pool captured (D6). Paid to whoever calls",
+              "`pool_liquidate`, from cash, after the CPI succeeds."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "min_pool_repay",
+            "docs": [
+              "Below this, `pool_liquidate` does not fire -- a real liquidation is always well above it; this",
+              "only blocks dust-repay fee farming (E6)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "gate_secs",
+            "docs": [
+              "Phase 5 (A5): admin-settable claim timings, bounded per `cluster_tag` by `set_claim_timing`."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "cooldown_secs",
+            "type": "i64"
+          },
+          {
+            "name": "stream_secs",
+            "type": "i64"
+          },
+          {
+            "name": "inactivity_secs",
+            "type": "i64"
+          },
+          {
+            "name": "min_after_wait_secs",
+            "type": "i64"
+          },
+          {
+            "name": "reserved",
+            "docs": [
+              "Room for later fields without a migration (U4)."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                16
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "BadDebtCover",
+      "docs": [
+        "Running total of bad debt the backstop has reimbursed one market for. Makes `cover_bad_debt`",
+        "idempotent against the market's own monotonic counter, with no epochs to coordinate."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "version",
+            "type": "u8"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "total_paid",
+            "type": "u64"
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "BadDebtReimbursed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "paid",
+            "type": "u64"
+          },
+          {
+            "name": "cumulative",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "BorrowerClaims",
+      "docs": [
+        "One per (market, borrower). Tracks the single live claim slot for that pair — phase 2 keeps one",
+        "slot, not the locked spec's separate open+queued pair (see job memory: a second facts submission",
+        "while one is unresolved is refused outright rather than queued in parallel)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "version",
+            "type": "u8"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "borrower",
+            "type": "pubkey"
+          },
+          {
+            "name": "open",
+            "docs": [
+              "`Pubkey::default()` when free. Cleared to the new claim once the occupant is terminal."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "penalty_since",
+            "docs": [
+              "Phase 4: both set together by `cancel_claim` when a cancelled claim had already started",
+              "streaming — `penalty_since` at the cancellation, `penalty_until` 365 days later.",
+              "`submit_facts` denies (`deny_reason::PENALTY_ACTIVE`, does not revert) any liquidation whose",
+              "debt-weighted `borrow_age_ts` falls inside `[penalty_since, penalty_until)` — \"no coverage",
+              "on new loans for 365 days\" (LOCKED verdict spec), scoped to this exact (market, borrower)",
+              "pair. The lower bound matters: without it, a loan opened long before the penalty would",
+              "still satisfy `borrow_age_ts < penalty_until` forever, since that bound sits in the future",
+              "by construction — an old, already-covered loan must never be caught by a later penalty."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "penalty_until",
+            "type": "i64"
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "Claim",
+      "docs": [
+        "One per liquidation. `init` is the idempotency: a second facts submission for the same",
+        "liquidation cannot create this twice, so a replayed transaction cannot open a second claim."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "version",
+            "type": "u8"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "borrower",
+            "type": "pubkey"
+          },
+          {
+            "name": "liquidation_record",
+            "type": "pubkey"
+          },
+          {
+            "name": "payout",
+            "docs": [
+              "Frozen at submission from the liquidation record; the eventual payout destination."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "status",
+            "type": {
+              "defined": {
+                "name": "ClaimStatus"
+              }
+            }
+          },
+          {
+            "name": "deny_reason",
+            "type": "u16"
+          },
+          {
+            "name": "loss",
+            "docs": [
+              "`safu_core::wrongful_loss`, computed once at submission. Zero on a denied claim."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "streamed",
+            "docs": [
+              "Cumulative amount actually paid out via `claim_stream`."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "submitted_at",
+            "type": "i64"
+          },
+          {
+            "name": "liquidated_at",
+            "docs": [
+              "When this liquidation happened (`LiquidationRecord.ts`), copied here so later instructions",
+              "never need to re-fetch the vault's record."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "releasable_at",
+            "docs": [
+              "`PendingTime` only: when the 60-day gate clears and `unlock_claim` may be called."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "admitted_at",
+            "docs": [
+              "`Active` only: when admission happened."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "cooldown_end",
+            "type": "i64"
+          },
+          {
+            "name": "stream_end",
+            "type": "i64"
+          },
+          {
+            "name": "snapshot_cash",
+            "docs": [
+              "`cash` at the moment of admission — the outflow cap's floor, so a claim admitted against a",
+              "large pool cannot be strangled if the pool later shrinks."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "last_pull_day",
+            "type": "i64"
+          },
+          {
+            "name": "pulled_today",
+            "type": "u64"
+          },
+          {
+            "name": "last_activity_ts",
+            "docs": [
+              "Updated at admission and at every successful pull. `expire_stale` reads it."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "evidence_hash",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "suspended",
+            "docs": [
+              "Phase 4 (suspend/unsuspend). While true, every permissionless progression instruction",
+              "(`unlock_claim`, `try_release_queued`, `expire_queued`, `expire_stale`, `claim_stream`)",
+              "refuses. `suspended_since` is the wall-clock moment suspension began (0 when not",
+              "suspended); on `unsuspend_claim` its duration is folded into `suspended_secs`."
+            ],
+            "type": "bool"
+          },
+          {
+            "name": "suspended_since",
+            "type": "i64"
+          },
+          {
+            "name": "suspended_secs",
+            "docs": [
+              "Cumulative seconds this claim has ever spent suspended. Subtracted from elapsed time in",
+              "`expire_queued`/`expire_stale` so a suspension genuinely freezes those clocks rather than",
+              "merely delaying when they are checked (LOCKED verdict spec: \"expiry clocks stop while",
+              "suspended and reset on unsuspend\")."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "vest_origin",
+            "docs": [
+              "Reference point `claim_stream` measures vesting elapsed-time from. Defaults to",
+              "`cooldown_end` (identical to reading `cooldown_end` directly) for every ordinary",
+              "admission. A 2-of-2 override that carries a prior `streamed` amount forward shifts this",
+              "backward by that amount's time-equivalent, so vesting resumes from where it left off",
+              "instead of re-streaming the already-paid portion a second time."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "inactivity_secs",
+            "docs": [
+              "Phase 5: `BackstopConfig.inactivity_secs` copied at admission, so a later change never shortens or",
+              "lengthens an already-admitted claim's expiry. The stream length is likewise frozen as",
+              "`stream_end − cooldown_end`."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                8
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ClaimCancelled",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "claim",
+            "type": "pubkey"
+          },
+          {
+            "name": "reason_code",
+            "type": "u16"
+          },
+          {
+            "name": "penalized",
+            "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ClaimOverridden",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "claim",
+            "type": "pubkey"
+          },
+          {
+            "name": "ref_at_liq",
+            "type": "u64"
+          },
+          {
+            "name": "loss",
+            "type": "u64"
+          },
+          {
+            "name": "status",
+            "type": {
+              "defined": {
+                "name": "ClaimStatus"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ClaimStatus",
+      "type": {
+        "kind": "enum",
+        "variants": [
+          {
+            "name": "Denied"
+          },
+          {
+            "name": "PendingTime"
+          },
+          {
+            "name": "Queued"
+          },
+          {
+            "name": "Active"
+          },
+          {
+            "name": "Completed"
+          },
+          {
+            "name": "Expired"
+          },
+          {
+            "name": "Cancelled"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ClaimStatusChanged",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "claim",
+            "type": "pubkey"
+          },
+          {
+            "name": "status",
+            "type": {
+              "defined": {
+                "name": "ClaimStatus"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ClaimStreamed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "claim",
+            "type": "pubkey"
+          },
+          {
+            "name": "pull",
+            "type": "u64"
+          },
+          {
+            "name": "streamed",
+            "type": "u64"
+          },
+          {
+            "name": "completed",
+            "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ClaimSuspendChanged",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "claim",
+            "type": "pubkey"
+          },
+          {
+            "name": "suspended",
+            "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ClaimTimingSet",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "gate_secs",
+            "type": "i64"
+          },
+          {
+            "name": "cooldown_secs",
+            "type": "i64"
+          },
+          {
+            "name": "stream_secs",
+            "type": "i64"
+          },
+          {
+            "name": "inactivity_secs",
+            "type": "i64"
+          },
+          {
+            "name": "min_after_wait_secs",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "CoSignerRotated",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "co_signer",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Deposited",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "shares",
+            "type": "u128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FactsArgs",
+      "docs": [
+        "The oracle-signed facts (LOCKED verdict spec): a reference price at the liquidation, a reference",
+        "price after a wait to prove the move didn't hold, and an evidence hash. No payout amount, no",
+        "tier — the program computes and bounds the loss itself from these plus on-chain state."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "liquidation_record",
+            "type": "pubkey"
+          },
+          {
+            "name": "borrower",
+            "type": "pubkey"
+          },
+          {
+            "name": "ref_at_liq",
+            "docs": [
+              "USD per whole share, 8 decimals, independent of the feed that liquidated."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "ref_after",
+            "docs": [
+              "Same reference source, sampled `after_ts`."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "after_ts",
+            "docs": [
+              "Unix seconds the second sample was taken. Must be `MIN_AFTER_WAIT_SECS..=MAX_AFTER_WAIT_SECS`",
+              "after the liquidation."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "evidence_hash",
+            "docs": [
+              "sha256 over the verdict evidence, including the archived reference-price responses."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "deadline",
+            "docs": [
+              "Unix seconds. The submission must land at or before this time."
+            ],
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "FactsSubmitted",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "claim",
+            "type": "pubkey"
+          },
+          {
+            "name": "liquidation_record",
+            "type": "pubkey"
+          },
+          {
+            "name": "borrower",
+            "type": "pubkey"
+          },
+          {
+            "name": "status",
+            "type": {
+              "defined": {
+                "name": "ClaimStatus"
+              }
+            }
+          },
+          {
+            "name": "deny_reason",
+            "type": "u16"
+          },
+          {
+            "name": "loss",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "InterestAbsorbed",
+      "docs": [
+        "Running total of interest the pool has recognised from one market, mirroring",
+        "`Market.backer_interest_paid_cumulative` so repeat `absorb_interest` calls settle only the",
+        "remainder and a raw donation into the USDC vault is never counted (2c pattern, in reverse)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "version",
+            "type": "u8"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "total_absorbed",
+            "type": "u64"
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "InterestAbsorbedEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "credited",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Inventory",
+      "docs": [
+        "One per market (phase 3). Collateral the pool holds after liquidating through it, priced at cost",
+        "until resold. `cost_total` doubles as this market's contribution to `BackstopConfig.inventory_cost_total`",
+        "(the deposit/withdraw pause signal, D4) and as the resale floor's basis."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "version",
+            "type": "u8"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "raw",
+            "docs": [
+              "Raw collateral currently held."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "cost_total",
+            "docs": [
+              "USDC the pool paid to acquire what it currently holds. Falls pro-rata to raw sold on resale."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "last_acquired_at",
+            "type": "i64"
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "InventorySold",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "raw",
+            "type": "u64"
+          },
+          {
+            "name": "sale_value",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "InventoryWrittenOff",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "raw_stranded",
+            "type": "u64"
+          },
+          {
+            "name": "cost_written_off",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "LiquidationRecord",
+      "docs": [
+        "Immutable snapshot of one liquidation.",
+        "",
+        "The verdict engine decides wrongfulness off-chain, so it must be able to re-derive the decision",
+        "from what the contract actually used — not from whatever the feed says later. Every input that",
+        "fed the seizure is recorded here, including `issuer_halt` at the time, because a liquidation",
+        "taken while the issuer had intervened is excluded from cover (spec 14a)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "version",
+            "type": "u8"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "seq",
+            "type": "u64"
+          },
+          {
+            "name": "borrower",
+            "type": "pubkey"
+          },
+          {
+            "name": "liquidator",
+            "type": "pubkey"
+          },
+          {
+            "name": "seized_raw",
+            "docs": [
+              "Raw collateral handed to the liquidator."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "debt_repaid",
+            "docs": [
+              "USDC the liquidator repaid on the borrower's behalf."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "multiplier_fp",
+            "docs": [
+              "Effective multiplier used for the valuation, in `MULT_SCALE` fixed point."
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "price_fp",
+            "docs": [
+              "TWAP the seizure was priced at, 8 decimals."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "collateral_decimals",
+            "type": "u8"
+          },
+          {
+            "name": "bonus_bps",
+            "type": "u32"
+          },
+          {
+            "name": "ltv_bps",
+            "docs": [
+              "Position LTV at the moment of seizure."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "coverage_bps",
+            "docs": [
+              "Coverage in force for this borrower when the loan was opened (U3)."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "borrow_age_ts",
+            "docs": [
+              "The loan's debt-weighted borrow time at the moment of liquidation (for the 60-day gate)."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "payout",
+            "docs": [
+              "Payback address at the moment of liquidation. Frozen here; later changes cannot redirect it."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "bad_debt",
+            "docs": [
+              "Debt written off because the collateral ran out, 0 in the normal case."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "ts",
+            "type": "i64"
+          },
+          {
+            "name": "slot",
+            "type": "u64"
+          },
+          {
+            "name": "issuer_halt",
+            "type": "bool"
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "LiquidationTerms",
+      "docs": [
+        "The terms that decide when, and how hard, an existing loan is liquidated. Changes that tighten them",
+        "ramp in over `LIQUIDATION_TERMS_RAMP_SECS`, so no borrower is liquidated overnight by a number change."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "liq_threshold_bps",
+            "type": "u32"
+          },
+          {
+            "name": "insolvency_ltv_bps",
+            "type": "u32"
+          },
+          {
+            "name": "close_factor_bps",
+            "type": "u32"
+          },
+          {
+            "name": "min_liq_bonus_bps",
+            "type": "u32"
+          },
+          {
+            "name": "max_liq_bonus_bps",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Market",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "version",
+            "type": "u8"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "collateral_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "usdc_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "collateral_decimals",
+            "type": "u8"
+          },
+          {
+            "name": "usdc_decimals",
+            "type": "u8"
+          },
+          {
+            "name": "params",
+            "type": {
+              "defined": {
+                "name": "MarketParams"
+              }
+            }
+          },
+          {
+            "name": "price",
+            "type": {
+              "defined": {
+                "name": "PriceState"
+              }
+            }
+          },
+          {
+            "name": "cash",
+            "docs": [
+              "USDC held, tracked internally. Never inferred from the vault balance (donation attacks)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_supply_shares",
+            "type": "u128"
+          },
+          {
+            "name": "total_borrow_shares",
+            "type": "u128"
+          },
+          {
+            "name": "borrow_index",
+            "docs": [
+              "Debt index, 1.0 == safu_core::lending::INDEX_SCALE."
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "last_accrual_ts",
+            "type": "i64"
+          },
+          {
+            "name": "total_collateral_raw",
+            "docs": [
+              "Sum of all positions' raw collateral, for reconciliation against the vault (review D4)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "bad_debt",
+            "docs": [
+              "Bad debt still uncovered. Falls when the backstop reimburses it."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "bad_debt_cumulative",
+            "docs": [
+              "Every write-off this market has ever taken, monotonic. The backstop compares its own running",
+              "total against this to work out what it still owes, which makes reimbursement idempotent with",
+              "no epoch counter to keep in step."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "issuer_halt",
+            "type": "bool"
+          },
+          {
+            "name": "liq_seq",
+            "type": "u64"
+          },
+          {
+            "name": "observed_multiplier_fp",
+            "docs": [
+              "Effective multiplier this market last acted on, in `MULT_SCALE` fixed point. The baseline the",
+              "unannounced-change guard compares the live value against. Seeded by `create_market`; 0 means",
+              "\"not yet observed\", which the guard treats as no change rather than as a change from zero."
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "ramp_from",
+            "docs": [
+              "Where the current liquidation-terms ramp started from, and when (U3). The target is `params`.",
+              "Taken from the old 40 reserved bytes (20 + 8), so the account size is unchanged (U4)."
+            ],
+            "type": {
+              "defined": {
+                "name": "LiquidationTerms"
+              }
+            }
+          },
+          {
+            "name": "ramp_start_ts",
+            "type": "i64"
+          },
+          {
+            "name": "backer_interest_owed",
+            "docs": [
+              "Interest credited to backers but not yet paid out (eng review addendum). Excluded from",
+              "`total_assets`, so lenders' share price reflects only their 85% (2c pattern, in reverse)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "backer_interest_cumulative",
+            "docs": [
+              "Monotonic total ever credited, mirrored by `InterestAbsorbed.total_absorbed` on the backstop",
+              "side so repeat `absorb_interest` calls settle only the remainder."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "backer_interest_paid_cumulative",
+            "docs": [
+              "Monotonic total ever transferred to the pool via `pay_backer_interest`."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "issuer_loss_cumulative",
+            "docs": [
+              "Debt written off on positions whose collateral the issuer seized (`write_down_collateral`). Kept apart",
+              "from `bad_debt_cumulative` on purpose: the backstop reimburses only that counter, and issuer actions are",
+              "never covered (spec 14a) -- lenders carry this loss, as they carry it on every market holding this token.",
+              "Taken from the old 12 reserved bytes, so the account size is unchanged (U4)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                4
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketParams",
+      "docs": [
+        "Admin-settable within hard bounds (U2). Values and the evidence behind each:",
+        "`outputs/2026-09-14_stocklana-market-config-research.md` §2b (research-ops)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "ltv_bps",
+            "docs": [
+              "Borrowing limit. AAPLx: 4_000 (matched to the market leader)."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "liq_threshold_bps",
+            "docs": [
+              "Liquidation line. AAPLx: 5_000."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "min_liq_bonus_bps",
+            "docs": [
+              "Dynamic liquidation bonus: max(min, LTV − threshold), capped at max and at 100% − LTV. 100 / 500."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "max_liq_bonus_bps",
+            "type": "u32"
+          },
+          {
+            "name": "insolvency_ltv_bps",
+            "docs": [
+              "Above this LTV the whole debt may be liquidated at once. 9_500."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "close_factor_bps",
+            "docs": [
+              "Share of debt repayable per liquidation below the insolvency line. 2_500."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "max_liquidation_debt",
+            "docs": [
+              "USDC base units per liquidation, sized from measured collateral liquidity ($100K)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "deviation_cap_bps",
+            "docs": [
+              "Single-update spike cap vs TWAP. 500 (US LULD Tier 1 band)."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "activation_pause_secs",
+            "docs": [
+              "Issuer-recommended pause around every multiplier activation. 900 s."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "split_cap_bps",
+            "docs": [
+              "A multiplier change above this is a split / reverse split. 500."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "split_max_hold_secs",
+            "docs": [
+              "Longest a split can hold risk actions while waiting for a market-open price. 86_400 s."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "borrow_max_price_age_secs",
+            "docs": [
+              "Borrow / withdraw need a price at most this old while the market is open. 3_600 s."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "liquidation_max_price_age_open_secs",
+            "docs": [
+              "Liquidation price age limit while open (feed's own 0.5% / 24h guarantee + 1h). 90_000 s."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "max_price_age_closed_secs",
+            "docs": [
+              "Any action while the underlying market is closed (longest US closure ≈ 89.5h). 345_600 s."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "rate",
+            "type": {
+              "defined": {
+                "name": "RateParams"
+              }
+            }
+          },
+          {
+            "name": "borrow_cap",
+            "docs": [
+              "Total USDC that may be lent (backstop sizing rule, 10:1). Base units."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "collateral_cap_raw",
+            "docs": [
+              "Total raw collateral accepted."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "backer_interest_share_bps",
+            "docs": [
+              "Share of accrued borrower interest credited to backers, bounded <= 5_000 (founder-locked at",
+              "1_500 = 15%; eng review addendum 2026-09-14). A change applies to interest accrued after it."
+            ],
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "OverrideRequest",
+      "docs": [
+        "One per liquidation (`[OVERRIDE_SEED, liquidation_record]`), opened permissionlessly via",
+        "`open_override` ahead of the first `approve_override` call. Mirrors the Soroban",
+        "`protection-pool` 2-of-2 pattern: each approver's own current key is recorded, not just \"an",
+        "approval happened,\" so a key rotation between the two calls correctly un-readies a stale",
+        "approval rather than letting it silently carry over (`approve_override` re-checks against",
+        "`BackstopConfig`'s *current* admin/co_signer every call, never a cached value)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "version",
+            "type": "u8"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "liquidation_record",
+            "type": "pubkey"
+          },
+          {
+            "name": "ref_at_liq",
+            "docs": [
+              "The independently-supplied reference price both approvers must agree on byte-for-byte."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "admin_approver",
+            "type": {
+              "option": "pubkey"
+            }
+          },
+          {
+            "name": "co_signer_approver",
+            "type": {
+              "option": "pubkey"
+            }
+          },
+          {
+            "name": "executed",
+            "docs": [
+              "Guards against a third call re-executing after both approvals already fired once."
+            ],
+            "type": "bool"
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                16
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "PoolLiquidated",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "seized_raw",
+            "type": "u64"
+          },
+          {
+            "name": "debt_repaid",
+            "type": "u64"
+          },
+          {
+            "name": "bonus_bps",
+            "type": "u32"
+          },
+          {
+            "name": "fee",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PriceState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "prices",
+            "docs": [
+              "Ring buffer, USD per whole share with 8 decimals."
+            ],
+            "type": {
+              "array": [
+                "u64",
+                16
+              ]
+            }
+          },
+          {
+            "name": "timestamps",
+            "type": {
+              "array": [
+                "i64",
+                16
+              ]
+            }
+          },
+          {
+            "name": "head",
+            "docs": [
+              "Next write position."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "count",
+            "type": "u8"
+          },
+          {
+            "name": "last_price",
+            "type": "u64"
+          },
+          {
+            "name": "last_update",
+            "type": "i64"
+          },
+          {
+            "name": "last_close",
+            "type": "u64"
+          },
+          {
+            "name": "market_open",
+            "docs": [
+              "Whether the underlying equity market was open at the last accepted update."
+            ],
+            "type": "bool"
+          },
+          {
+            "name": "flagged",
+            "docs": [
+              "Set when an update broke the spike cap. Blocks borrowing and liquidation until cleared."
+            ],
+            "type": "bool"
+          },
+          {
+            "name": "flagged_price",
+            "docs": [
+              "The rejected price, so a second consecutive update confirming it can be accepted."
+            ],
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RateParams",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "base_bps",
+            "type": "u32"
+          },
+          {
+            "name": "slope1_bps",
+            "type": "u32"
+          },
+          {
+            "name": "slope2_bps",
+            "type": "u32"
+          },
+          {
+            "name": "kink_bps",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RevokedAttestation",
+      "docs": [
+        "Marks one specific oracle-signed-but-not-yet-submitted attestation as revoked (admin-only,",
+        "`revoke_attestation`). Keyed by `(liquidation_record, evidence_hash)` — the same two fields",
+        "that bind every `FactsArgs` payload for that liquidation — so `submit_facts` can refuse a",
+        "specific signed message without needing to have seen it yet. Existence alone is the signal:",
+        "the fields are stored only for readability off-chain, never re-checked on-chain beyond the",
+        "seeds that derived this account."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "version",
+            "type": "u8"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "liquidation_record",
+            "type": "pubkey"
+          },
+          {
+            "name": "evidence_hash",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "revoked_at",
+            "type": "i64"
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                16
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultConfig",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "version",
+            "type": "u8"
+          },
+          {
+            "name": "admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "feed_authority",
+            "docs": [
+              "Pushes prices through the mock adapter on devnet. Separate key from the verdict oracle."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "paused",
+            "type": "bool"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "pool_liquidator",
+            "docs": [
+              "The backstop pool's liquidator key (its config PDA). It may liquidate at once; anyone else only after",
+              "the grace period. Default = no pool registered, so the grace rule applies to every liquidator."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "fallback_grace_secs",
+            "docs": [
+              "How long a position must have been liquidatable before an outside liquidator may act. 900 s."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "cluster_tag",
+            "docs": [
+              "Which cluster this deployment is on (0 localnet, 1 devnet, 2 mainnet), set once at initialize with no",
+              "setter. Selects the time floors (eng review A5): mainnet may never shorten the grace below 5 min."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "reserved",
+            "docs": [
+              "Taken from the old 64 reserved bytes (32 + 8 + 1), so the account size is unchanged (U4)."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                23
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "VerdictOracleRotated",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "verdict_oracle",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "WithdrawFinalized",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "shares",
+            "type": "u128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "WithdrawRequested",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "shares",
+            "type": "u128"
+          }
+        ]
+      }
+    }
+  ]
+}

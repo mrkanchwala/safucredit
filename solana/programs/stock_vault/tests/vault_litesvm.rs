@@ -2321,6 +2321,21 @@ impl Env {
         }
     }
 
+    fn write_down_ix(&self, admin: &Pubkey, owner: &Pubkey, amount: u64) -> Instruction {
+        Instruction {
+            program_id: stock_vault::ID,
+            accounts: stock_vault::accounts::WriteDownCollateral {
+                admin: *admin,
+                config: pda(&[VCONFIG_SEED]),
+                market: self.market(),
+                position: self.position(owner),
+                collateral_vault: self.coll_vault(),
+            }
+            .to_account_metas(None),
+            data: stock_vault::instruction::WriteDownCollateral { amount }.data(),
+        }
+    }
+
     fn sync_issuer_ix(&self) -> Instruction {
         Instruction {
             program_id: stock_vault::ID,
@@ -3104,4 +3119,127 @@ fn a_separate_payer_covers_the_record_rent_for_a_liquidator_with_no_sol() {
     env.ok(&[ix], &[&bob, &broke]);
     assert_eq!(env.svm.get_balance(&broke.pubkey()).unwrap_or(0), 0);
     assert_eq!(env.record_state(0).liquidator, broke.pubkey());
+}
+
+// ------------------------------------------------------------------ issuer seizure write-down
+
+#[test]
+fn an_issuer_seizure_is_written_down_and_the_market_recovers() {
+    let mut env = lending_env();
+    let (admin, alice) = (env.admin.insecure_clone(), env.alice.insecure_clone());
+    let before = env.position_state(&alice.pubkey());
+    let total_before = env.market_state().total_collateral_raw;
+
+    // Nothing is missing yet: there is nothing to write down.
+    let ix = env.write_down_ix(&admin.pubkey(), &alice.pubkey(), 1);
+    assert_program_error(env.send(&[ix], &[&admin]), VaultError::WriteDownTooLarge);
+
+    env.shrink_vault_balance(ONE_SHARE);
+    env.ok(&[env.sync_issuer_ix()], &[&admin]);
+    assert!(
+        env.market_state().issuer_halt,
+        "a short vault halts the market"
+    );
+
+    let ix = env.write_down_ix(&alice.pubkey(), &alice.pubkey(), ONE_SHARE);
+    assert_program_error(env.send(&[ix], &[&alice]), VaultError::Unauthorized);
+    env.warp(1);
+    let ix = env.write_down_ix(&admin.pubkey(), &alice.pubkey(), ONE_SHARE + 1);
+    assert_program_error(env.send(&[ix], &[&admin]), VaultError::WriteDownTooLarge);
+
+    let ix = env.write_down_ix(&admin.pubkey(), &alice.pubkey(), ONE_SHARE);
+    env.ok(&[ix], &[&admin]);
+    let after = env.position_state(&alice.pubkey());
+    assert_eq!(after.raw_collateral, before.raw_collateral - ONE_SHARE);
+    assert!(after.issuer_seized);
+    assert_eq!(after.seized_raw_total, ONE_SHARE);
+    assert_eq!(
+        after.debt_shares, before.debt_shares,
+        "debt stays while collateral remains"
+    );
+    assert_eq!(
+        env.market_state().total_collateral_raw,
+        total_before - ONE_SHARE
+    );
+
+    env.warp(1);
+    let ix = env.write_down_ix(&admin.pubkey(), &alice.pubkey(), 1);
+    assert_program_error(env.send(&[ix], &[&admin]), VaultError::WriteDownTooLarge);
+
+    env.warp(1);
+    env.ok(&[env.sync_issuer_ix()], &[&admin]);
+    assert!(
+        !env.market_state().issuer_halt,
+        "books match again: the halt lifts"
+    );
+
+    // A seized position can still be liquidated, but its record is marked so no payback claim can use it.
+    let (liq, lu, lc) = env.new_liquidator(10_000 * USDC);
+    env.walk_price_to(PRICE * 70 / 100);
+    let seq = env.market_state().liq_seq;
+    env.warp(60);
+    let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 10_000 * USDC);
+    env.ok(&[ix], &[&liq]);
+    assert!(env.record_state(seq).issuer_halt);
+}
+
+#[test]
+fn writing_down_all_collateral_books_the_debt_as_issuer_loss_not_bad_debt() {
+    let mut env = lending_env();
+    let (admin, alice) = (env.admin.insecure_clone(), env.alice.insecure_clone());
+    let raw = env.position_state(&alice.pubkey()).raw_collateral;
+    let borrow_shares_before = env.market_state().total_borrow_shares;
+    assert!(env.position_state(&alice.pubkey()).debt_shares > 0);
+
+    env.shrink_vault_balance(raw);
+    let ix = env.write_down_ix(&admin.pubkey(), &alice.pubkey(), raw);
+    env.ok(&[ix], &[&admin]);
+
+    let p = env.position_state(&alice.pubkey());
+    let m = env.market_state();
+    assert_eq!(p.raw_collateral, 0);
+    assert_eq!(p.debt_shares, 0);
+    assert!(
+        m.issuer_loss_cumulative > 0,
+        "the unpayable debt is booked as issuer loss"
+    );
+    assert_eq!(
+        m.bad_debt, 0,
+        "and never as bad debt the backstop would reimburse"
+    );
+    assert_eq!(m.bad_debt_cumulative, 0);
+    assert!(m.total_borrow_shares < borrow_shares_before);
+}
+
+#[test]
+fn a_seized_position_liquidated_into_shortfall_is_issuer_loss_not_bad_debt() {
+    let mut env = lending_env();
+    let (admin, alice) = (env.admin.insecure_clone(), env.alice.insecure_clone());
+    let raw = env.position_state(&alice.pubkey()).raw_collateral;
+    // The issuer takes all but one share; what remains cannot cover the loan.
+    env.shrink_vault_balance(raw - ONE_SHARE);
+    let ix = env.write_down_ix(&admin.pubkey(), &alice.pubkey(), raw - ONE_SHARE);
+    env.ok(&[ix], &[&admin]);
+    env.ok(&[env.sync_issuer_ix()], &[&admin]);
+    assert!(!env.market_state().issuer_halt);
+
+    let (liq, lu, lc) = env.new_liquidator(50_000 * USDC);
+    env.warp(60);
+    let seq = env.market_state().liq_seq;
+    let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 50_000 * USDC);
+    env.ok(&[ix], &[&liq]);
+
+    let record = env.record_state(seq);
+    assert!(
+        record.bad_debt > 0,
+        "the remaining collateral could not cover the loan"
+    );
+    assert!(record.issuer_halt);
+    let m = env.market_state();
+    assert_eq!(m.issuer_loss_cumulative, record.bad_debt);
+    assert_eq!(m.bad_debt, 0);
+    assert_eq!(
+        m.bad_debt_cumulative, 0,
+        "the backstop must never see this as reimbursable"
+    );
 }

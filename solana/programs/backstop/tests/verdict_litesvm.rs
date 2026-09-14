@@ -178,7 +178,8 @@ fn setup(cluster_tag: u8) -> Env {
         backer_interest_owed: 0,
         backer_interest_cumulative: 0,
         backer_interest_paid_cumulative: 0,
-        reserved: [0; 12],
+        issuer_loss_cumulative: 0,
+        reserved: [0; 4],
     };
     set_state(&mut svm, market_key, stock_vault::ID, &market);
 

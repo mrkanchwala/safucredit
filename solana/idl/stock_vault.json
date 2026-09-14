@@ -1,0 +1,4162 @@
+{
+  "address": "GkQw6VGDKYBWJtgtWUmFDkHNqGrnyjSviQeQzVMW35K2",
+  "metadata": {
+    "name": "stock_vault",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "description": "SAFU Credit: USDC loans against tokenized stocks, with wrongful-liquidation guards"
+  },
+  "instructions": [
+    {
+      "name": "absorb_bad_debt_cover",
+      "docs": [
+        "Credits USDC sitting in the market's vault beyond what the market has accounted for, against",
+        "bad debt. Permissionless and authority-free by construction.",
+        "",
+        "The backstop reimburses bad debt by simply transferring USDC into this market's USDC vault.",
+        "Cash is tracked internally precisely so a raw transfer cannot move the share price, which",
+        "means that reimbursement would otherwise sit unaccounted forever. This instruction is the one",
+        "place unaccounted surplus may be recognised, and it is bounded by `bad_debt` — so a stranger",
+        "donating tokens can repair a write-off but can never inflate the pool beyond it. Anything",
+        "above the outstanding bad debt stays unaccounted, exactly as before."
+      ],
+      "discriminator": [
+        163,
+        191,
+        226,
+        21,
+        99,
+        130,
+        53,
+        228
+      ],
+      "accounts": [
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.collateral_mint",
+                "account": "Market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "usdc_vault",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  117,
+                  115,
+                  100,
+                  99,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "acknowledge_multiplier",
+      "docs": [
+        "Clears a hold raised by `unobserved_multiplier_change`. The feed authority or the admin",
+        "attests that the price feed and the token's multiplier are back in step, and the market",
+        "resumes against the new value.",
+        "",
+        "This is an operational gate on an unannounced corporate action, not a claims decision: it",
+        "cannot move anyone's money, cannot raise or lower a payout, and is recorded on-chain by the",
+        "event below."
+      ],
+      "discriminator": [
+        38,
+        173,
+        229,
+        210,
+        81,
+        212,
+        184,
+        236
+      ],
+      "accounts": [
+        {
+          "name": "authority",
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.collateral_mint",
+                "account": "Market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_mint",
+          "docs": [
+            "Read for the live multiplier schedule."
+          ]
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "borrow",
+      "discriminator": [
+        228,
+        253,
+        131,
+        202,
+        207,
+        116,
+        89,
+        18
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "signer": true,
+          "relations": [
+            "position"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.collateral_mint",
+                "account": "Market"
+              }
+            ]
+          },
+          "relations": [
+            "position"
+          ]
+        },
+        {
+          "name": "position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_mint",
+          "docs": [
+            "Read for the live multiplier schedule and issuer controls."
+          ]
+        },
+        {
+          "name": "usdc_mint"
+        },
+        {
+          "name": "owner_usdc",
+          "writable": true
+        },
+        {
+          "name": "usdc_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  117,
+                  115,
+                  100,
+                  99,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "usdc_token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "create_market",
+      "discriminator": [
+        103,
+        226,
+        97,
+        235,
+        200,
+        188,
+        251,
+        254
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_mint"
+        },
+        {
+          "name": "usdc_mint"
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "collateral_mint"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  108,
+                  108,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "usdc_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  117,
+                  115,
+                  100,
+                  99,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_token_program"
+        },
+        {
+          "name": "usdc_token_program"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "MarketParams"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "deposit_collateral",
+      "docs": [
+        "Adding collateral only reduces risk, so it is allowed while paused."
+      ],
+      "discriminator": [
+        156,
+        131,
+        142,
+        116,
+        146,
+        247,
+        162,
+        120
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "signer": true,
+          "relations": [
+            "position"
+          ]
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.collateral_mint",
+                "account": "Market"
+              }
+            ]
+          },
+          "relations": [
+            "position"
+          ]
+        },
+        {
+          "name": "position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_mint"
+        },
+        {
+          "name": "owner_collateral",
+          "writable": true
+        },
+        {
+          "name": "collateral_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  108,
+                  108,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "initialize_config",
+      "docs": [
+        "Only the program's upgrade authority may initialize, so nobody watching the deploy can call it",
+        "first and take admin. Initialize before any `--final`: a program with no upgrade authority can",
+        "never be initialized."
+      ],
+      "discriminator": [
+        208,
+        127,
+        21,
+        1,
+        194,
+        190,
+        196,
+        70
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "program",
+          "docs": [
+            "This program. Proves `program_data` belongs to it, not to a program the caller deployed."
+          ],
+          "address": "GkQw6VGDKYBWJtgtWUmFDkHNqGrnyjSviQeQzVMW35K2"
+        },
+        {
+          "name": "program_data"
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "feed_authority",
+          "type": "pubkey"
+        },
+        {
+          "name": "cluster_tag",
+          "type": "u8"
+        }
+      ]
+    },
+    {
+      "name": "liquidate",
+      "docs": [
+        "Permissionless liquidation of a position past its threshold.",
+        "",
+        "The liquidator repays USDC on the borrower's behalf and receives collateral at a bonus that",
+        "grows with how far the position has drifted, bounded by solvency, the close factor, and a",
+        "chunk cap sized from measured liquidity. Everything used to price the seizure is snapshotted",
+        "into a `LiquidationRecord`: the wrongful-liquidation verdict is decided off-chain against",
+        "exactly these inputs, and must never be re-derived from a later feed state."
+      ],
+      "discriminator": [
+        223,
+        179,
+        226,
+        125,
+        48,
+        46,
+        39,
+        74
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "docs": [
+            "Pays the record's rent. Separate from `liquidator` so the backstop pool, whose key is a program-owned",
+            "PDA that cannot fund an account, can liquidate with a crank wallet paying the rent (eng review A1)."
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "liquidator",
+          "docs": [
+            "Authorizes the USDC in and receives the collateral out."
+          ],
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.collateral_mint",
+                "account": "Market"
+              }
+            ]
+          },
+          "relations": [
+            "position"
+          ]
+        },
+        {
+          "name": "position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "position.owner",
+                "account": "Position"
+              }
+            ]
+          }
+        },
+        {
+          "name": "record",
+          "docs": [
+            "Seeded by the market's own counter, so each liquidation gets its own immutable record and a",
+            "replayed transaction cannot overwrite an earlier one."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  108,
+                  105,
+                  113
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "market.liq_seq",
+                "account": "Market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_mint"
+        },
+        {
+          "name": "usdc_mint"
+        },
+        {
+          "name": "liquidator_usdc",
+          "writable": true
+        },
+        {
+          "name": "liquidator_collateral",
+          "writable": true
+        },
+        {
+          "name": "collateral_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  108,
+                  108,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "usdc_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  117,
+                  115,
+                  100,
+                  99,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_token_program"
+        },
+        {
+          "name": "usdc_token_program"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "repay_amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "mark_liquidatable",
+      "docs": [
+        "Permissionless. Records that a position can be liquidated right now (every liquidation guard passes and",
+        "it is past its line), or clears the record if it cannot. The pool may liquidate at any time; outside",
+        "liquidators only once the position has been marked for the grace period and the mark is still fresh.",
+        "A mark older than twice the grace period restarts the clock, so a position that recovered and fell",
+        "again gets the pool's full head start."
+      ],
+      "discriminator": [
+        214,
+        191,
+        84,
+        52,
+        246,
+        210,
+        126,
+        82
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.collateral_mint",
+                "account": "Market"
+              }
+            ]
+          },
+          "relations": [
+            "position"
+          ]
+        },
+        {
+          "name": "position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "position.owner",
+                "account": "Position"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_mint"
+        },
+        {
+          "name": "collateral_vault",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  108,
+                  108,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_token_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "open_position",
+      "discriminator": [
+        135,
+        128,
+        47,
+        77,
+        15,
+        152,
+        240,
+        49
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.collateral_mint",
+                "account": "Market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "open_supplier",
+      "discriminator": [
+        25,
+        158,
+        210,
+        164,
+        100,
+        194,
+        251,
+        73
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "market",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.collateral_mint",
+                "account": "Market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "supplier",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  115,
+                  117,
+                  112,
+                  112,
+                  108,
+                  105,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "pay_backer_interest",
+      "docs": [
+        "Pays backers their accrued interest share to the registered pool (eng review addendum,",
+        "founder-locked 15%). Permissionless, and -- like `absorb_bad_debt_cover` -- a plain token",
+        "transfer only: the market never calls the backstop program. Capped at `market.cash`: under",
+        "high utilization the payment waits until enough cash exists rather than borrowing against",
+        "principal, and nothing is lost while it waits."
+      ],
+      "discriminator": [
+        74,
+        241,
+        220,
+        138,
+        29,
+        123,
+        22,
+        75
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.collateral_mint",
+                "account": "Market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "usdc_mint"
+        },
+        {
+          "name": "usdc_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  117,
+                  115,
+                  100,
+                  99,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "pool_usdc_vault",
+          "docs": [
+            "The registered pool's own USDC vault -- constrained to `config.pool_liquidator` so interest",
+            "can only ever be paid to the pool the vault admin actually registered, never to an arbitrary",
+            "caller-supplied account."
+          ],
+          "writable": true
+        },
+        {
+          "name": "usdc_token_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "push_price",
+      "discriminator": [
+        113,
+        238,
+        232,
+        235,
+        60,
+        71,
+        127,
+        203
+      ],
+      "accounts": [
+        {
+          "name": "feed_authority",
+          "signer": true
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.collateral_mint",
+                "account": "Market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "price",
+          "type": "u64"
+        },
+        {
+          "name": "market_open",
+          "type": "bool"
+        },
+        {
+          "name": "last_close",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "repay",
+      "docs": [
+        "Anyone may repay a position. Allowed while paused (it only reduces risk)."
+      ],
+      "discriminator": [
+        234,
+        103,
+        67,
+        82,
+        208,
+        234,
+        219,
+        166
+      ],
+      "accounts": [
+        {
+          "name": "payer",
+          "signer": true
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.collateral_mint",
+                "account": "Market"
+              }
+            ]
+          },
+          "relations": [
+            "position"
+          ]
+        },
+        {
+          "name": "position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "position.owner",
+                "account": "Position"
+              }
+            ]
+          }
+        },
+        {
+          "name": "usdc_mint"
+        },
+        {
+          "name": "payer_usdc",
+          "writable": true
+        },
+        {
+          "name": "usdc_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  117,
+                  115,
+                  100,
+                  99,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "usdc_token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "set_admin",
+      "docs": [
+        "Admin rotation (U5), matching the backstop. Refuses the default key, which would leave the",
+        "vault with no reachable admin."
+      ],
+      "discriminator": [
+        251,
+        163,
+        0,
+        52,
+        91,
+        194,
+        187,
+        92
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "admin",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "set_fallback_grace",
+      "docs": [
+        "How long a position must be liquidatable before outside liquidators may act. Bounded 1 min (5 min on",
+        "mainnet, eng review A5) to 1 day."
+      ],
+      "discriminator": [
+        78,
+        246,
+        46,
+        32,
+        234,
+        56,
+        152,
+        23
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "secs",
+          "type": "i64"
+        }
+      ]
+    },
+    {
+      "name": "set_feed_authority",
+      "docs": [
+        "Key rotation (U5)."
+      ],
+      "discriminator": [
+        225,
+        218,
+        1,
+        171,
+        131,
+        226,
+        87,
+        178
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "feed_authority",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "set_paused",
+      "discriminator": [
+        91,
+        60,
+        125,
+        192,
+        176,
+        225,
+        166,
+        218
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "paused",
+          "type": "bool"
+        }
+      ]
+    },
+    {
+      "name": "set_payout_address",
+      "docs": [
+        "Where this position's wrongful-liquidation payback goes. Owner only. Refuses the default key and",
+        "the vault's own admin and feed keys (the backstop refuses its oracle and co-signer at payout). A",
+        "liquidation record freezes the address, so a later change, or a stolen key, cannot redirect a",
+        "payback already owed."
+      ],
+      "discriminator": [
+        5,
+        158,
+        197,
+        34,
+        137,
+        153,
+        47,
+        86
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "signer": true,
+          "relations": [
+            "position"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "position.market",
+                "account": "Position"
+              },
+              {
+                "kind": "account",
+                "path": "position.owner",
+                "account": "Position"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "payout",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "set_pool_liquidator",
+      "docs": [
+        "Registers the backstop pool's liquidator key (its config PDA). Default unregisters it, which leaves the",
+        "grace rule applying to every liquidator. Never the vault admin or the feed authority."
+      ],
+      "discriminator": [
+        82,
+        20,
+        114,
+        152,
+        8,
+        81,
+        21,
+        220
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "pool_liquidator",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "supply",
+      "discriminator": [
+        81,
+        67,
+        116,
+        61,
+        250,
+        209,
+        5,
+        198
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "signer": true,
+          "relations": [
+            "supplier"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.collateral_mint",
+                "account": "Market"
+              }
+            ]
+          },
+          "relations": [
+            "supplier"
+          ]
+        },
+        {
+          "name": "supplier",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  115,
+                  117,
+                  112,
+                  112,
+                  108,
+                  105,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "usdc_mint"
+        },
+        {
+          "name": "owner_usdc",
+          "writable": true
+        },
+        {
+          "name": "usdc_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  117,
+                  115,
+                  100,
+                  99,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "usdc_token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "sync_issuer_state",
+      "docs": [
+        "Permissionless. Re-derives the issuer-controlled facts the market must respect and records",
+        "them, so a halt can be raised (or lifted) without waiting for someone to attempt a risk",
+        "action. It reflects observable on-chain state only, which is why it needs no authority.",
+        "",
+        "A burn by the mint's permanent delegate leaves `reconciliation_short` true until",
+        "`write_down_collateral` attributes the missing tokens; the halt is correct until then — the",
+        "market genuinely cannot honour the collateral it has recorded."
+      ],
+      "discriminator": [
+        79,
+        151,
+        105,
+        126,
+        78,
+        3,
+        196,
+        179
+      ],
+      "accounts": [
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.collateral_mint",
+                "account": "Market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_mint"
+        },
+        {
+          "name": "collateral_vault",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  108,
+                  108,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "update_market_params",
+      "docs": [
+        "U2/U3: interest accrues at the old rate up to now; open loans keep their coverage snapshot."
+      ],
+      "discriminator": [
+        70,
+        117,
+        202,
+        191,
+        205,
+        174,
+        92,
+        82
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.collateral_mint",
+                "account": "Market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "params",
+          "type": {
+            "defined": {
+              "name": "MarketParams"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "withdraw_collateral",
+      "discriminator": [
+        115,
+        135,
+        168,
+        106,
+        139,
+        214,
+        138,
+        150
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "signer": true,
+          "relations": [
+            "position"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.collateral_mint",
+                "account": "Market"
+              }
+            ]
+          },
+          "relations": [
+            "position"
+          ]
+        },
+        {
+          "name": "position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_mint"
+        },
+        {
+          "name": "owner_collateral",
+          "writable": true
+        },
+        {
+          "name": "collateral_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  108,
+                  108,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "withdraw_supply",
+      "discriminator": [
+        64,
+        146,
+        255,
+        84,
+        160,
+        188,
+        49,
+        55
+      ],
+      "accounts": [
+        {
+          "name": "owner",
+          "signer": true,
+          "relations": [
+            "supplier"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.collateral_mint",
+                "account": "Market"
+              }
+            ]
+          },
+          "relations": [
+            "supplier"
+          ]
+        },
+        {
+          "name": "supplier",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  115,
+                  117,
+                  112,
+                  112,
+                  108,
+                  105,
+                  101,
+                  114
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "usdc_mint"
+        },
+        {
+          "name": "owner_usdc",
+          "writable": true
+        },
+        {
+          "name": "usdc_vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  117,
+                  115,
+                  100,
+                  99,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        },
+        {
+          "name": "usdc_token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "shares",
+          "type": "u128"
+        }
+      ]
+    },
+    {
+      "name": "write_down_collateral",
+      "docs": [
+        "Admin-only recovery from an issuer seizure (spec 14). The mint's permanent delegate can burn tokens out of",
+        "the shared collateral vault; the chain then shows tokens missing but not whose, and the market halts",
+        "permanently (`reconciliation_short`). This attributes the missing amount to the position it was taken from.",
+        "",
+        "Bounded so it can only ever restore the books, never take anything real: allowed only while the vault is",
+        "actually short, never more than the shortfall, never more than the position holds. The position is marked",
+        "`issuer_seized` for good: its later liquidations can't back a payback claim, and debt it leaves unpaid is",
+        "issuer loss that the backstop never reimburses. Once every missing token is attributed, the next",
+        "`sync_issuer_state` lifts the halt (unless the mint itself is still paused or the vault frozen)."
+      ],
+      "discriminator": [
+        158,
+        47,
+        224,
+        209,
+        121,
+        81,
+        150,
+        18
+      ],
+      "accounts": [
+        {
+          "name": "admin",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        },
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "market",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  109,
+                  97,
+                  114,
+                  107,
+                  101,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market.collateral_mint",
+                "account": "Market"
+              }
+            ]
+          },
+          "relations": [
+            "position"
+          ]
+        },
+        {
+          "name": "position",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  111,
+                  115,
+                  105,
+                  116,
+                  105,
+                  111,
+                  110
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              },
+              {
+                "kind": "account",
+                "path": "position.owner",
+                "account": "Position"
+              }
+            ]
+          }
+        },
+        {
+          "name": "collateral_vault",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  108,
+                  108,
+                  95,
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "market"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "LiquidationRecord",
+      "discriminator": [
+        95,
+        116,
+        23,
+        132,
+        89,
+        210,
+        245,
+        162
+      ]
+    },
+    {
+      "name": "Market",
+      "discriminator": [
+        219,
+        190,
+        213,
+        55,
+        0,
+        227,
+        198,
+        154
+      ]
+    },
+    {
+      "name": "Position",
+      "discriminator": [
+        170,
+        188,
+        143,
+        228,
+        122,
+        64,
+        247,
+        208
+      ]
+    },
+    {
+      "name": "Supplier",
+      "discriminator": [
+        83,
+        248,
+        232,
+        49,
+        94,
+        98,
+        120,
+        208
+      ]
+    },
+    {
+      "name": "VaultConfig",
+      "discriminator": [
+        99,
+        86,
+        43,
+        216,
+        184,
+        102,
+        119,
+        77
+      ]
+    }
+  ],
+  "events": [
+    {
+      "name": "BackerInterestPaid",
+      "discriminator": [
+        172,
+        18,
+        83,
+        0,
+        154,
+        12,
+        155,
+        110
+      ]
+    },
+    {
+      "name": "BadDebtCovered",
+      "discriminator": [
+        89,
+        203,
+        163,
+        93,
+        199,
+        141,
+        237,
+        11
+      ]
+    },
+    {
+      "name": "Borrowed",
+      "discriminator": [
+        225,
+        182,
+        241,
+        78,
+        34,
+        145,
+        253,
+        230
+      ]
+    },
+    {
+      "name": "CollateralDeposited",
+      "discriminator": [
+        244,
+        62,
+        77,
+        11,
+        135,
+        112,
+        61,
+        96
+      ]
+    },
+    {
+      "name": "CollateralWithdrawn",
+      "discriminator": [
+        51,
+        224,
+        133,
+        106,
+        74,
+        173,
+        72,
+        82
+      ]
+    },
+    {
+      "name": "CollateralWrittenDown",
+      "discriminator": [
+        20,
+        24,
+        207,
+        211,
+        122,
+        58,
+        61,
+        107
+      ]
+    },
+    {
+      "name": "IssuerHaltSet",
+      "discriminator": [
+        7,
+        105,
+        191,
+        149,
+        143,
+        84,
+        7,
+        225
+      ]
+    },
+    {
+      "name": "LiquidatableMarked",
+      "discriminator": [
+        136,
+        26,
+        157,
+        205,
+        66,
+        149,
+        57,
+        172
+      ]
+    },
+    {
+      "name": "Liquidated",
+      "discriminator": [
+        231,
+        57,
+        55,
+        75,
+        0,
+        170,
+        246,
+        68
+      ]
+    },
+    {
+      "name": "LiquidationTermsTightening",
+      "discriminator": [
+        133,
+        230,
+        200,
+        146,
+        228,
+        233,
+        202,
+        116
+      ]
+    },
+    {
+      "name": "MarketCreated",
+      "discriminator": [
+        88,
+        184,
+        130,
+        231,
+        226,
+        84,
+        6,
+        58
+      ]
+    },
+    {
+      "name": "MultiplierAcknowledged",
+      "discriminator": [
+        76,
+        31,
+        212,
+        210,
+        30,
+        10,
+        1,
+        159
+      ]
+    },
+    {
+      "name": "PausedSet",
+      "discriminator": [
+        171,
+        125,
+        127,
+        156,
+        233,
+        81,
+        68,
+        66
+      ]
+    },
+    {
+      "name": "PayoutAddressSet",
+      "discriminator": [
+        22,
+        203,
+        86,
+        238,
+        91,
+        0,
+        189,
+        210
+      ]
+    },
+    {
+      "name": "PriceUpdated",
+      "discriminator": [
+        154,
+        72,
+        87,
+        150,
+        246,
+        230,
+        23,
+        217
+      ]
+    },
+    {
+      "name": "Repaid",
+      "discriminator": [
+        38,
+        248,
+        231,
+        7,
+        150,
+        164,
+        172,
+        23
+      ]
+    },
+    {
+      "name": "Supplied",
+      "discriminator": [
+        137,
+        114,
+        239,
+        72,
+        162,
+        75,
+        133,
+        39
+      ]
+    },
+    {
+      "name": "SupplyWithdrawn",
+      "discriminator": [
+        213,
+        185,
+        167,
+        9,
+        123,
+        82,
+        180,
+        217
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "Unauthorized",
+      "msg": "Signer is not authorized for this action"
+    },
+    {
+      "code": 6001,
+      "name": "Paused",
+      "msg": "Vault is paused"
+    },
+    {
+      "code": 6002,
+      "name": "InvalidMarketParams",
+      "msg": "Market parameters are outside their hard bounds"
+    },
+    {
+      "code": 6003,
+      "name": "UnsupportedCollateralMint",
+      "msg": "Collateral mint must be Token-2022 with the Scaled UI Amount extension"
+    },
+    {
+      "code": 6004,
+      "name": "UnsupportedMintExtension",
+      "msg": "Fee-bearing or closable mints are not accepted"
+    },
+    {
+      "code": 6005,
+      "name": "InvalidMultiplier",
+      "msg": "Scaled UI multiplier is not a usable number"
+    },
+    {
+      "code": 6006,
+      "name": "InvalidPrice",
+      "msg": "Price must be greater than zero"
+    },
+    {
+      "code": 6007,
+      "name": "StalePriceUpdate",
+      "msg": "Price updates must be strictly newer than the last one"
+    },
+    {
+      "code": 6008,
+      "name": "PriceUnavailable",
+      "msg": "No usable price: none recorded, too old, or flagged"
+    },
+    {
+      "code": 6009,
+      "name": "IssuerHalt",
+      "msg": "Issuer has paused the mint or added a transfer hook"
+    },
+    {
+      "code": 6010,
+      "name": "CorporateActionHold",
+      "msg": "Paused around a multiplier activation, or held until a split is repriced"
+    },
+    {
+      "code": 6011,
+      "name": "CapReached",
+      "msg": "Borrow or collateral cap reached"
+    },
+    {
+      "code": 6012,
+      "name": "ZeroAmount",
+      "msg": "Amount must be greater than zero"
+    },
+    {
+      "code": 6013,
+      "name": "ExceedsLtv",
+      "msg": "Borrow would exceed the loan-to-value limit"
+    },
+    {
+      "code": 6014,
+      "name": "InsufficientCash",
+      "msg": "Not enough USDC available in the market"
+    },
+    {
+      "code": 6015,
+      "name": "InsufficientBalance",
+      "msg": "Not enough shares or collateral"
+    },
+    {
+      "code": 6016,
+      "name": "NotLiquidatable",
+      "msg": "Position is not past its liquidation threshold"
+    },
+    {
+      "code": 6017,
+      "name": "CollateralAccountFrozen",
+      "msg": "The vault's collateral account is frozen"
+    },
+    {
+      "code": 6018,
+      "name": "ReconciliationFailed",
+      "msg": "Vault holds less collateral than the market has recorded"
+    },
+    {
+      "code": 6019,
+      "name": "NothingSeized",
+      "msg": "Liquidation would seize no collateral"
+    },
+    {
+      "code": 6020,
+      "name": "MathOverflow",
+      "msg": "Arithmetic overflow"
+    },
+    {
+      "code": 6021,
+      "name": "NotUpgradeAuthority",
+      "msg": "Only the program's upgrade authority can initialize"
+    },
+    {
+      "code": 6022,
+      "name": "InvalidAdmin",
+      "msg": "Admin cannot be the default key"
+    },
+    {
+      "code": 6023,
+      "name": "InvalidPayoutAddress",
+      "msg": "Payback address cannot be the default key, the vault admin or the feed authority"
+    },
+    {
+      "code": 6024,
+      "name": "PoolPriority",
+      "msg": "Only the backstop pool may liquidate until the position has been liquidatable for the grace period"
+    },
+    {
+      "code": 6025,
+      "name": "InvalidPoolLiquidator",
+      "msg": "Pool liquidator cannot be the vault admin or the feed authority"
+    },
+    {
+      "code": 6026,
+      "name": "InvalidFallbackGrace",
+      "msg": "Fallback grace period is outside its bounds"
+    },
+    {
+      "code": 6027,
+      "name": "InvalidClusterTag",
+      "msg": "Cluster tag must be localnet (0), devnet (1) or mainnet (2)"
+    },
+    {
+      "code": 6028,
+      "name": "WriteDownTooLarge",
+      "msg": "Write-down exceeds the collateral the vault is provably missing, or what the position holds"
+    }
+  ],
+  "types": [
+    {
+      "name": "BackerInterestPaid",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "paid",
+            "type": "u64"
+          },
+          {
+            "name": "owed_remaining",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "BadDebtCovered",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "absorbed",
+            "type": "u64"
+          },
+          {
+            "name": "bad_debt_remaining",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Borrowed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "shares",
+            "type": "u128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "CollateralDeposited",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "CollateralWithdrawn",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "CollateralWrittenDown",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "position",
+            "type": "pubkey"
+          },
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "raw",
+            "type": "u64"
+          },
+          {
+            "name": "shortfall_remaining",
+            "type": "u64"
+          },
+          {
+            "name": "debt_written_off",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "IssuerHaltSet",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "halted",
+            "type": "bool"
+          },
+          {
+            "name": "mint_blocked",
+            "type": "bool"
+          },
+          {
+            "name": "vault_frozen",
+            "type": "bool"
+          },
+          {
+            "name": "reconciliation_short",
+            "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "LiquidatableMarked",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "position",
+            "type": "pubkey"
+          },
+          {
+            "name": "first_seen",
+            "type": "i64"
+          },
+          {
+            "name": "last_seen",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Liquidated",
+      "docs": [
+        "Everything the off-chain verdict engine needs to start from, without reading the record account."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "seq",
+            "type": "u64"
+          },
+          {
+            "name": "borrower",
+            "type": "pubkey"
+          },
+          {
+            "name": "liquidator",
+            "type": "pubkey"
+          },
+          {
+            "name": "seized_raw",
+            "type": "u64"
+          },
+          {
+            "name": "debt_repaid",
+            "type": "u64"
+          },
+          {
+            "name": "bonus_bps",
+            "type": "u32"
+          },
+          {
+            "name": "ltv_bps",
+            "type": "u32"
+          },
+          {
+            "name": "price_fp",
+            "type": "u64"
+          },
+          {
+            "name": "bad_debt",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "LiquidationRecord",
+      "docs": [
+        "Immutable snapshot of one liquidation.",
+        "",
+        "The verdict engine decides wrongfulness off-chain, so it must be able to re-derive the decision",
+        "from what the contract actually used — not from whatever the feed says later. Every input that",
+        "fed the seizure is recorded here, including `issuer_halt` at the time, because a liquidation",
+        "taken while the issuer had intervened is excluded from cover (spec 14a)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "version",
+            "type": "u8"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "seq",
+            "type": "u64"
+          },
+          {
+            "name": "borrower",
+            "type": "pubkey"
+          },
+          {
+            "name": "liquidator",
+            "type": "pubkey"
+          },
+          {
+            "name": "seized_raw",
+            "docs": [
+              "Raw collateral handed to the liquidator."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "debt_repaid",
+            "docs": [
+              "USDC the liquidator repaid on the borrower's behalf."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "multiplier_fp",
+            "docs": [
+              "Effective multiplier used for the valuation, in `MULT_SCALE` fixed point."
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "price_fp",
+            "docs": [
+              "TWAP the seizure was priced at, 8 decimals."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "collateral_decimals",
+            "type": "u8"
+          },
+          {
+            "name": "bonus_bps",
+            "type": "u32"
+          },
+          {
+            "name": "ltv_bps",
+            "docs": [
+              "Position LTV at the moment of seizure."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "coverage_bps",
+            "docs": [
+              "Coverage in force for this borrower when the loan was opened (U3)."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "borrow_age_ts",
+            "docs": [
+              "The loan's debt-weighted borrow time at the moment of liquidation (for the 60-day gate)."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "payout",
+            "docs": [
+              "Payback address at the moment of liquidation. Frozen here; later changes cannot redirect it."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "bad_debt",
+            "docs": [
+              "Debt written off because the collateral ran out, 0 in the normal case."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "ts",
+            "type": "i64"
+          },
+          {
+            "name": "slot",
+            "type": "u64"
+          },
+          {
+            "name": "issuer_halt",
+            "type": "bool"
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "LiquidationTerms",
+      "docs": [
+        "The terms that decide when, and how hard, an existing loan is liquidated. Changes that tighten them",
+        "ramp in over `LIQUIDATION_TERMS_RAMP_SECS`, so no borrower is liquidated overnight by a number change."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "liq_threshold_bps",
+            "type": "u32"
+          },
+          {
+            "name": "insolvency_ltv_bps",
+            "type": "u32"
+          },
+          {
+            "name": "close_factor_bps",
+            "type": "u32"
+          },
+          {
+            "name": "min_liq_bonus_bps",
+            "type": "u32"
+          },
+          {
+            "name": "max_liq_bonus_bps",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "LiquidationTermsTightening",
+      "docs": [
+        "A parameter change tightened the liquidation terms. Existing loans reach `to` gradually, completing",
+        "at `completes` (U3). Announced on-chain so borrowers can add collateral or repay in time."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "from",
+            "type": {
+              "defined": {
+                "name": "LiquidationTerms"
+              }
+            }
+          },
+          {
+            "name": "to",
+            "type": {
+              "defined": {
+                "name": "LiquidationTerms"
+              }
+            }
+          },
+          {
+            "name": "starts",
+            "type": "i64"
+          },
+          {
+            "name": "completes",
+            "type": "i64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Market",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "version",
+            "type": "u8"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "collateral_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "usdc_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "collateral_decimals",
+            "type": "u8"
+          },
+          {
+            "name": "usdc_decimals",
+            "type": "u8"
+          },
+          {
+            "name": "params",
+            "type": {
+              "defined": {
+                "name": "MarketParams"
+              }
+            }
+          },
+          {
+            "name": "price",
+            "type": {
+              "defined": {
+                "name": "PriceState"
+              }
+            }
+          },
+          {
+            "name": "cash",
+            "docs": [
+              "USDC held, tracked internally. Never inferred from the vault balance (donation attacks)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "total_supply_shares",
+            "type": "u128"
+          },
+          {
+            "name": "total_borrow_shares",
+            "type": "u128"
+          },
+          {
+            "name": "borrow_index",
+            "docs": [
+              "Debt index, 1.0 == safu_core::lending::INDEX_SCALE."
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "last_accrual_ts",
+            "type": "i64"
+          },
+          {
+            "name": "total_collateral_raw",
+            "docs": [
+              "Sum of all positions' raw collateral, for reconciliation against the vault (review D4)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "bad_debt",
+            "docs": [
+              "Bad debt still uncovered. Falls when the backstop reimburses it."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "bad_debt_cumulative",
+            "docs": [
+              "Every write-off this market has ever taken, monotonic. The backstop compares its own running",
+              "total against this to work out what it still owes, which makes reimbursement idempotent with",
+              "no epoch counter to keep in step."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "issuer_halt",
+            "type": "bool"
+          },
+          {
+            "name": "liq_seq",
+            "type": "u64"
+          },
+          {
+            "name": "observed_multiplier_fp",
+            "docs": [
+              "Effective multiplier this market last acted on, in `MULT_SCALE` fixed point. The baseline the",
+              "unannounced-change guard compares the live value against. Seeded by `create_market`; 0 means",
+              "\"not yet observed\", which the guard treats as no change rather than as a change from zero."
+            ],
+            "type": "u128"
+          },
+          {
+            "name": "ramp_from",
+            "docs": [
+              "Where the current liquidation-terms ramp started from, and when (U3). The target is `params`.",
+              "Taken from the old 40 reserved bytes (20 + 8), so the account size is unchanged (U4)."
+            ],
+            "type": {
+              "defined": {
+                "name": "LiquidationTerms"
+              }
+            }
+          },
+          {
+            "name": "ramp_start_ts",
+            "type": "i64"
+          },
+          {
+            "name": "backer_interest_owed",
+            "docs": [
+              "Interest credited to backers but not yet paid out (eng review addendum). Excluded from",
+              "`total_assets`, so lenders' share price reflects only their 85% (2c pattern, in reverse)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "backer_interest_cumulative",
+            "docs": [
+              "Monotonic total ever credited, mirrored by `InterestAbsorbed.total_absorbed` on the backstop",
+              "side so repeat `absorb_interest` calls settle only the remainder."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "backer_interest_paid_cumulative",
+            "docs": [
+              "Monotonic total ever transferred to the pool via `pay_backer_interest`."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "issuer_loss_cumulative",
+            "docs": [
+              "Debt written off on positions whose collateral the issuer seized (`write_down_collateral`). Kept apart",
+              "from `bad_debt_cumulative` on purpose: the backstop reimburses only that counter, and issuer actions are",
+              "never covered (spec 14a) -- lenders carry this loss, as they carry it on every market holding this token.",
+              "Taken from the old 12 reserved bytes, so the account size is unchanged (U4)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                4
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketCreated",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "collateral_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "usdc_mint",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MarketParams",
+      "docs": [
+        "Admin-settable within hard bounds (U2). Values and the evidence behind each:",
+        "`outputs/2026-09-14_stocklana-market-config-research.md` §2b (research-ops)."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "ltv_bps",
+            "docs": [
+              "Borrowing limit. AAPLx: 4_000 (matched to the market leader)."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "liq_threshold_bps",
+            "docs": [
+              "Liquidation line. AAPLx: 5_000."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "min_liq_bonus_bps",
+            "docs": [
+              "Dynamic liquidation bonus: max(min, LTV − threshold), capped at max and at 100% − LTV. 100 / 500."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "max_liq_bonus_bps",
+            "type": "u32"
+          },
+          {
+            "name": "insolvency_ltv_bps",
+            "docs": [
+              "Above this LTV the whole debt may be liquidated at once. 9_500."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "close_factor_bps",
+            "docs": [
+              "Share of debt repayable per liquidation below the insolvency line. 2_500."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "max_liquidation_debt",
+            "docs": [
+              "USDC base units per liquidation, sized from measured collateral liquidity ($100K)."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "deviation_cap_bps",
+            "docs": [
+              "Single-update spike cap vs TWAP. 500 (US LULD Tier 1 band)."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "activation_pause_secs",
+            "docs": [
+              "Issuer-recommended pause around every multiplier activation. 900 s."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "split_cap_bps",
+            "docs": [
+              "A multiplier change above this is a split / reverse split. 500."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "split_max_hold_secs",
+            "docs": [
+              "Longest a split can hold risk actions while waiting for a market-open price. 86_400 s."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "borrow_max_price_age_secs",
+            "docs": [
+              "Borrow / withdraw need a price at most this old while the market is open. 3_600 s."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "liquidation_max_price_age_open_secs",
+            "docs": [
+              "Liquidation price age limit while open (feed's own 0.5% / 24h guarantee + 1h). 90_000 s."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "max_price_age_closed_secs",
+            "docs": [
+              "Any action while the underlying market is closed (longest US closure ≈ 89.5h). 345_600 s."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "rate",
+            "type": {
+              "defined": {
+                "name": "RateParams"
+              }
+            }
+          },
+          {
+            "name": "borrow_cap",
+            "docs": [
+              "Total USDC that may be lent (backstop sizing rule, 10:1). Base units."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "collateral_cap_raw",
+            "docs": [
+              "Total raw collateral accepted."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "backer_interest_share_bps",
+            "docs": [
+              "Share of accrued borrower interest credited to backers, bounded <= 5_000 (founder-locked at",
+              "1_500 = 15%; eng review addendum 2026-09-14). A change applies to interest accrued after it."
+            ],
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "MultiplierAcknowledged",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "previous",
+            "type": "u128"
+          },
+          {
+            "name": "effective",
+            "type": "u128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PausedSet",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "paused",
+            "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PayoutAddressSet",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "position",
+            "type": "pubkey"
+          },
+          {
+            "name": "payout",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Position",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "version",
+            "type": "u8"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "raw_collateral",
+            "type": "u64"
+          },
+          {
+            "name": "debt_shares",
+            "type": "u128"
+          },
+          {
+            "name": "coverage_bps",
+            "docs": [
+              "Coverage in force when this loan was opened (U3: later changes never shrink an open loan's cover)."
+            ],
+            "type": "u32"
+          },
+          {
+            "name": "borrow_age_ts",
+            "docs": [
+              "Debt-weighted borrow time (unix seconds), 0 while there is no debt. Each borrow pulls it toward",
+              "now in proportion to its size; full repayment resets it. The backstop's 60-day gate reads it, so",
+              "a tiny early loan topped up after a price breaks still counts as young."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "payout",
+            "docs": [
+              "Where a wrongful-liquidation payback goes. Defaults to the owner, who may change it. A liquidation",
+              "record freezes it, so nobody can redirect a payback after the fact."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "liquidatable_first_seen",
+            "docs": [
+              "When this position was first seen liquidatable by `mark_liquidatable`, and most recently. 0 = not",
+              "marked. Outside liquidators wait on these; the pool does not."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "liquidatable_last_seen",
+            "type": "i64"
+          },
+          {
+            "name": "issuer_seized",
+            "docs": [
+              "Set by `write_down_collateral` once any of this position's collateral is attributed to an issuer seizure.",
+              "Permanent. Every later liquidation of this position records `issuer_halt = true`, so the backstop refuses",
+              "a payback claim on it, and any debt it leaves behind is issuer loss, never reimbursable bad debt."
+            ],
+            "type": "bool"
+          },
+          {
+            "name": "seized_raw_total",
+            "docs": [
+              "Raw collateral ever written down on this position."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "reserved",
+            "docs": [
+              "Taken from the old 32 reserved bytes (8 + 8 + 1 + 8)."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                7
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "PriceState",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "prices",
+            "docs": [
+              "Ring buffer, USD per whole share with 8 decimals."
+            ],
+            "type": {
+              "array": [
+                "u64",
+                16
+              ]
+            }
+          },
+          {
+            "name": "timestamps",
+            "type": {
+              "array": [
+                "i64",
+                16
+              ]
+            }
+          },
+          {
+            "name": "head",
+            "docs": [
+              "Next write position."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "count",
+            "type": "u8"
+          },
+          {
+            "name": "last_price",
+            "type": "u64"
+          },
+          {
+            "name": "last_update",
+            "type": "i64"
+          },
+          {
+            "name": "last_close",
+            "type": "u64"
+          },
+          {
+            "name": "market_open",
+            "docs": [
+              "Whether the underlying equity market was open at the last accepted update."
+            ],
+            "type": "bool"
+          },
+          {
+            "name": "flagged",
+            "docs": [
+              "Set when an update broke the spike cap. Blocks borrowing and liquidation until cleared."
+            ],
+            "type": "bool"
+          },
+          {
+            "name": "flagged_price",
+            "docs": [
+              "The rejected price, so a second consecutive update confirming it can be accepted."
+            ],
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PriceUpdated",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "price",
+            "type": "u64"
+          },
+          {
+            "name": "market_open",
+            "type": "bool"
+          },
+          {
+            "name": "accepted",
+            "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "RateParams",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "base_bps",
+            "type": "u32"
+          },
+          {
+            "name": "slope1_bps",
+            "type": "u32"
+          },
+          {
+            "name": "slope2_bps",
+            "type": "u32"
+          },
+          {
+            "name": "kink_bps",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Repaid",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "shares",
+            "type": "u128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Supplied",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "shares",
+            "type": "u128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Supplier",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "version",
+            "type": "u8"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "market",
+            "type": "pubkey"
+          },
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "shares",
+            "type": "u128"
+          },
+          {
+            "name": "reserved",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "SupplyWithdrawn",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "shares",
+            "type": "u128"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultConfig",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "version",
+            "type": "u8"
+          },
+          {
+            "name": "admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "feed_authority",
+            "docs": [
+              "Pushes prices through the mock adapter on devnet. Separate key from the verdict oracle."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "paused",
+            "type": "bool"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "pool_liquidator",
+            "docs": [
+              "The backstop pool's liquidator key (its config PDA). It may liquidate at once; anyone else only after",
+              "the grace period. Default = no pool registered, so the grace rule applies to every liquidator."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "fallback_grace_secs",
+            "docs": [
+              "How long a position must have been liquidatable before an outside liquidator may act. 900 s."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "cluster_tag",
+            "docs": [
+              "Which cluster this deployment is on (0 localnet, 1 devnet, 2 mainnet), set once at initialize with no",
+              "setter. Selects the time floors (eng review A5): mainnet may never shorten the grace below 5 min."
+            ],
+            "type": "u8"
+          },
+          {
+            "name": "reserved",
+            "docs": [
+              "Taken from the old 64 reserved bytes (32 + 8 + 1), so the account size is unchanged (U4)."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                23
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

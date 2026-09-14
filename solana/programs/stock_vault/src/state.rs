@@ -234,7 +234,12 @@ pub struct Market {
     pub backer_interest_cumulative: u64,
     /// Monotonic total ever transferred to the pool via `pay_backer_interest`.
     pub backer_interest_paid_cumulative: u64,
-    pub reserved: [u8; 12],
+    /// Debt written off on positions whose collateral the issuer seized (`write_down_collateral`). Kept apart
+    /// from `bad_debt_cumulative` on purpose: the backstop reimburses only that counter, and issuer actions are
+    /// never covered (spec 14a) -- lenders carry this loss, as they carry it on every market holding this token.
+    /// Taken from the old 12 reserved bytes, so the account size is unchanged (U4).
+    pub issuer_loss_cumulative: u64,
+    pub reserved: [u8; 4],
 }
 
 #[account]
@@ -259,8 +264,14 @@ pub struct Position {
     /// marked. Outside liquidators wait on these; the pool does not.
     pub liquidatable_first_seen: i64,
     pub liquidatable_last_seen: i64,
-    /// Taken from the old 32 reserved bytes (8 + 8).
-    pub reserved: [u8; 16],
+    /// Set by `write_down_collateral` once any of this position's collateral is attributed to an issuer seizure.
+    /// Permanent. Every later liquidation of this position records `issuer_halt = true`, so the backstop refuses
+    /// a payback claim on it, and any debt it leaves behind is issuer loss, never reimbursable bad debt.
+    pub issuer_seized: bool,
+    /// Raw collateral ever written down on this position.
+    pub seized_raw_total: u64,
+    /// Taken from the old 32 reserved bytes (8 + 8 + 1 + 8).
+    pub reserved: [u8; 7],
 }
 
 #[account]

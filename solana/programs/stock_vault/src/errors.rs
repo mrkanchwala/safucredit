@@ -58,6 +58,8 @@ pub enum VaultError {
     InvalidFallbackGrace,
     #[msg("Cluster tag must be localnet (0), devnet (1) or mainnet (2)")]
     InvalidClusterTag,
+    #[msg("Write-down exceeds the collateral the vault is provably missing, or what the position holds")]
+    WriteDownTooLarge,
 }
 
 impl From<safu_core::CoreError> for VaultError {

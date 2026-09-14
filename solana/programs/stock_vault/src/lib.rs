@@ -197,6 +197,7 @@ pub mod stock_vault {
         market.total_collateral_raw = 0;
         market.bad_debt = 0;
         market.bad_debt_cumulative = 0;
+        market.issuer_loss_cumulative = 0;
         market.issuer_halt = false;
         market.liq_seq = 0;
         market.observed_multiplier_fp = schedule.effective(now);
@@ -205,7 +206,7 @@ pub mod stock_vault {
         market.backer_interest_owed = 0;
         market.backer_interest_cumulative = 0;
         market.backer_interest_paid_cumulative = 0;
-        market.reserved = [0; 12];
+        market.reserved = [0; 4];
 
         emit!(MarketCreated {
             market: market.key(),
@@ -286,7 +287,9 @@ pub mod stock_vault {
         position.payout = ctx.accounts.owner.key();
         position.liquidatable_first_seen = 0;
         position.liquidatable_last_seen = 0;
-        position.reserved = [0; 16];
+        position.issuer_seized = false;
+        position.seized_raw_total = 0;
+        position.reserved = [0; 7];
         Ok(())
     }
 
@@ -650,14 +653,71 @@ pub mod stock_vault {
         Ok(())
     }
 
+    /// Admin-only recovery from an issuer seizure (spec 14). The mint's permanent delegate can burn tokens out of
+    /// the shared collateral vault; the chain then shows tokens missing but not whose, and the market halts
+    /// permanently (`reconciliation_short`). This attributes the missing amount to the position it was taken from.
+    ///
+    /// Bounded so it can only ever restore the books, never take anything real: allowed only while the vault is
+    /// actually short, never more than the shortfall, never more than the position holds. The position is marked
+    /// `issuer_seized` for good: its later liquidations can't back a payback claim, and debt it leaves unpaid is
+    /// issuer loss that the backstop never reimburses. Once every missing token is attributed, the next
+    /// `sync_issuer_state` lifts the halt (unless the mint itself is still paused or the vault frozen).
+    pub fn write_down_collateral(ctx: Context<WriteDownCollateral>, amount: u64) -> Result<()> {
+        require!(amount > 0, VaultError::ZeroAmount);
+        let now = Clock::get()?.unix_timestamp;
+        let vault_amount = ctx.accounts.collateral_vault.amount;
+        let market_key = ctx.accounts.market.key();
+        let market = &mut ctx.accounts.market;
+        let position = &mut ctx.accounts.position;
+        let shortfall = market.total_collateral_raw.saturating_sub(vault_amount);
+        require!(
+            amount <= shortfall && amount <= position.raw_collateral,
+            VaultError::WriteDownTooLarge
+        );
+        accrue(market, now)?;
+
+        position.raw_collateral -= amount;
+        market.total_collateral_raw -= amount;
+        position.issuer_seized = true;
+        position.seized_raw_total = position
+            .seized_raw_total
+            .checked_add(amount)
+            .ok_or(VaultError::MathOverflow)?;
+
+        // Nothing left to seize means the remaining debt can never be collected: write it off now, as issuer
+        // loss, rather than leave it accruing on a position nobody can liquidate.
+        let mut written_off = 0u64;
+        if position.raw_collateral == 0 && position.debt_shares > 0 {
+            written_off = logic::core(debt_for_shares(position.debt_shares, market.borrow_index))?;
+            market.total_borrow_shares = market
+                .total_borrow_shares
+                .saturating_sub(position.debt_shares);
+            position.debt_shares = 0;
+            position.borrow_age_ts = 0;
+            market.issuer_loss_cumulative = market
+                .issuer_loss_cumulative
+                .checked_add(written_off)
+                .ok_or(VaultError::MathOverflow)?;
+        }
+
+        emit!(CollateralWrittenDown {
+            market: market_key,
+            position: position.key(),
+            owner: position.owner,
+            raw: amount,
+            shortfall_remaining: shortfall - amount,
+            debt_written_off: written_off,
+        });
+        Ok(())
+    }
+
     /// Permissionless. Re-derives the issuer-controlled facts the market must respect and records
     /// them, so a halt can be raised (or lifted) without waiting for someone to attempt a risk
     /// action. It reflects observable on-chain state only, which is why it needs no authority.
     ///
-    /// Known limit: a burn by the mint's permanent delegate leaves `reconciliation_short` true
-    /// forever, because the collateral really is gone. Clearing that needs an admin write-down,
-    /// which lands with upgradeability (stage 2 item 5). Until then the halt is permanent and
-    /// correct — the market genuinely cannot honour the collateral it has recorded.
+    /// A burn by the mint's permanent delegate leaves `reconciliation_short` true until
+    /// `write_down_collateral` attributes the missing tokens; the halt is correct until then — the
+    /// market genuinely cannot honour the collateral it has recorded.
     pub fn sync_issuer_state(ctx: Context<SyncIssuerState>) -> Result<()> {
         let mint_info = ctx.accounts.collateral_mint.to_account_info();
         let mint_blocked = issuer_blocks(&mint_info);
@@ -905,14 +965,23 @@ pub mod stock_vault {
                 .total_borrow_shares
                 .saturating_sub(position.debt_shares);
             position.debt_shares = 0;
-            market.bad_debt = market
-                .bad_debt
-                .checked_add(bad_debt)
-                .ok_or(VaultError::MathOverflow)?;
-            market.bad_debt_cumulative = market
-                .bad_debt_cumulative
-                .checked_add(bad_debt)
-                .ok_or(VaultError::MathOverflow)?;
+            if position.issuer_seized {
+                // Spec 14a: the collateral that would have covered this was taken by the issuer. Lenders carry
+                // it; it never enters the counter the backstop reimburses.
+                market.issuer_loss_cumulative = market
+                    .issuer_loss_cumulative
+                    .checked_add(bad_debt)
+                    .ok_or(VaultError::MathOverflow)?;
+            } else {
+                market.bad_debt = market
+                    .bad_debt
+                    .checked_add(bad_debt)
+                    .ok_or(VaultError::MathOverflow)?;
+                market.bad_debt_cumulative = market
+                    .bad_debt_cumulative
+                    .checked_add(bad_debt)
+                    .ok_or(VaultError::MathOverflow)?;
+            }
         }
 
         if position.debt_shares == 0 {
@@ -923,7 +992,8 @@ pub mod stock_vault {
 
         let seq = market.liq_seq;
         market.liq_seq = seq.checked_add(1).ok_or(VaultError::MathOverflow)?;
-        let issuer_halt = market.issuer_halt;
+        // A position the issuer has already seized from is never a wrongful liquidation (spec 14a).
+        let issuer_halt = market.issuer_halt || position.issuer_seized;
         let collateral_decimals = market.collateral_decimals;
 
         let record = &mut ctx.accounts.record;
@@ -1268,6 +1338,24 @@ pub struct AbsorbBadDebtCover<'info> {
 }
 
 #[derive(Accounts)]
+pub struct WriteDownCollateral<'info> {
+    pub admin: Signer<'info>,
+    #[account(seeds = [VCONFIG_SEED], bump = config.bump, has_one = admin @ VaultError::Unauthorized)]
+    pub config: Account<'info, VaultConfig>,
+    #[account(mut, seeds = [MARKET_SEED, market.collateral_mint.as_ref()], bump = market.bump)]
+    pub market: Box<Account<'info, Market>>,
+    #[account(
+        mut,
+        seeds = [POSITION_SEED, market.key().as_ref(), position.owner.as_ref()],
+        bump = position.bump,
+        has_one = market,
+    )]
+    pub position: Box<Account<'info, Position>>,
+    #[account(seeds = [COLL_VAULT_SEED, market.key().as_ref()], bump)]
+    pub collateral_vault: Box<InterfaceAccount<'info, TokenAccount>>,
+}
+
+#[derive(Accounts)]
 pub struct SyncIssuerState<'info> {
     #[account(mut, seeds = [MARKET_SEED, market.collateral_mint.as_ref()], bump = market.bump)]
     pub market: Box<Account<'info, Market>>,
@@ -1453,6 +1541,16 @@ pub struct BadDebtCovered {
     pub market: Pubkey,
     pub absorbed: u64,
     pub bad_debt_remaining: u64,
+}
+
+#[event]
+pub struct CollateralWrittenDown {
+    pub market: Pubkey,
+    pub position: Pubkey,
+    pub owner: Pubkey,
+    pub raw: u64,
+    pub shortfall_remaining: u64,
+    pub debt_written_off: u64,
 }
 
 #[event]
