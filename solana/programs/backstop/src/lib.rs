@@ -75,9 +75,9 @@ pub mod backstop {
         Ok(())
     }
 
-    /// NOTE: the first caller becomes admin, matching the lending vault. Gating this on the
-    /// program's upgrade authority lands with upgradeability (stage 2 item 5); until then deploy
-    /// and initialize in the same session.
+    /// Only the program's upgrade authority may initialize, so nobody watching the deploy can call it
+    /// first and take admin. Initialize before any `--final`: a program with no upgrade authority can
+    /// never be initialized.
     pub fn initialize_backstop(
         ctx: Context<InitializeBackstop>,
         verdict_oracle: Pubkey,
@@ -494,6 +494,11 @@ pub struct AttestVerdict<'info> {
 pub struct InitializeBackstop<'info> {
     #[account(mut)]
     pub admin: Signer<'info>,
+    /// This program. Proves `program_data` belongs to it, not to a program the caller deployed.
+    #[account(constraint = program.programdata_address()? == Some(program_data.key()) @ VerdictError::NotUpgradeAuthority)]
+    pub program: Program<'info, crate::program::Backstop>,
+    #[account(constraint = program_data.upgrade_authority_address == Some(admin.key()) @ VerdictError::NotUpgradeAuthority)]
+    pub program_data: Account<'info, ProgramData>,
     #[account(init, payer = admin, space = 8 + BackstopConfig::INIT_SPACE, seeds = [CONFIG_SEED], bump)]
     pub config: Box<Account<'info, BackstopConfig>>,
     #[account(mint::token_program = usdc_token_program)]

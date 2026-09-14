@@ -5,6 +5,7 @@
 //! is the thing that makes a fabricated record impossible, so testing it against an injected struct
 //! would prove nothing.
 
+use anchor_lang::solana_program::bpf_loader_upgradeable;
 use anchor_lang::{
     prelude::{Clock, Pubkey},
     solana_program::{instruction::Instruction, program_pack::Pack},
@@ -515,8 +516,8 @@ impl Env {
 
 // ------------------------------------------------------------------ environments
 
-/// Both programs loaded, mints created, backstop initialized. No market yet.
-fn base() -> Env {
+/// Both programs loaded (upgrade authority = admin for each) and mints created. Backstop NOT initialized.
+fn base_uninitialized() -> Env {
     let mut svm = LiteSVM::new();
     svm.add_program(
         stock_vault::ID,
@@ -539,13 +540,15 @@ fn base() -> Env {
         Keypair::new(),
         Keypair::new(),
     );
+    set_upgrade_authority(&mut svm, &stock_vault::ID, Some(&admin.pubkey()));
+    set_upgrade_authority(&mut svm, &backstop::ID, Some(&admin.pubkey()));
     for k in [&admin, &feed, &issuer, &alice] {
         svm.airdrop(&k.pubkey(), 1_000_000_000_000).unwrap();
     }
     let coll = t22_mint(&mut svm, &admin, &issuer);
     let usdc = classic_mint(&mut svm, &admin, &issuer.pubkey());
 
-    let mut env = Env {
+    Env {
         svm,
         admin,
         feed,
@@ -557,28 +560,64 @@ fn base() -> Env {
         alice_coll: Pubkey::default(),
         alice_usdc: Pubkey::default(),
         now: NOW,
-    };
+    }
+}
 
+/// Both programs loaded, mints created, backstop initialized. No market yet.
+fn base() -> Env {
+    let mut env = base_uninitialized();
     let admin = env.admin.insecure_clone();
-    let (oracle_key, usdc_key) = (env.oracle.pubkey(), env.usdc_mint);
-    let init = env.b_ix(
-        backstop::accounts::InitializeBackstop {
-            admin: admin.pubkey(),
-            config: env.b_config(),
-            usdc_mint: usdc_key,
-            usdc_vault: env.b_vault(),
-            usdc_token_program: TOKEN_CLASSIC,
-            system_program: SYSTEM,
-        },
-        backstop::instruction::InitializeBackstop {
-            verdict_oracle: oracle_key,
-            cluster_tag: CLUSTER_DEVNET,
-            per_claim_cap_bps: CAP_BPS,
-            withdraw_delay_secs: 86_400,
-        },
-    );
+    let init = env.init_backstop_ix(&admin.pubkey(), programdata(&backstop::ID));
     env.ok(&[init], &[&admin]);
     env
+}
+
+impl Env {
+    fn init_backstop_ix(&self, admin: &Pubkey, program_data: Pubkey) -> Instruction {
+        self.b_ix(
+            backstop::accounts::InitializeBackstop {
+                admin: *admin,
+                program: backstop::ID,
+                program_data,
+                config: self.b_config(),
+                usdc_mint: self.usdc_mint,
+                usdc_vault: self.b_vault(),
+                usdc_token_program: TOKEN_CLASSIC,
+                system_program: SYSTEM,
+            },
+            backstop::instruction::InitializeBackstop {
+                verdict_oracle: self.oracle.pubkey(),
+                cluster_tag: CLUSTER_DEVNET,
+                per_claim_cap_bps: CAP_BPS,
+                withdraw_delay_secs: 86_400,
+            },
+        )
+    }
+}
+
+/// ProgramData account of an upgradeable program.
+fn programdata(program_id: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[program_id.as_ref()], &bpf_loader_upgradeable::ID).0
+}
+
+/// LiteSVM loads programs upgradeable with no upgrade authority. Set (or clear) it, as a real deploy would.
+fn set_upgrade_authority(svm: &mut LiteSVM, program_id: &Pubkey, authority: Option<&Pubkey>) {
+    let address = programdata(program_id);
+    let mut account = svm.get_account(&address).expect("program data account");
+    // bincode UpgradeableLoaderState::ProgramData: u32 tag (3) · u64 slot · Option<Pubkey> (1 + 32).
+    assert_eq!(
+        &account.data[..4],
+        &3u32.to_le_bytes(),
+        "not a ProgramData account"
+    );
+    match authority {
+        Some(key) => {
+            account.data[12] = 1;
+            account.data[13..45].copy_from_slice(key.as_ref());
+        }
+        None => account.data[12..45].fill(0),
+    }
+    svm.set_account(address, account).unwrap();
 }
 
 /// `base`, plus a lending market with Alice borrowed to the limit against 10 shares.
@@ -595,6 +634,8 @@ fn with_loan() -> Env {
     let vcfg = env.v_ix(
         stock_vault::accounts::InitializeConfig {
             admin: admin.pubkey(),
+            program: stock_vault::ID,
+            program_data: programdata(&stock_vault::ID),
             config: vpda(&[VCONFIG_SEED]),
             system_program: SYSTEM,
         },
@@ -1447,5 +1488,44 @@ fn the_market_cannot_absorb_more_than_its_bad_debt() {
     assert_vault_error(
         env.send(&[absorb_ix(&env)], &[&env.admin.insecure_clone()]),
         stock_vault::errors::VaultError::ZeroAmount,
+    );
+}
+
+// ------------------------------------------------------------------ initialization authority
+
+#[test]
+fn only_the_upgrade_authority_can_initialize_the_backstop() {
+    let mut env = base_uninitialized();
+    // Someone watching the deploy calls initialize first: refused, and nothing is created.
+    let stranger = env.alice.insecure_clone();
+    let ix = env.init_backstop_ix(&stranger.pubkey(), programdata(&backstop::ID));
+    assert_program_error(
+        env.send(&[ix], &[&stranger]),
+        VerdictError::NotUpgradeAuthority,
+    );
+    assert!(env.svm.get_account(&env.b_config()).is_none());
+    // The upgrade authority can, and becomes admin.
+    let admin = env.admin.insecure_clone();
+    let ix = env.init_backstop_ix(&admin.pubkey(), programdata(&backstop::ID));
+    env.ok(&[ix], &[&admin]);
+    let data = env.svm.get_account(&env.b_config()).unwrap().data;
+    let config = BackstopConfig::try_deserialize(&mut &data[..]).unwrap();
+    assert_eq!(config.admin, admin.pubkey());
+}
+
+#[test]
+fn backstop_initialize_refuses_the_upgrade_authority_of_a_different_program() {
+    // The attacker deploys a program they control and presents its ProgramData as ours.
+    let mut env = base_uninitialized();
+    let attacker = env.alice.insecure_clone();
+    let theirs = Pubkey::new_unique();
+    env.svm
+        .add_program(theirs, include_bytes!("../../../target/deploy/backstop.so"))
+        .unwrap();
+    set_upgrade_authority(&mut env.svm, &theirs, Some(&attacker.pubkey()));
+    let ix = env.init_backstop_ix(&attacker.pubkey(), programdata(&theirs));
+    assert_program_error(
+        env.send(&[ix], &[&attacker]),
+        VerdictError::NotUpgradeAuthority,
     );
 }

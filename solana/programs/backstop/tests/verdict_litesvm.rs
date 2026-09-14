@@ -52,7 +52,7 @@ fn setup(cluster_tag: u8) -> Env {
     let oracle = Keypair::new();
 
     // State set directly (skill guidance: set up state, don't replay long setup transactions). The
-    // initialize instruction, gated on the program upgrade authority, lands with upgradeability (item 5).
+    // initialize instruction and its upgrade-authority gate are tested in payout_litesvm.rs.
     let (config_pda, bump) = Pubkey::find_program_address(&[CONFIG_SEED], &backstop::ID);
     let config = BackstopConfig {
         version: ACCOUNT_VERSION,

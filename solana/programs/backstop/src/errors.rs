@@ -52,4 +52,6 @@ pub enum VerdictError {
     NoBadDebt,
     #[msg("Arithmetic overflow")]
     MathOverflow,
+    #[msg("Only the program's upgrade authority can initialize")]
+    NotUpgradeAuthority,
 }

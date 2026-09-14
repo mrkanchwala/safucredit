@@ -5,6 +5,7 @@
 //! debt) is built through real instructions, because the accounting under test *is* that build-up;
 //! only `VaultConfig` is ever written directly.
 
+use anchor_lang::solana_program::bpf_loader_upgradeable;
 use anchor_lang::{
     prelude::{Clock, Pubkey},
     solana_program::instruction::Instruction,
@@ -411,10 +412,16 @@ fn mint_to(
 // ------------------------------------------------------------------ instructions
 
 fn init_config_ix(admin: &Pubkey, feed: &Pubkey) -> Instruction {
+    init_config_ix_with(admin, feed, programdata(&stock_vault::ID))
+}
+
+fn init_config_ix_with(admin: &Pubkey, feed: &Pubkey, program_data: Pubkey) -> Instruction {
     Instruction {
         program_id: stock_vault::ID,
         accounts: stock_vault::accounts::InitializeConfig {
             admin: *admin,
+            program: stock_vault::ID,
+            program_data,
             config: pda(&[VCONFIG_SEED]),
             system_program: SYSTEM,
         }
@@ -456,8 +463,8 @@ fn create_market_ix(
 
 // ------------------------------------------------------------------ environment
 
-/// SVM with the program loaded, both mints created, and the config initialized. No market yet.
-fn base() -> Env {
+/// SVM with the program loaded (upgrade authority = admin) and both mints created. Config NOT initialized.
+fn base_uninitialized() -> Env {
     let mut svm = LiteSVM::new();
     svm.add_program(
         stock_vault::ID,
@@ -473,6 +480,7 @@ fn base() -> Env {
     let issuer = Keypair::new();
     let alice = Keypair::new();
     let bob = Keypair::new();
+    set_upgrade_authority(&mut svm, &stock_vault::ID, Some(&admin.pubkey()));
     for k in [&admin, &feed, &issuer, &alice, &bob] {
         svm.airdrop(&k.pubkey(), 100_000_000_000).unwrap();
     }
@@ -480,7 +488,7 @@ fn base() -> Env {
     let coll_mint = create_t22_mint(&mut svm, &admin, &issuer, COLL_DECIMALS, true, true, None);
     let usdc_mint = create_classic_mint(&mut svm, &admin, &issuer.pubkey(), USDC_DECIMALS);
 
-    let mut env = Env {
+    Env {
         svm,
         admin,
         feed,
@@ -493,12 +501,42 @@ fn base() -> Env {
         alice_usdc: Pubkey::default(),
         bob_usdc: Pubkey::default(),
         now: NOW,
-    };
+    }
+}
+
+/// SVM with the program loaded, both mints created, and the config initialized. No market yet.
+fn base() -> Env {
+    let mut env = base_uninitialized();
     let admin_key = env.admin.pubkey();
     let feed_key = env.feed.pubkey();
     let admin = env.admin.insecure_clone();
     env.ok(&[init_config_ix(&admin_key, &feed_key)], &[&admin]);
     env
+}
+
+/// ProgramData account of an upgradeable program.
+fn programdata(program_id: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[program_id.as_ref()], &bpf_loader_upgradeable::ID).0
+}
+
+/// LiteSVM loads programs upgradeable with no upgrade authority. Set (or clear) it, as a real deploy would.
+fn set_upgrade_authority(svm: &mut LiteSVM, program_id: &Pubkey, authority: Option<&Pubkey>) {
+    let address = programdata(program_id);
+    let mut account = svm.get_account(&address).expect("program data account");
+    // bincode UpgradeableLoaderState::ProgramData: u32 tag (3) · u64 slot · Option<Pubkey> (1 + 32).
+    assert_eq!(
+        &account.data[..4],
+        &3u32.to_le_bytes(),
+        "not a ProgramData account"
+    );
+    match authority {
+        Some(key) => {
+            account.data[12] = 1;
+            account.data[13..45].copy_from_slice(key.as_ref());
+        }
+        None => account.data[12..45].fill(0),
+    }
+    svm.set_account(address, account).unwrap();
 }
 
 // ------------------------------------------------------------------ T1 probe
@@ -943,6 +981,52 @@ fn initialize_config_records_the_admin_and_the_feed_key() {
     assert_eq!(c.admin, env.admin.pubkey());
     assert_eq!(c.feed_authority, env.feed.pubkey());
     assert!(!c.paused);
+}
+
+#[test]
+fn only_the_upgrade_authority_can_initialize_the_config() {
+    let mut env = base_uninitialized();
+    let feed = env.feed.pubkey();
+    // Someone watching the deploy calls initialize first: refused, and nothing is created.
+    let stranger = env.alice.insecure_clone();
+    assert_program_error(
+        env.send(&[init_config_ix(&stranger.pubkey(), &feed)], &[&stranger]),
+        VaultError::NotUpgradeAuthority,
+    );
+    assert!(env.svm.get_account(&pda(&[VCONFIG_SEED])).is_none());
+    // The upgrade authority can, and becomes admin.
+    let admin = env.admin.insecure_clone();
+    env.ok(&[init_config_ix(&admin.pubkey(), &feed)], &[&admin]);
+    assert_eq!(env.config_state().admin, admin.pubkey());
+}
+
+#[test]
+fn initialize_refuses_the_upgrade_authority_of_a_different_program() {
+    // The attacker deploys a program they control and presents its ProgramData as ours.
+    let mut env = base_uninitialized();
+    let attacker = env.alice.insecure_clone();
+    let theirs = Pubkey::new_unique();
+    env.svm
+        .add_program(
+            theirs,
+            include_bytes!("../../../target/deploy/stock_vault.so"),
+        )
+        .unwrap();
+    set_upgrade_authority(&mut env.svm, &theirs, Some(&attacker.pubkey()));
+    let ix = init_config_ix_with(&attacker.pubkey(), &env.feed.pubkey(), programdata(&theirs));
+    assert_program_error(
+        env.send(&[ix], &[&attacker]),
+        VaultError::NotUpgradeAuthority,
+    );
+}
+
+#[test]
+fn a_program_with_no_upgrade_authority_can_never_be_initialized() {
+    let mut env = base_uninitialized();
+    set_upgrade_authority(&mut env.svm, &stock_vault::ID, None);
+    let admin = env.admin.insecure_clone();
+    let ix = init_config_ix(&admin.pubkey(), &env.feed.pubkey());
+    assert_program_error(env.send(&[ix], &[&admin]), VaultError::NotUpgradeAuthority);
 }
 
 #[test]

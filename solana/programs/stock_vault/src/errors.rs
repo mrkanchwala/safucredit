@@ -44,6 +44,8 @@ pub enum VaultError {
     NothingSeized,
     #[msg("Arithmetic overflow")]
     MathOverflow,
+    #[msg("Only the program's upgrade authority can initialize")]
+    NotUpgradeAuthority,
 }
 
 impl From<safu_core::CoreError> for VaultError {
