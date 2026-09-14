@@ -1,6 +1,8 @@
 //! Borrowing limits, liquidation trigger, interest (kinked utilization curve, A5 §5), debt shares.
 
-use crate::{add, apply_bps, collateral::raw_for_usd, div, div_ceil, mul, to_u64, CoreError, Result, BPS};
+use crate::{
+    add, apply_bps, collateral::raw_for_usd, div, div_ceil, mul, to_u64, CoreError, Result, BPS,
+};
 
 /// Debt index fixed-point scale: 1.0 == 1_000_000_000_000.
 pub const INDEX_SCALE: u128 = 1_000_000_000_000;
@@ -42,10 +44,16 @@ pub fn borrow_rate_bps(utilization: u32, curve: RateCurve) -> Result<u32> {
     }
     let u = utilization as u128;
     let rate = if u <= kink {
-        add(curve.base_bps as u128, div(mul(curve.slope1_bps as u128, u)?, kink)?)?
+        add(
+            curve.base_bps as u128,
+            div(mul(curve.slope1_bps as u128, u)?, kink)?,
+        )?
     } else {
         let steep = div(mul(curve.slope2_bps as u128, u - kink)?, BPS - kink)?;
-        add(add(curve.base_bps as u128, curve.slope1_bps as u128)?, steep)?
+        add(
+            add(curve.base_bps as u128, curve.slope1_bps as u128)?,
+            steep,
+        )?
     };
     u32::try_from(rate).map_err(|_| CoreError::Overflow)
 }
@@ -82,7 +90,12 @@ pub fn seize_for_repay(
     multiplier_fp: u128,
     price_fp: u64,
 ) -> Result<u64> {
-    let with_bonus = apply_bps(repay_usd, (BPS as u32).checked_add(bonus_bps).ok_or(CoreError::Overflow)?)?;
+    let with_bonus = apply_bps(
+        repay_usd,
+        (BPS as u32)
+            .checked_add(bonus_bps)
+            .ok_or(CoreError::Overflow)?,
+    )?;
     raw_for_usd(with_bonus, decimals, multiplier_fp, price_fp)
 }
 
@@ -90,7 +103,12 @@ pub fn seize_for_repay(
 mod tests {
     use super::*;
 
-    const CURVE: RateCurve = RateCurve { base_bps: 200, slope1_bps: 800, slope2_bps: 6_000, kink_bps: 8_000 };
+    const CURVE: RateCurve = RateCurve {
+        base_bps: 200,
+        slope1_bps: 800,
+        slope2_bps: 6_000,
+        kink_bps: 8_000,
+    };
 
     #[test]
     fn liquidation_threshold_boundary() {
@@ -105,7 +123,10 @@ mod tests {
         assert_eq!(borrow_rate_bps(8_000, CURVE), Ok(1_000));
         assert_eq!(borrow_rate_bps(9_000, CURVE), Ok(4_000));
         assert_eq!(borrow_rate_bps(10_000, CURVE), Ok(7_000));
-        assert_eq!(borrow_rate_bps(10_001, CURVE), Err(CoreError::InvalidParameter));
+        assert_eq!(
+            borrow_rate_bps(10_001, CURVE),
+            Err(CoreError::InvalidParameter)
+        );
     }
 
     #[test]

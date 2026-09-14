@@ -7,7 +7,12 @@ use crate::{div, mul, pow10, to_u64, CoreError, Result, MULT_SCALE, PRICE_DECIMA
 
 /// Multiplier in effect at `now`. Token-2022's rule: the new value applies at `now >= effective_ts`, and the
 /// stored `multiplier` field is NOT rewritten when that happens, so reading it alone goes stale.
-pub fn effective_multiplier(now: i64, current_fp: u128, new_fp: u128, new_effective_ts: i64) -> u128 {
+pub fn effective_multiplier(
+    now: i64,
+    current_fp: u128,
+    new_fp: u128,
+    new_effective_ts: i64,
+) -> u128 {
     if now >= new_effective_ts {
         new_fp
     } else {
@@ -35,7 +40,10 @@ pub fn raw_for_usd(usd: u64, decimals: u8, multiplier_fp: u128, price_fp: u64) -
     if multiplier_fp == 0 {
         return Err(CoreError::InvalidMultiplier);
     }
-    let usd_price_units = mul(mul(usd as u128, pow10(PRICE_DECIMALS - USD_DECIMALS)?)?, pow10(decimals as u32)?)?;
+    let usd_price_units = mul(
+        mul(usd as u128, pow10(PRICE_DECIMALS - USD_DECIMALS)?)?,
+        pow10(decimals as u32)?,
+    )?;
     let scaled_raw = div(usd_price_units, price_fp as u128)?;
     to_u64(div(mul(scaled_raw, MULT_SCALE)?, multiplier_fp)?)
 }
@@ -58,18 +66,23 @@ mod tests {
 
     #[test]
     fn four_for_one_split_keeps_value_when_price_and_multiplier_move_together() {
-        let before = collateral_value(100_000_000, AAPLX_DECIMALS, MULT_SCALE, 40_000_000_000).unwrap();
-        let after = collateral_value(100_000_000, AAPLX_DECIMALS, 4 * MULT_SCALE, 10_000_000_000).unwrap();
+        let before =
+            collateral_value(100_000_000, AAPLX_DECIMALS, MULT_SCALE, 40_000_000_000).unwrap();
+        let after =
+            collateral_value(100_000_000, AAPLX_DECIMALS, 4 * MULT_SCALE, 10_000_000_000).unwrap();
         assert_eq!(before, after);
     }
 
     #[test]
     fn desync_cases_move_value_by_the_split_ratio() {
-        let fair = collateral_value(100_000_000, AAPLX_DECIMALS, MULT_SCALE, 40_000_000_000).unwrap();
+        let fair =
+            collateral_value(100_000_000, AAPLX_DECIMALS, MULT_SCALE, 40_000_000_000).unwrap();
         // Price updated first (÷4), multiplier not yet: collateral reads 4× too low → wrongful liquidation.
-        let price_first = collateral_value(100_000_000, AAPLX_DECIMALS, MULT_SCALE, 10_000_000_000).unwrap();
+        let price_first =
+            collateral_value(100_000_000, AAPLX_DECIMALS, MULT_SCALE, 10_000_000_000).unwrap();
         // Multiplier first (×4), price not yet: collateral reads 4× too high → over-borrowing.
-        let mult_first = collateral_value(100_000_000, AAPLX_DECIMALS, 4 * MULT_SCALE, 40_000_000_000).unwrap();
+        let mult_first =
+            collateral_value(100_000_000, AAPLX_DECIMALS, 4 * MULT_SCALE, 40_000_000_000).unwrap();
         assert_eq!(price_first * 4, fair);
         assert_eq!(mult_first, fair * 4);
     }
@@ -83,8 +96,14 @@ mod tests {
 
     #[test]
     fn zero_multiplier_and_zero_price_are_errors_not_panics() {
-        assert_eq!(collateral_value(1, 8, 0, 1), Err(CoreError::InvalidMultiplier));
-        assert_eq!(raw_for_usd(1, 8, MULT_SCALE, 0), Err(CoreError::DivideByZero));
+        assert_eq!(
+            collateral_value(1, 8, 0, 1),
+            Err(CoreError::InvalidMultiplier)
+        );
+        assert_eq!(
+            raw_for_usd(1, 8, MULT_SCALE, 0),
+            Err(CoreError::DivideByZero)
+        );
     }
 
     #[test]

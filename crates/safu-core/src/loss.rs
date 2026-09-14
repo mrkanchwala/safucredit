@@ -43,7 +43,10 @@ mod tests {
 
     #[test]
     fn no_loss_when_debt_repaid_covers_fair_value() {
-        assert_eq!(wrongful_loss(100_000_000, 8, MULT_SCALE, 10_000_000_000, 250_000_000), Ok(0));
+        assert_eq!(
+            wrongful_loss(100_000_000, 8, MULT_SCALE, 10_000_000_000, 250_000_000),
+            Ok(0)
+        );
     }
 
     #[test]

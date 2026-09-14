@@ -93,7 +93,10 @@ mod tests {
     #[test]
     fn twap_errors() {
         assert_eq!(twap(&[], 10), Err(CoreError::EmptySamples));
-        assert_eq!(twap(&[s(1, 20), s(2, 10)], 30), Err(CoreError::UnsortedSamples));
+        assert_eq!(
+            twap(&[s(1, 20), s(2, 10)], 30),
+            Err(CoreError::UnsortedSamples)
+        );
         assert_eq!(twap(&[s(1, 20)], 10), Err(CoreError::UnsortedSamples));
     }
 
@@ -114,13 +117,24 @@ mod tests {
         assert_eq!(clamp_to_band(12_000, 10_000, 1_000), Ok(11_000));
         assert_eq!(clamp_to_band(8_000, 10_000, 1_000), Ok(9_000));
         assert_eq!(clamp_to_band(10_300, 10_000, 1_000), Ok(10_300));
-        assert_eq!(clamp_to_band(1, 10_000, 10_001), Err(CoreError::InvalidParameter));
+        assert_eq!(
+            clamp_to_band(1, 10_000, 10_001),
+            Err(CoreError::InvalidParameter)
+        );
     }
 
     #[test]
     fn dividend_step_never_pauses() {
         // Live AAPLx step 1.0026642 → 1.0032690 (~6 bps) against a 500 bps cap.
-        let active = split_window_active(1_000, 1_002_664_200_000, 1_003_269_000_000, 1_000, 500, 3_600).unwrap();
+        let active = split_window_active(
+            1_000,
+            1_002_664_200_000,
+            1_003_269_000_000,
+            1_000,
+            500,
+            3_600,
+        )
+        .unwrap();
         assert!(!active);
     }
 

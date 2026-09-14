@@ -24,6 +24,17 @@ custom-panic = []
 anchor-lang = "=1.1.2"
 anchor-spl = { version = "=1.1.2", features = ["token", "token_2022"] }
 safu-core = { path = "../../../crates/safu-core" }
+# Both already resolved in the vetted lockfile at these versions (transitive via anchor-lang).
+solana-instructions-sysvar = "3.0.1"
+solana-sdk-ids = "3.1.0"
+
+[dev-dependencies]
+litesvm = { version = "0.10.0", features = ["precompiles"] }
+solana-message = "3.0.1"
+solana-transaction = "3.0.2"
+solana-signer = "3.0.0"
+solana-keypair = "3.0.1"
+solana-account = "3.4.0"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

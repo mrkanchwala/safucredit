@@ -69,5 +69,8 @@ pub fn apply_bps(amount: u64, bps: u32) -> Result<u64> {
 
 /// Absolute difference between `value` and `reference`, in basis points of `reference`.
 pub fn bps_diff(value: u64, reference: u64) -> Result<u128> {
-    div(mul(value.abs_diff(reference) as u128, BPS)?, reference as u128)
+    div(
+        mul(value.abs_diff(reference) as u128, BPS)?,
+        reference as u128,
+    )
 }

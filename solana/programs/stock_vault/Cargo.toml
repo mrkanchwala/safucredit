@@ -26,7 +26,7 @@ anchor-spl = { version = "=1.1.2", features = ["token_2022", "token_2022_extensi
 safu-core = { path = "../../../crates/safu-core" }
 
 [dev-dependencies]
-litesvm = "0.10.0"
+litesvm = { version = "0.10.0", features = ["precompiles"] }
 solana-message = "3.0.1"
 solana-transaction = "3.0.2"
 solana-signer = "3.0.0"

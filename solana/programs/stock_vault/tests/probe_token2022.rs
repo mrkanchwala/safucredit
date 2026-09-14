@@ -19,7 +19,11 @@ use spl_token_2022_interface::{
     ID as TOKEN_2022,
 };
 
-fn send(svm: &mut LiteSVM, ixs: &[anchor_lang::solana_program::instruction::Instruction], signers: &[&Keypair]) {
+fn send(
+    svm: &mut LiteSVM,
+    ixs: &[anchor_lang::solana_program::instruction::Instruction],
+    signers: &[&Keypair],
+) {
     let msg = Message::new_with_blockhash(ixs, Some(&signers[0].pubkey()), &svm.latest_blockhash());
     let tx = VersionedTransaction::try_new(VersionedMessage::Legacy(msg), signers).unwrap();
     if let Err(e) = svm.send_transaction(tx) {
@@ -30,8 +34,12 @@ fn send(svm: &mut LiteSVM, ixs: &[anchor_lang::solana_program::instruction::Inst
 fn read_config(svm: &LiteSVM, mint: &Pubkey) -> (f64, i64, f64, bool) {
     let acc = svm.get_account(mint).expect("mint exists");
     let state = StateWithExtensions::<Mint>::unpack(&acc.data).expect("unpack mint");
-    let s = state.get_extension::<ScaledUiAmountConfig>().expect("scaled ui amount ext");
-    let p = state.get_extension::<PausableConfig>().expect("pausable ext");
+    let s = state
+        .get_extension::<ScaledUiAmountConfig>()
+        .expect("scaled ui amount ext");
+    let p = state
+        .get_extension::<PausableConfig>()
+        .expect("pausable ext");
     (
         f64::from_le_bytes(s.multiplier.0),
         i64::from(s.new_multiplier_effective_timestamp),
@@ -65,10 +73,23 @@ fn litesvm_token2022_supports_scaled_ui_amount_and_pausable() {
                 space as u64,
                 &TOKEN_2022,
             ),
-            scaled_ui_amount::instruction::initialize(&TOKEN_2022, &mint.pubkey(), Some(issuer.pubkey()), 1.0026642)
+            scaled_ui_amount::instruction::initialize(
+                &TOKEN_2022,
+                &mint.pubkey(),
+                Some(issuer.pubkey()),
+                1.0026642,
+            )
+            .unwrap(),
+            pausable::instruction::initialize(&TOKEN_2022, &mint.pubkey(), &issuer.pubkey())
                 .unwrap(),
-            pausable::instruction::initialize(&TOKEN_2022, &mint.pubkey(), &issuer.pubkey()).unwrap(),
-            initialize_mint2(&TOKEN_2022, &mint.pubkey(), &issuer.pubkey(), Some(&issuer.pubkey()), 8).unwrap(),
+            initialize_mint2(
+                &TOKEN_2022,
+                &mint.pubkey(),
+                &issuer.pubkey(),
+                Some(&issuer.pubkey()),
+                8,
+            )
+            .unwrap(),
         ],
         &[&issuer, &mint],
     );
@@ -93,14 +114,20 @@ fn litesvm_token2022_supports_scaled_ui_amount_and_pausable() {
         &[&issuer],
     );
     let (m, ts, new_m, _) = read_config(&svm, &mint.pubkey());
-    assert_eq!(m, 1.0026642, "current multiplier unchanged before the effective timestamp");
+    assert_eq!(
+        m, 1.0026642,
+        "current multiplier unchanged before the effective timestamp"
+    );
     assert_eq!(ts, split_ts);
     assert_eq!(new_m, 4.0106568);
 
     // Issuer pause must be visible to a reader.
     send(
         &mut svm,
-        &[pausable::instruction::pause(&TOKEN_2022, &mint.pubkey(), &issuer.pubkey(), &[]).unwrap()],
+        &[
+            pausable::instruction::pause(&TOKEN_2022, &mint.pubkey(), &issuer.pubkey(), &[])
+                .unwrap(),
+        ],
         &[&issuer],
     );
     let (_, _, _, paused) = read_config(&svm, &mint.pubkey());

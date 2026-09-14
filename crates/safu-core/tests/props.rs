@@ -3,7 +3,10 @@
 use proptest::prelude::*;
 use safu_core::{
     collateral::{collateral_value, effective_multiplier, raw_for_usd},
-    lending::{debt_for_shares, is_liquidatable, max_borrow, seize_for_repay, shares_for_borrow, shares_for_repay},
+    lending::{
+        debt_for_shares, is_liquidatable, max_borrow, seize_for_repay, shares_for_borrow,
+        shares_for_repay,
+    },
     loss::{payout, wrongful_loss},
     price::{clamp_to_band, split_window_active, twap, Sample},
     MULT_SCALE,
