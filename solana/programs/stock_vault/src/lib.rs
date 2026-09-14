@@ -45,6 +45,14 @@ pub mod stock_vault {
         Ok(())
     }
 
+    /// Admin rotation (U5), matching the backstop. Refuses the default key, which would leave the
+    /// vault with no reachable admin.
+    pub fn set_admin(ctx: Context<AdminOnly>, admin: Pubkey) -> Result<()> {
+        require_keys_neq!(admin, Pubkey::default(), VaultError::InvalidAdmin);
+        ctx.accounts.config.admin = admin;
+        Ok(())
+    }
+
     /// Clears a hold raised by `unobserved_multiplier_change`. The feed authority or the admin
     /// attests that the price feed and the token's multiplier are back in step, and the market
     /// resumes against the new value.

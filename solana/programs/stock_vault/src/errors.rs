@@ -46,6 +46,8 @@ pub enum VaultError {
     MathOverflow,
     #[msg("Only the program's upgrade authority can initialize")]
     NotUpgradeAuthority,
+    #[msg("Admin cannot be the default key")]
+    InvalidAdmin,
 }
 
 impl From<safu_core::CoreError> for VaultError {

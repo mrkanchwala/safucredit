@@ -617,6 +617,14 @@ fn set_feed_authority_ix(admin: &Pubkey, feed_authority: &Pubkey) -> Instruction
     }
 }
 
+fn set_admin_ix(admin: &Pubkey, new_admin: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: stock_vault::ID,
+        accounts: admin_only_metas(admin),
+        data: stock_vault::instruction::SetAdmin { admin: *new_admin }.data(),
+    }
+}
+
 fn update_params_ix(admin: &Pubkey, coll_mint: &Pubkey, params: MarketParams) -> Instruction {
     Instruction {
         program_id: stock_vault::ID,
@@ -1043,6 +1051,46 @@ fn a_non_admin_cannot_pause_or_rotate_the_feed_key() {
         VaultError::Unauthorized,
     );
     assert!(!env.config_state().paused);
+}
+
+#[test]
+fn rotating_the_admin_hands_over_control_and_retires_the_old_key() {
+    let mut env = base();
+    let old = env.admin.insecure_clone();
+    let new = Keypair::new();
+    env.svm.airdrop(&new.pubkey(), 1_000_000_000).unwrap();
+
+    env.ok(&[set_admin_ix(&old.pubkey(), &new.pubkey())], &[&old]);
+    assert_eq!(env.config_state().admin, new.pubkey());
+
+    assert_program_error(
+        env.send(&[set_paused_ix(&old.pubkey(), true)], &[&old]),
+        VaultError::Unauthorized,
+    );
+    env.ok(&[set_paused_ix(&new.pubkey(), true)], &[&new]);
+    assert!(env.config_state().paused);
+}
+
+#[test]
+fn a_non_admin_cannot_rotate_the_admin_and_the_default_key_is_refused() {
+    let mut env = base();
+    let intruder = env.alice.insecure_clone();
+    assert_program_error(
+        env.send(
+            &[set_admin_ix(&intruder.pubkey(), &intruder.pubkey())],
+            &[&intruder],
+        ),
+        VaultError::Unauthorized,
+    );
+    let admin = env.admin.insecure_clone();
+    assert_program_error(
+        env.send(
+            &[set_admin_ix(&admin.pubkey(), &Pubkey::default())],
+            &[&admin],
+        ),
+        VaultError::InvalidAdmin,
+    );
+    assert_eq!(env.config_state().admin, admin.pubkey());
 }
 
 #[test]

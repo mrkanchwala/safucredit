@@ -949,6 +949,54 @@ fn a_backer_cannot_queue_more_shares_than_they_hold() {
 
 // ------------------------------------------------------------------ admin knobs
 
+/// `set_admin` existed since 2c without a test of its own.
+#[test]
+fn rotating_the_backstop_admin_hands_over_control_and_retires_the_old_key() {
+    let mut env = base();
+    let old = env.admin.insecure_clone();
+    let new = Keypair::new();
+    env.svm.airdrop(&new.pubkey(), 1_000_000_000).unwrap();
+    let set_admin = |env: &Env, signer: &Pubkey, to: Pubkey| {
+        env.b_ix(
+            backstop::accounts::AdminOnly {
+                admin: *signer,
+                config: env.b_config(),
+            },
+            backstop::instruction::SetAdmin { admin: to },
+        )
+    };
+    let knobs = |env: &Env, signer: &Pubkey| {
+        env.b_ix(
+            backstop::accounts::AdminOnly {
+                admin: *signer,
+                config: env.b_config(),
+            },
+            backstop::instruction::SetBackstopParams {
+                per_claim_cap_bps: 2_000,
+                withdraw_delay_secs: 3_600,
+            },
+        )
+    };
+
+    let intruder = env.alice.insecure_clone();
+    let ix = set_admin(&env, &intruder.pubkey(), intruder.pubkey());
+    assert_program_error(env.send(&[ix], &[&intruder]), VerdictError::Unauthorized);
+    let ix = set_admin(&env, &old.pubkey(), Pubkey::default());
+    assert_program_error(env.send(&[ix], &[&old]), VerdictError::InvalidParams);
+
+    let ix = set_admin(&env, &old.pubkey(), new.pubkey());
+    env.ok(&[ix], &[&old]);
+    let ix = knobs(&env, &old.pubkey());
+    assert_program_error(env.send(&[ix], &[&old]), VerdictError::Unauthorized);
+    let ix = knobs(&env, &new.pubkey());
+    env.ok(&[ix], &[&new]);
+
+    let data = env.svm.get_account(&env.b_config()).unwrap().data;
+    let config = BackstopConfig::try_deserialize(&mut &data[..]).unwrap();
+    assert_eq!(config.admin, new.pubkey());
+    assert_eq!(config.per_claim_cap_bps, 2_000);
+}
+
 #[test]
 fn only_the_admin_can_rotate_the_oracle_or_move_the_knobs() {
     let mut env = base();
