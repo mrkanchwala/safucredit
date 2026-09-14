@@ -768,6 +768,20 @@ impl Env {
 
     /// Multiplier in fixed point exactly as the program computes it — never a hand-copied constant,
     /// because `(f64 × 1e12).floor()` is not always the decimal you would write down.
+    fn acknowledge_ix(&self, authority: &Pubkey) -> Instruction {
+        Instruction {
+            program_id: stock_vault::ID,
+            accounts: stock_vault::accounts::AcknowledgeMultiplier {
+                authority: *authority,
+                config: self.config(),
+                market: self.market(),
+                collateral_mint: self.coll_mint,
+            }
+            .to_account_metas(None),
+            data: stock_vault::instruction::AcknowledgeMultiplier {}.data(),
+        }
+    }
+
     fn mult_fp(&self) -> u128 {
         let acc = self.svm.get_account(&self.coll_mint).unwrap();
         let state =
@@ -1707,5 +1721,142 @@ fn a_backdated_multiplier_update_leaves_no_pending_schedule() {
         f64::from(cfg.multiplier),
         f64::from(cfg.new_multiplier),
         "no schedule is left pending after a back-dated update"
+    );
+}
+
+// --------------------------------------------- unannounced (back-dated) multiplier changes
+//
+// The hole these close: Token-2022 collapses a back-dated `update_multiplier` into both fields, so
+// the schedule-based hold sees nothing and the collateral value jumps by the split ratio with no
+// pause at all. The mint's activation timestamp cannot be used instead — the issuer chooses it.
+
+#[test]
+fn an_unannounced_split_holds_borrowing() {
+    let mut env = full();
+    let alice = env.alice.insecure_clone();
+    let baseline = env.market_state().observed_multiplier_fp;
+    assert!(baseline > 0, "create_market seeds the baseline");
+
+    // 4-for-1 applied the moment it takes effect: no schedule is ever visible.
+    env.schedule_multiplier(MULT * 4.0, env.now - 1_000);
+    assert!(env.mult_fp() > baseline * 3);
+
+    env.warp(60);
+    let ix = env.borrow_ix(&alice.pubkey(), &env.alice_usdc, 100 * USDC);
+    assert_program_error(env.send(&[ix], &[&alice]), VaultError::CorporateActionHold);
+}
+
+#[test]
+fn an_unannounced_change_dated_to_the_epoch_still_holds() {
+    // The case that rules out counting from the mint's own timestamp: an issuer can back-date far
+    // enough that every window — the ±15 min pause and the 24 h split hold — is long expired.
+    let mut env = full();
+    let alice = env.alice.insecure_clone();
+    env.schedule_multiplier(MULT * 4.0, 0);
+
+    env.warp(60);
+    let ix = env.borrow_ix(&alice.pubkey(), &env.alice_usdc, 100 * USDC);
+    assert_program_error(env.send(&[ix], &[&alice]), VaultError::CorporateActionHold);
+}
+
+#[test]
+fn the_unannounced_hold_does_not_expire_with_time() {
+    let mut env = full();
+    let (alice, feed) = (env.alice.insecure_clone(), env.feed.insecure_clone());
+    env.schedule_multiplier(MULT * 4.0, env.now - 1_000);
+
+    // Well past both the activation pause and the 24 h split hold that bound the scheduled path.
+    env.warp(30 * 86_400);
+    let fresh = env.push_price_ix(&feed.pubkey(), PRICE, true, PRICE);
+    env.ok(&[fresh], &[&feed]);
+    let ix = env.borrow_ix(&alice.pubkey(), &env.alice_usdc, 100 * USDC);
+    assert_program_error(env.send(&[ix], &[&alice]), VaultError::CorporateActionHold);
+}
+
+#[test]
+fn an_unannounced_split_also_blocks_collateral_withdrawal() {
+    let mut env = full();
+    let alice = env.alice.insecure_clone();
+    let borrow = env.borrow_ix(&alice.pubkey(), &env.alice_usdc, 500 * USDC);
+    env.ok(&[borrow], &[&alice]);
+
+    env.schedule_multiplier(MULT * 4.0, env.now - 1_000);
+    env.warp(60);
+    let ix = env.withdraw_collateral_ix(&alice.pubkey(), &env.alice_coll, ONE_SHARE);
+    assert_program_error(env.send(&[ix], &[&alice]), VaultError::CorporateActionHold);
+}
+
+#[test]
+fn acknowledging_an_unannounced_split_resumes_borrowing() {
+    let mut env = full();
+    let (alice, feed) = (env.alice.insecure_clone(), env.feed.insecure_clone());
+    env.schedule_multiplier(MULT * 4.0, env.now - 1_000);
+    env.warp(60);
+    let blocked = env.borrow_ix(&alice.pubkey(), &env.alice_usdc, 100 * USDC);
+    assert_program_error(
+        env.send(&[blocked], &[&alice]),
+        VaultError::CorporateActionHold,
+    );
+
+    let ack = env.acknowledge_ix(&feed.pubkey());
+    env.ok(&[ack], &[&feed]);
+    assert_eq!(
+        env.market_state().observed_multiplier_fp,
+        env.mult_fp(),
+        "the baseline moves to the value the market now acts on"
+    );
+
+    env.warp(60);
+    let ix = env.borrow_ix(&alice.pubkey(), &env.alice_usdc, 100 * USDC);
+    env.ok(&[ix], &[&alice]);
+}
+
+#[test]
+fn the_admin_can_also_acknowledge_but_a_borrower_cannot() {
+    let mut env = full();
+    let (alice, admin) = (env.alice.insecure_clone(), env.admin.insecure_clone());
+    env.schedule_multiplier(MULT * 4.0, env.now - 1_000);
+    env.warp(60);
+
+    let theirs = env.acknowledge_ix(&alice.pubkey());
+    assert_program_error(env.send(&[theirs], &[&alice]), VaultError::Unauthorized);
+
+    let ours = env.acknowledge_ix(&admin.pubkey());
+    env.ok(&[ours], &[&admin]);
+}
+
+#[test]
+fn acknowledging_against_a_flagged_price_is_refused() {
+    let mut env = full();
+    let feed = env.feed.insecure_clone();
+    env.schedule_multiplier(MULT * 4.0, env.now - 1_000);
+
+    // A flagged feed is the wrong moment to attest that price and multiplier are back in step.
+    env.warp(60);
+    let spike = env.push_price_ix(&feed.pubkey(), PRICE * 2, true, PRICE);
+    env.ok(&[spike], &[&feed]);
+    assert!(env.market_state().price.flagged);
+
+    let ack = env.acknowledge_ix(&feed.pubkey());
+    assert_program_error(env.send(&[ack], &[&feed]), VaultError::PriceUnavailable);
+}
+
+#[test]
+fn an_unannounced_dividend_step_does_not_halt_the_market() {
+    // Routine dividend steps land unannounced all the time — the live AAPLx mint carried a ~6 bps
+    // step. Holding the whole market for a move the price deviation cap already tolerates would be
+    // a liveness bug, so only changes beyond `split_cap_bps` halt it.
+    let mut env = full();
+    let alice = env.alice.insecure_clone();
+    let baseline = env.market_state().observed_multiplier_fp;
+    env.schedule_multiplier(MULT * 1.0006, env.now - 1_000);
+
+    env.warp(60);
+    let ix = env.borrow_ix(&alice.pubkey(), &env.alice_usdc, 100 * USDC);
+    env.ok(&[ix], &[&alice]);
+    let after = env.market_state().observed_multiplier_fp;
+    assert!(
+        after != baseline && after == env.mult_fp(),
+        "a sub-threshold change moves the baseline instead of halting"
     );
 }

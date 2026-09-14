@@ -1,0 +1,32 @@
+# cargo-audit configuration for the SAFU Credit Solana workspace.
+#
+# Every ignore below is a TEST-ONLY advisory: the crate reaches the dependency graph solely through
+# `litesvm`, which is a dev-dependency, and never appears in the program binary that gets deployed.
+# That claim is not taken on trust — `scripts/audit-gate.sh` re-derives it on every run against the
+# non-dev dependency graph and fails if any of these crates ever becomes a real dependency.
+#
+# Do NOT add an entry here for an advisory that touches the deployed program. Fix it instead.
+# Reviewed 2026-09-14.
+
+[advisories]
+ignore = [
+    # ed25519-dalek 1.0.1 — double public key signing oracle.
+    # Path: litesvm (dev) -> agave-precompiles -> ed25519-dalek 1.0.1.
+    # Upstream-blocked: agave-precompiles still pins dalek 1.x as of litesvm 0.16.0 (checked
+    # 2026-09-14 by bumping to 0.16.0 — the chain is unchanged, so the bump buys nothing).
+    # SAFU's own oracle signatures are verified by the Solana Ed25519 precompile on-chain, not by
+    # this crate.
+    "RUSTSEC-2022-0093",
+
+    # curve25519-dalek 3.2.0 — timing variability in Scalar29::sub / Scalar52::sub.
+    # Same path and same upstream block as RUSTSEC-2022-0093.
+    "RUSTSEC-2024-0344",
+
+    # rand 0.7.3 — unsound with a custom logger using rand::rng().
+    # Test-only; logged during the 2026-09-14 P3 pre-check before it had an ignore entry.
+    "RUSTSEC-2026-0097",
+]
+
+# Unmaintained-crate warnings (ansi_term, bincode, derivative, libsecp256k1, paste) come from the
+# Solana and Anchor toolchains themselves and are deliberately NOT ignored: they stay visible as
+# warnings so the list gets re-read, and they do not fail the gate.

@@ -154,7 +154,11 @@ pub struct Market {
     pub bad_debt: u64,
     pub issuer_halt: bool,
     pub liq_seq: u64,
-    pub reserved: [u8; 64],
+    /// Effective multiplier this market last acted on, in `MULT_SCALE` fixed point. The baseline the
+    /// unannounced-change guard compares the live value against. Seeded by `create_market`; 0 means
+    /// "not yet observed", which the guard treats as no change rather than as a change from zero.
+    pub observed_multiplier_fp: u128,
+    pub reserved: [u8; 48],
 }
 
 #[account]

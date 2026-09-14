@@ -95,6 +95,41 @@ pub fn corporate_action_hold(m: &Market, schedule: &MultiplierSchedule, now: i64
     false
 }
 
+/// A multiplier change that arrived with no schedule this guard could see.
+///
+/// Token-2022 applies a back-dated or immediate `update_multiplier` at once, collapsing the new
+/// value into BOTH the stored and the scheduled field. `corporate_action_hold` therefore has
+/// nothing to key on, and the mint's own activation timestamp cannot stand in for one: it is chosen
+/// by the issuer, so a value of 0 would put every time window in the distant past and defeat any
+/// rule counted from it. The only trustworthy evidence such a change happened is that the effective
+/// multiplier differs from the value this market last acted on.
+///
+/// Fail-closed by design: this hold has **no time-based expiry** and is cleared only by
+/// `acknowledge_multiplier`, precisely because there is no timestamp the contract could safely
+/// count from.
+///
+/// Gated on `split_cap_bps`, the same threshold that separates a split from a routine dividend
+/// step: a change at or below it can move collateral value by no more than the price deviation cap
+/// already tolerates, so it updates the baseline without halting the market. Known limit of that
+/// choice: many sub-threshold steps in a row each update the baseline and so never aggregate into a
+/// hold. For the real corporate actions this guards against — splits and reverse splits, which move
+/// the multiplier by whole multiples — that is not reachable.
+pub fn unobserved_multiplier_change(m: &Market, schedule: &MultiplierSchedule, now: i64) -> bool {
+    if m.observed_multiplier_fp == 0 || schedule.has_activation() {
+        return false;
+    }
+    let effective = schedule.effective(now);
+    if effective == m.observed_multiplier_fp {
+        return false;
+    }
+    let change_bps = m
+        .observed_multiplier_fp
+        .abs_diff(effective)
+        .saturating_mul(BPS)
+        / m.observed_multiplier_fp;
+    change_bps > m.params.split_cap_bps as u128
+}
+
 /// Spec 14: an issuer pause or an added transfer hook halts new borrows and liquidations.
 pub fn issuer_blocks(mint: &AccountInfo) -> bool {
     let paused = get_mint_extension_data::<PausableConfig>(mint)

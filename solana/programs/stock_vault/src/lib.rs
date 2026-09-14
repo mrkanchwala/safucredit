@@ -42,6 +42,35 @@ pub mod stock_vault {
         Ok(())
     }
 
+    /// Clears a hold raised by `unobserved_multiplier_change`. The feed authority or the admin
+    /// attests that the price feed and the token's multiplier are back in step, and the market
+    /// resumes against the new value.
+    ///
+    /// This is an operational gate on an unannounced corporate action, not a claims decision: it
+    /// cannot move anyone's money, cannot raise or lower a payout, and is recorded on-chain by the
+    /// event below.
+    pub fn acknowledge_multiplier(ctx: Context<AcknowledgeMultiplier>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let mint_info = ctx.accounts.collateral_mint.to_account_info();
+        let schedule = MultiplierSchedule::read(&mint_info)?;
+        let market_key = ctx.accounts.market.key();
+        let market = &mut ctx.accounts.market;
+        // Attesting against a missing or flagged price would defeat the point of the hold.
+        require!(
+            market.price.count > 0 && !market.price.flagged,
+            VaultError::PriceUnavailable
+        );
+        let previous = market.observed_multiplier_fp;
+        let effective = schedule.effective(now);
+        market.observed_multiplier_fp = effective;
+        emit!(MultiplierAcknowledged {
+            market: market_key,
+            previous,
+            effective,
+        });
+        Ok(())
+    }
+
     pub fn create_market(ctx: Context<CreateMarket>, params: MarketParams) -> Result<()> {
         params.validate()?;
 
@@ -51,7 +80,7 @@ pub mod stock_vault {
             anchor_spl::token_2022::ID,
             VaultError::UnsupportedCollateralMint
         );
-        MultiplierSchedule::read(&collateral)?;
+        let schedule = MultiplierSchedule::read(&collateral)?;
         reject_risky_mint(&collateral)?;
         let usdc = ctx.accounts.usdc_mint.to_account_info();
         if *usdc.owner == anchor_spl::token_2022::ID {
@@ -77,7 +106,8 @@ pub mod stock_vault {
         market.bad_debt = 0;
         market.issuer_halt = false;
         market.liq_seq = 0;
-        market.reserved = [0; 64];
+        market.observed_multiplier_fp = schedule.effective(now);
+        market.reserved = [0; 48];
 
         emit!(MarketCreated {
             market: market.key(),
@@ -305,9 +335,11 @@ pub mod stock_vault {
             );
             let schedule = MultiplierSchedule::read(&mint_info)?;
             require!(
-                !corporate_action_hold(market, &schedule, now),
+                !corporate_action_hold(market, &schedule, now)
+                    && !unobserved_multiplier_change(market, &schedule, now),
                 VaultError::CorporateActionHold
             );
+            market.observed_multiplier_fp = schedule.effective(now);
             let price = risk_price(market, now, PriceUse::Borrow)?;
             let remaining = position.raw_collateral - amount;
             let value_after = value_of(market, remaining, schedule.effective(now), price)?;
@@ -357,9 +389,11 @@ pub mod stock_vault {
         );
         let schedule = MultiplierSchedule::read(&mint_info)?;
         require!(
-            !corporate_action_hold(market, &schedule, now),
+            !corporate_action_hold(market, &schedule, now)
+                && !unobserved_multiplier_change(market, &schedule, now),
             VaultError::CorporateActionHold
         );
+        market.observed_multiplier_fp = schedule.effective(now);
         let price = risk_price(market, now, PriceUse::Borrow)?;
 
         let position = &mut ctx.accounts.position;
@@ -526,6 +560,23 @@ pub struct CreateMarket<'info> {
     pub collateral_token_program: Interface<'info, TokenInterface>,
     pub usdc_token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct AcknowledgeMultiplier<'info> {
+    pub authority: Signer<'info>,
+    #[account(
+        seeds = [VCONFIG_SEED],
+        bump = config.bump,
+        constraint = config.feed_authority == authority.key() || config.admin == authority.key()
+            @ VaultError::Unauthorized,
+    )]
+    pub config: Account<'info, VaultConfig>,
+    #[account(mut, seeds = [MARKET_SEED, market.collateral_mint.as_ref()], bump = market.bump)]
+    pub market: Box<Account<'info, Market>>,
+    /// Read for the live multiplier schedule.
+    #[account(address = market.collateral_mint)]
+    pub collateral_mint: Box<InterfaceAccount<'info, Mint>>,
 }
 
 #[derive(Accounts)]
@@ -738,6 +789,13 @@ pub struct MarketCreated {
 #[event]
 pub struct PausedSet {
     pub paused: bool,
+}
+
+#[event]
+pub struct MultiplierAcknowledged {
+    pub market: Pubkey,
+    pub previous: u128,
+    pub effective: u128,
 }
 
 #[event]
