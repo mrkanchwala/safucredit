@@ -1,0 +1,10 @@
+{
+  "cluster": "devnet",
+  "stockVaultProgram": "GkQw6VGDKYBWJtgtWUmFDkHNqGrnyjSviQeQzVMW35K2",
+  "backstopProgram": "H1hApKnNkYPsqQ9WVZGzqZQZYirxCLpXDj2uEmzMK3YV",
+  "aaplxMint": "E6RUf1bawAkoNEgQGtyEUN5HRbFtnuLRmeYDtUtqjRSg",
+  "usdcMint": "Cujm3S48mCeQHnNfAEarYfuwoSwgp9gLPFVVrdDVV8wn",
+  "market": "ChKC3KygoKKvYz173rtxFDHbiC7YJM1P1tF7m6fcrevc",
+  "collateralVault": "CqK5gtehP3SfhUY5nUvC91kM41FaAKvqNVGvz5ioF2mr",
+  "usdcVault": "76S4bK99LPNyRKzwt9XKTyHBjL1PK9zArDHBrWc942Fm"
+}

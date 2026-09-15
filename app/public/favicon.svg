@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <rect width="32" height="32" fill="#000"/>
+  <text x="16" y="14" font-family="Arial Black,Arial,sans-serif" font-weight="900" font-size="13" fill="#fff" text-anchor="middle" letter-spacing="0.5">SA</text>
+  <text x="16" y="27" font-family="Arial Black,Arial,sans-serif" font-weight="900" font-size="13" fill="#fff" text-anchor="middle" letter-spacing="0.5">FU</text>
+  <text x="27" y="8" font-family="Arial Black,Arial,sans-serif" font-weight="900" font-size="8" fill="#FF3B3B" text-anchor="middle">✳</text>
+</svg>
