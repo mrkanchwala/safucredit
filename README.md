@@ -36,18 +36,20 @@ Deposit tokenized stock (xStocks) as collateral and borrow USDC against it, same
 | 50%–95% | Up to 25% of your debt liquidated per event, 1–5% bonus to whoever liquidates |
 | Above 95% | Full position can be liquidated at once |
 
-**Covered / not covered:**
+**Covered / not covered.** Every row below links straight to the test that proves it.
 
-| Situation | What happens | Costs SAFU anything? |
-|---|---|---|
-| Slow wrong-price drift | Liquidated, then repaid 1:1 | Yes, a real payout |
-| Single price spike | Blocked before it can liquidate you | No, never liquidated |
-| Stock split | Held until repriced correctly | No, never liquidated |
-| Unannounced split | Frozen until acknowledged | No, never liquidated |
-| Genuine price crash | Liquidated, nothing paid. On-chain denial shown. | No, correct outcome |
-| Gap at market open | Not covered. Closed market, no price to verify. | N/A, disclosed at deposit |
-| Issuer freezes the stock | Market halts. Nothing liquidated or paid. | N/A, collateral itself is stuck |
-| Same wallet backs the pool and borrows from it | Both allowed together, but the payout is blocked while that wallet still holds backer shares | N/A, self-dealing guard |
+| Situation | What happens | Costs SAFU anything? | Proven by |
+|---|---|---|---|
+| Slow wrong-price drift | Liquidated, then repaid 1:1 | Yes, a real payout | [`valid_facts_admit_the_claim`](https://github.com/mrkanchwala/safucredit/blob/main/solana/programs/backstop/tests/verdict_litesvm.rs#L607) |
+| Single price spike | Blocked before it can liquidate you | No, never liquidated | [`a_spike_beyond_the_cap_is_flagged_and_kept_out_of_the_twap`](https://github.com/mrkanchwala/safucredit/blob/main/solana/programs/stock_vault/tests/vault_litesvm.rs#L1395) |
+| Stock split | Held until repriced correctly | No, never liquidated | [`liquidation_is_blocked_inside_a_scheduled_split_hold`](https://github.com/mrkanchwala/safucredit/blob/main/solana/programs/stock_vault/tests/vault_litesvm.rs#L2849) |
+| Unannounced split | Frozen until acknowledged | No, never liquidated | [`an_unannounced_split_holds_borrowing`](https://github.com/mrkanchwala/safucredit/blob/main/solana/programs/stock_vault/tests/vault_litesvm.rs#L2005) |
+| Genuine price crash | Liquidated, nothing paid. On-chain denial shown. | No, correct outcome | [`a_price_that_was_not_actually_wrong_is_denied_on_chain`](https://github.com/mrkanchwala/safucredit/blob/main/solana/programs/backstop/tests/verdict_litesvm.rs#L656) |
+| Over-liquidation / cascades | Capped per event (close factor), bonus scales with how underwater the position is, never the whole position at once below 95% LTV | No, size and cost are both bounded | [`the_chunk_cap_bounds_a_single_liquidation`](https://github.com/mrkanchwala/safucredit/blob/main/solana/programs/stock_vault/tests/vault_litesvm.rs#L2674) |
+| Liquidator front-running | The backstop pool liquidates first; an outside liquidator can only step in after a 15-minute grace window | No, same cost either way | [`an_outsider_may_liquidate_once_the_position_has_been_marked_for_the_grace_period`](https://github.com/mrkanchwala/safucredit/blob/main/solana/programs/stock_vault/tests/vault_litesvm.rs#L3193) |
+| Issuer freezes the stock | Market halts. Nothing liquidated or paid. | N/A, collateral itself is stuck | [`liquidation_is_blocked_by_an_issuer_pause`](https://github.com/mrkanchwala/safucredit/blob/main/solana/programs/stock_vault/tests/vault_litesvm.rs#L2773) |
+| Same wallet backs the pool and borrows from it | Both allowed together, but the payout is blocked while that wallet still holds backer shares | N/A, self-dealing guard | [`a_borrower_who_backs_the_pool_cannot_be_paid_from_it`](https://github.com/mrkanchwala/safucredit/blob/main/solana/programs/backstop/tests/payout_litesvm.rs#L1901) |
+| Gap at market open | Not covered. Closed market, no price to verify. | N/A, disclosed at deposit | This is a deliberate design boundary with nothing to guard against, so no test exists for it. |
 
 Collateral is native xStocks only (Token-2022), never wrapped variants. Valuation reads the token's own on-chain multiplier schedule in fixed-point math, never the floating-point UI conversion, so a stock split can't desync price from share count. Loans are USDC only, and the vault and the backstop (the pool that funds paybacks) are separate programs.
 
@@ -109,6 +111,12 @@ Wallets: Phantom, Solflare, Backpack.
 This repository is a shared build across three entries from the same team, one product with collateral split by chain: tokenized stocks on Solana (this hackathon), treasuries on Stellar (Stellar Pro Hackathon, Sept 19–20), and cross-chain liquidity between the two backstops via CCTP (Colosseum Crypto World's Fair). The `stellar/` and `crosschain/` directories are reserved for that work and are not built yet.
 
 Longer term, the direction is multichain and multi-asset. The shared math core (`crates/safu-core`) already targets both Solana and Stellar from one codebase, and the verdict engine only needs a reference price and a liquidation to check, not a specific collateral type. Most real-world assets (real estate, commodities, other equities beyond AAPLx) and major crypto collateral (ETH, SOL, BTC) fit that same design on any chain SAFU deploys to. Neither is scoped or scheduled yet.
+
+Past that, ideas already discussed but not built:
+
+- **Senior / junior backer tranches**, the same pattern as Maple and Goldfinch: senior backers take a steadier, lower return and lose only after junior capital runs out, junior backers take the first loss for a higher return. Illustrative only, never a promised number: a $100K pool split $70K senior / $30K junior would put senior near a fixed 5% and junior near 22% in a good year, negative in a bad one, under the caps this design already enforces.
+- **An independent on-chain reference price** (Pyth or Chainlink), replacing the devnet build's mock price replay (see Known issues).
+- **On-chain market sale of seized inventory through Jupiter**, instead of today's buyer-initiated resale only.
 
 ## Disclosures
 
