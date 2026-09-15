@@ -47,8 +47,11 @@ Deposit tokenized stock (xStocks) as collateral and borrow USDC against it, same
 | Genuine price crash | Liquidated, nothing paid. On-chain denial shown. | No, correct outcome |
 | Gap at market open | Not covered. Closed market, no price to verify. | N/A, disclosed at deposit |
 | Issuer freezes the stock | Market halts. Nothing liquidated or paid. | N/A, collateral itself is stuck |
+| Same wallet backs the pool and borrows from it | Both allowed together, but the payout is blocked while that wallet still holds backer shares | N/A, self-dealing guard |
 
 Collateral is native xStocks only (Token-2022), never wrapped variants. Valuation reads the token's own on-chain multiplier schedule in fixed-point math, never the floating-point UI conversion, so a stock split can't desync price from share count. Loans are USDC only, and the vault and the backstop (the pool that funds paybacks) are separate programs.
+
+A wallet can back the pool and borrow from it at the same time; nothing stops that at deposit or borrow. The one place it matters is a wrongful-liquidation payout: if the wallet claiming it still holds backer shares in this pool, the claim is rejected (`BorrowerIsABacker`, `backstop/src/lib.rs`). It guards against a backer paying itself out of its own backstop capital.
 
 ## Proven on real devnet
 
@@ -96,9 +99,16 @@ The Solana programs need an SBF build (`cargo build-sbf`) before their LiteSVM t
 
 Wallets: Phantom, Solflare, Backpack.
 
+## Known issues
+
+- **Wallet auto-reconnect after disconnect.** Disconnecting a wallet on the site, then refreshing the page, currently reconnects Solflare without a fresh approval prompt. Every transaction still needs its own wallet approval, so funds stay safe either way, but disconnect should stop the session from resuming on its own and right now it doesn't. Flagged 2026-09-15, fix in progress.
+- **Devnet price source is a mock replay of recorded prices.** The reference price the verdict engine checks liquidations against replays real recorded AAPLx prices, through the same oracle-adapter interface the mainnet design targets (the Chainlink xStocks oracle). This is the documented demo setup, disclosed here so it's clear the devnet build pulls no live third-party feed.
+
 ## Roadmap
 
 This repository is a shared build across three entries from the same team, one product with collateral split by chain: tokenized stocks on Solana (this hackathon), treasuries on Stellar (Stellar Pro Hackathon, Sept 19–20), and cross-chain liquidity between the two backstops via CCTP (Colosseum Crypto World's Fair). The `stellar/` and `crosschain/` directories are reserved for that work and are not built yet.
+
+Longer term, the direction is multichain and multi-asset. The shared math core (`crates/safu-core`) already targets both Solana and Stellar from one codebase, and the verdict engine only needs a reference price and a liquidation to check, not a specific collateral type. Most real-world assets (real estate, commodities, other equities beyond AAPLx) and major crypto collateral (ETH, SOL, BTC) fit that same design on any chain SAFU deploys to. Neither is scoped or scheduled yet.
 
 ## Disclosures
 
