@@ -179,6 +179,7 @@ fn setup(cluster_tag: u8) -> Env {
         backer_interest_cumulative: 0,
         backer_interest_paid_cumulative: 0,
         issuer_loss_cumulative: 0,
+        price_units_fp: safu_core::MULT_SCALE,
         reserved: [0; 4],
     };
     set_state(&mut svm, market_key, stock_vault::ID, &market);

@@ -253,7 +253,8 @@ class Demo:
     # --- actions -------------------------------------------------------------------------------------------------
 
     def push_price(self, price_fp8: int, market_open: bool = True) -> None:
-        ix = self.vault.instruction("push_price", {"feed_authority": self.k.feed.pubkey(), "config": self.v(b"vconfig"), "market": self.market},
+        ix = self.vault.instruction("push_price", {"feed_authority": self.k.feed.pubkey(), "config": self.v(b"vconfig"), "market": self.market,
+                                                   "collateral_mint": self.coll_mint},
                                     {"price": price_fp8, "market_open": market_open, "last_close": price_fp8})
         for _ in range(10):
             try:
@@ -444,11 +445,13 @@ def scenario_split(demo: Demo, recorder: Recorder) -> None:
     demo.wait_until_chain_time(activation - 20)
     quarter = demo.price // 4
     demo.push_price(quarter)
-    flagged = demo.market_state()["price"]["flagged"]
     time.sleep(1.05)
     demo.push_price(quarter)
-    say(f"DESYNC: feed reports the post-split price {fmt_usd(quarter)} early (spike flagged={flagged}, then confirmed); "
-        "without the hold the loan would look 75% underwater")
+    st = demo.market_state()["price"]
+    if not st["flagged"] or st["last_price"] == quarter:
+        raise SystemExit(f"FAIL: the early post-split price entered the price history (flagged={st['flagged']})")
+    say(f"DESYNC: feed reports the post-split price {fmt_usd(quarter)} early, twice; it is exactly the split ratio "
+        "away, so it stays flagged and never enters the price history")
 
     def liquidate():
         demo.pool_liquidate()
@@ -458,16 +461,14 @@ def scenario_split(demo: Demo, recorder: Recorder) -> None:
     say("split activated and the ±30 s pause has passed; no market-open price since activation yet")
     expect_refused(liquidate, "CorporateActionHold", "pool liquidation after activation, before a fresh market-open price")
 
-    # The TWAP ring still holds pre-split prints, so the first post-split market-open print is flagged as a
-    # spike; the feed's next consecutive print confirms it (spec 5). Both are ordinary feed updates.
+    # The vault re-quotes its stored price history in the new multiplier at activation (split-adjusted, as equity
+    # data vendors do), so one ordinary market-open print at the post-split price is accepted as-is.
     demo.push_price(quarter, market_open=True)
-    time.sleep(1.05)
-    demo.push_price(quarter, market_open=True)
-    st = demo.market_state()["price"]
-    if st["flagged"] or st["last_update"] <= activation:
-        raise SystemExit(f"FAIL: repricing not accepted (flagged={st['flagged']}, last_update={st['last_update']})")
-    say(f"feed publishes a market-open price after activation (confirmed): {fmt_usd(quarter)} x new multiplier = "
-        "same value as before")
+    st = demo.market_state()
+    if st["price"]["flagged"] or st["price"]["last_update"] <= activation:
+        raise SystemExit(f"FAIL: repricing not accepted (flagged={st['price']['flagged']}, last_update={st['price']['last_update']})")
+    say(f"feed publishes one market-open price after activation: {fmt_usd(quarter)}, accepted first time because the "
+        "stored history was re-quoted for the split")
     expect_refused(liquidate, "NotLiquidatable", "pool liquidation once repriced (the loan is healthy)")
     if demo.market_state()["liq_seq"] != 0:
         raise SystemExit("FAIL: a liquidation record exists")

@@ -4858,6 +4858,18 @@
             "type": "u64"
           },
           {
+            "name": "price_units_fp",
+            "docs": [
+              "Multiplier the stored price history (`price`) is quoted in, `MULT_SCALE` fixed point. Every price is per",
+              "whole token, and a split changes what one token is worth, so when the live multiplier moves away from this",
+              "value the history is re-quoted into it first (`logic::sync_price_units`). Kept apart from",
+              "`observed_multiplier_fp` on purpose: the price history must follow an unannounced change at once, while",
+              "the market's baseline waits for `acknowledge_multiplier`. Added before any deployment, so it grows the",
+              "account instead of taking reserved bytes (4 were not enough)."
+            ],
+            "type": "u128"
+          },
+          {
             "name": "reserved",
             "type": {
               "array": [

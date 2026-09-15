@@ -688,6 +688,7 @@ impl Env {
                 feed_authority: *feed,
                 config: self.config(),
                 market: self.market(),
+                collateral_mint: self.coll_mint,
             }
             .to_account_metas(None),
             data: stock_vault::instruction::PushPrice {
@@ -1803,9 +1804,11 @@ fn a_split_holds_borrowing_until_the_feed_reprices() {
     let ix = env.borrow_ix(&alice.pubkey(), &env.alice_usdc, 100 * USDC);
     assert_program_error(env.send(&[ix], &[&alice]), VaultError::CorporateActionHold);
 
-    // The first market-open print after the activation ends the hold.
+    // The first market-open print after the activation ends the hold. It is quoted per post-split
+    // token, a quarter of the old price (before 2026-09-15 this test pushed the pre-split PRICE, which
+    // only passed because the price history was never re-quoted for the split).
     env.warp(60);
-    let repriced = env.push_price_ix(&feed.pubkey(), PRICE, true, PRICE);
+    let repriced = env.push_price_ix(&feed.pubkey(), PRICE / 4, true, PRICE / 4);
     env.ok(&[repriced], &[&feed]);
     let ix = env.borrow_ix(&alice.pubkey(), &env.alice_usdc, 100 * USDC);
     env.ok(&[ix], &[&alice]);
@@ -1821,8 +1824,12 @@ fn a_split_hold_does_not_block_a_market_that_is_still_closed() {
 
     // An out-of-hours print is not a reprice: the hold must survive it.
     env.warp(60);
-    let closed = env.push_price_ix(&feed.pubkey(), PRICE, false, PRICE);
+    let closed = env.push_price_ix(&feed.pubkey(), PRICE / 4, false, PRICE / 4);
     env.ok(&[closed], &[&feed]);
+    assert!(
+        !env.market_state().price.flagged,
+        "accepted, so the hold below is the closed market's doing"
+    );
     let ix = env.borrow_ix(&alice.pubkey(), &env.alice_usdc, 100 * USDC);
     assert_program_error(env.send(&[ix], &[&alice]), VaultError::CorporateActionHold);
 }
@@ -2849,6 +2856,185 @@ fn liquidation_is_blocked_inside_a_scheduled_split_hold() {
     env.warp(2_000);
     let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 10_000 * USDC);
     assert_program_error(env.send(&[ix], &[&liq]), VaultError::CorporateActionHold);
+}
+
+// --------------------------------------------- split-adjusted price history
+//
+// The TWAP ring stores prices per whole token. A split changes what one token is worth by the split
+// ratio, so every sample recorded before it is quoted in the wrong units afterwards. Left as is, a
+// reverse split undervalues collateral by the ratio (wrongful liquidation) and a forward split
+// overvalues it (a genuine liquidation stalls). The vault re-quotes the stored history in the live
+// multiplier, the way equity data vendors back-adjust price history for splits.
+
+#[test]
+fn a_reverse_split_never_liquidates_a_healthy_loan() {
+    let mut env = lending_env();
+    let (alice, feed) = (env.alice.insecure_clone(), env.feed.insecure_clone());
+    let (liq, lu, lc) = env.new_liquidator(10_000 * USDC);
+
+    // 1-for-4: each token now carries a quarter of the units, so its quoted price is four times higher.
+    env.schedule_multiplier(MULT * 0.25, env.now + 1_000);
+    env.warp(2_000);
+    for _ in 0..2 {
+        let print = env.push_price_ix(&feed.pubkey(), PRICE * 4, true, PRICE * 4);
+        env.ok(&[print], &[&feed]);
+        env.warp(60);
+    }
+
+    // Nothing about the loan changed: same shares, same dollar value. It must not be seizable.
+    let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 10_000 * USDC);
+    assert_program_error(env.send(&[ix], &[&liq]), VaultError::NotLiquidatable);
+    assert_eq!(env.market_state().liq_seq, 0);
+}
+
+#[test]
+fn a_forward_split_does_not_delay_a_genuine_liquidation() {
+    let mut env = lending_env();
+    let (alice, feed) = (env.alice.insecure_clone(), env.feed.insecure_clone());
+    let (liq, lu, lc) = env.new_liquidator(10_000 * USDC);
+    env.walk_price_to(PRICE * 75 / 100);
+    let low = env.market_state().price.last_price;
+
+    env.schedule_multiplier(MULT * 4.0, env.now + 1_000);
+    env.warp(2_000);
+    let print = env.push_price_ix(&feed.pubkey(), low / 4, true, low / 4);
+    env.ok(&[print], &[&feed]);
+    assert!(
+        !env.market_state().price.flagged,
+        "a price correctly re-quoted for the split is not a spike"
+    );
+
+    // One ordinary print ends the hold, and the loan is exactly as underwater as before the split.
+    env.warp(60);
+    let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 10_000 * USDC);
+    env.ok(&[ix], &[&liq]);
+    assert_eq!(env.market_state().liq_seq, 1);
+}
+
+#[test]
+fn a_stale_pre_split_price_after_a_reverse_split_is_never_confirmed() {
+    // The mirror image, and the dangerous direction: after a 1-for-4 reverse split a lagging feed still
+    // quotes the old, four-times-lower price. Confirmed, it would value every loan at a quarter.
+    let mut env = lending_env();
+    let (alice, feed) = (env.alice.insecure_clone(), env.feed.insecure_clone());
+    let (liq, lu, lc) = env.new_liquidator(10_000 * USDC);
+    env.schedule_multiplier(MULT * 0.25, env.now + 1_000);
+    env.warp(2_000);
+    for _ in 0..3 {
+        let stale = env.push_price_ix(&feed.pubkey(), PRICE, true, PRICE);
+        env.ok(&[stale], &[&feed]);
+        assert_ne!(
+            env.market_state().price.last_price,
+            PRICE,
+            "a repeated stale quote must never be confirmed into the history"
+        );
+        env.warp(60);
+    }
+    assert!(env.market_state().price.flagged);
+    let ix = env.liquidate_ix(&liq.pubkey(), &lu, &lc, &alice.pubkey(), 10_000 * USDC);
+    assert!(env.send(&[ix], &[&liq]).is_err());
+    assert_eq!(env.market_state().liq_seq, 0);
+}
+
+#[test]
+fn a_genuine_crash_on_split_day_still_confirms() {
+    // The guard above must not lock out a real move: a 30% fall right after a 4-for-1 split is not the
+    // split ratio, so the second consecutive print confirms it as usual.
+    let mut env = full();
+    let feed = env.feed.insecure_clone();
+    env.schedule_multiplier(MULT * 4.0, env.now + 1_000);
+    env.warp(2_000);
+    let crashed = PRICE / 4 * 70 / 100;
+    for _ in 0..2 {
+        let print = env.push_price_ix(&feed.pubkey(), crashed, true, PRICE / 4);
+        env.ok(&[print], &[&feed]);
+        env.warp(60);
+    }
+    let st = env.market_state().price;
+    assert!(!st.flagged);
+    assert_eq!(st.last_price, crashed);
+}
+
+#[test]
+fn stored_prices_are_requoted_in_the_new_multiplier() {
+    let mut env = full();
+    let feed = env.feed.insecure_clone();
+    let before = env.market_state().price;
+    env.schedule_multiplier(MULT * 4.0, env.now - 1_000);
+    env.warp(60);
+    let ack = env.acknowledge_ix(&feed.pubkey());
+    env.ok(&[ack], &[&feed]);
+
+    // Every stored figure is re-quoted so price × multiplier, the collateral value, is unchanged.
+    let after = env.market_state().price;
+    for i in 0..before.count as usize {
+        let expected = before.prices[i] / 4;
+        assert!(
+            after.prices[i].abs_diff(expected) <= 1,
+            "sample {i}: {} re-quoted to {}, expected {expected}",
+            before.prices[i],
+            after.prices[i]
+        );
+        assert_eq!(after.timestamps[i], before.timestamps[i]);
+    }
+    assert!(after.last_price.abs_diff(before.last_price / 4) <= 1);
+    assert!(after.last_close.abs_diff(before.last_close / 4) <= 1);
+}
+
+#[test]
+fn prices_pushed_during_an_unannounced_split_are_quoted_in_the_new_units() {
+    // The feed keeps publishing while the fail-closed hold waits for a human acknowledgement. Those
+    // prints are already in post-split terms and must land in the history as such.
+    let mut env = full();
+    let (alice, feed) = (env.alice.insecure_clone(), env.feed.insecure_clone());
+    env.schedule_multiplier(MULT * 4.0, env.now - 1_000);
+    env.warp(60);
+    let print = env.push_price_ix(&feed.pubkey(), PRICE / 4, true, PRICE / 4);
+    env.ok(&[print], &[&feed]);
+    assert!(!env.market_state().price.flagged);
+
+    // The price history being right does not lift the hold: that still takes an acknowledgement.
+    let blocked = env.borrow_ix(&alice.pubkey(), &env.alice_usdc, 100 * USDC);
+    assert_program_error(
+        env.send(&[blocked], &[&alice]),
+        VaultError::CorporateActionHold,
+    );
+    let ack = env.acknowledge_ix(&feed.pubkey());
+    env.ok(&[ack], &[&feed]);
+    env.warp(60);
+    let ix = env.borrow_ix(&alice.pubkey(), &env.alice_usdc, 100 * USDC);
+    env.ok(&[ix], &[&alice]);
+}
+
+#[test]
+fn an_early_post_split_price_is_never_confirmed_into_the_history() {
+    // The desync the split demo stages: the feed publishes the post-split price before the
+    // multiplier activates. A move of exactly the split ratio is a price in the wrong units, not a
+    // crash, so repeating it must not confirm it.
+    let mut env = full();
+    let (alice, feed) = (env.alice.insecure_clone(), env.feed.insecure_clone());
+    let activation = env.now + 1_000;
+    env.schedule_multiplier(MULT * 4.0, activation);
+
+    env.warp(900);
+    for _ in 0..2 {
+        let early = env.push_price_ix(&feed.pubkey(), PRICE / 4, true, PRICE / 4);
+        env.ok(&[early], &[&feed]);
+        env.warp(30);
+    }
+    let st = env.market_state().price;
+    assert!(st.flagged, "the early print stays flagged");
+    assert_eq!(st.last_price, PRICE, "and never enters the price history");
+
+    // Past the far edge of the window the same price, now correct, is accepted at once.
+    env.warp(activation + params().activation_pause_secs + 60 - env.now);
+    let repriced = env.push_price_ix(&feed.pubkey(), PRICE / 4, true, PRICE / 4);
+    env.ok(&[repriced], &[&feed]);
+    let st = env.market_state().price;
+    assert!(!st.flagged);
+    assert_eq!(st.last_price, PRICE / 4);
+    let ix = env.borrow_ix(&alice.pubkey(), &env.alice_usdc, 100 * USDC);
+    env.ok(&[ix], &[&alice]);
 }
 
 #[test]

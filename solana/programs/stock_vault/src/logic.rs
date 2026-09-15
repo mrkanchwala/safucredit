@@ -256,15 +256,90 @@ pub fn market_twap(m: &Market, now: i64) -> Result<u64> {
     core(twap(&ordered_samples(&m.price), now))
 }
 
+/// One per-token price re-quoted from units of multiplier `from_fp` into units of `to_fp`, keeping
+/// `price × multiplier` (the value of one raw unit) unchanged. Rounded to nearest, so neither a borrower nor
+/// a lender is systematically favoured; a non-zero price never rounds to zero.
+pub fn requote(price: u64, from_fp: u128, to_fp: u128) -> Result<u64> {
+    if price == 0 {
+        return Ok(0);
+    }
+    require!(from_fp > 0 && to_fp > 0, VaultError::InvalidMultiplier);
+    let scaled = (price as u128)
+        .checked_mul(from_fp)
+        .and_then(|v| v.checked_add(to_fp / 2))
+        .ok_or(VaultError::MathOverflow)?
+        / to_fp;
+    let out = u64::try_from(scaled).map_err(|_| VaultError::MathOverflow)?;
+    Ok(out.max(1))
+}
+
+/// Split-adjusts the stored price history to `effective`, the multiplier now in force.
+///
+/// Prices are per whole token. After a 4-for-1 split one token is a quarter of what it was, so every sample
+/// recorded before the split reads four times too high against the new multiplier (and a reverse split, four
+/// times too low). Left alone, the TWAP undervalues collateral after a reverse split — a wrongful liquidation
+/// of a healthy loan — and overvalues it after a forward split, stalling a genuine one while every correct new
+/// print is flagged as a spike against the stale history. Re-quoting the history is what equity data vendors
+/// do for splits. Timestamps are untouched, so the TWAP's time weighting is unchanged.
+///
+/// Must run before any read or write of `m.price` in an instruction that can see the mint. Sub-threshold
+/// dividend steps are re-quoted too; they are tiny but real.
+pub fn sync_price_units(m: &mut Market, effective: u128) -> Result<()> {
+    let from = m.price_units_fp;
+    if from != 0 && from != effective {
+        let p = &mut m.price;
+        for slot in p.prices.iter_mut() {
+            *slot = requote(*slot, from, effective)?;
+        }
+        p.last_price = requote(p.last_price, from, effective)?;
+        p.last_close = requote(p.last_close, from, effective)?;
+        p.flagged_price = requote(p.flagged_price, from, effective)?;
+    }
+    m.price_units_fp = effective;
+    Ok(())
+}
+
+/// Whether the stored price history is quoted in the multiplier in force now. Read-only callers (the
+/// backstop's resale) cannot re-quote it, so they refuse instead of pricing off a stale history.
+pub fn price_units_current(m: &Market, schedule: &MultiplierSchedule, now: i64) -> bool {
+    m.price_units_fp == schedule.effective(now)
+}
+
+/// The *other* multiplier a feed print could mistakenly be quoted in while a split is in play, if any: before
+/// a scheduled activation, the post-split value (a feed publishing the new price early); after it, the
+/// pre-split value (a feed still quoting the old price); during an unannounced change, the market's last
+/// acknowledged baseline. `None` when nothing split-sized is in play, so routine dividend steps are unaffected.
+pub fn other_price_units(m: &Market, schedule: &MultiplierSchedule, now: i64) -> Option<u128> {
+    let effective = schedule.effective(now);
+    let other = if schedule.has_activation() {
+        if effective == schedule.stored {
+            schedule.scheduled
+        } else {
+            schedule.stored
+        }
+    } else if m.observed_multiplier_fp != 0 {
+        m.observed_multiplier_fp
+    } else {
+        return None;
+    };
+    let change_bps = effective.abs_diff(other).saturating_mul(BPS) / effective;
+    (change_bps > m.params.split_cap_bps as u128).then_some(other)
+}
+
 /// Mock-adapter price update (spec 5, final 2026-09-14). A move beyond the spike cap vs TWAP is flagged and kept
 /// out of the TWAP; a second consecutive update within the cap of the flagged price confirms a genuine move and is
 /// accepted, so a real crash cannot be locked out. No off-hours clamp: it stalled liquidations in a real crash.
+///
+/// Exception: a spike that is exactly the split ratio away — the print lands inside the cap once re-quoted from
+/// `other_units` — is a price quoted in the wrong split units, not a market move, and can never be confirmed.
+/// A genuine crash on split day is not near the ratio (2-for-1 is already a 50% move), so it still confirms.
 /// Returns whether the price was accepted.
 pub fn apply_price(
     m: &mut Market,
     price: u64,
     market_open: bool,
     last_close: u64,
+    other_units: Option<u128>,
     now: i64,
 ) -> Result<bool> {
     require!(price > 0 && last_close > 0, VaultError::InvalidPrice);
@@ -274,8 +349,18 @@ pub fn apply_price(
         let reference = market_twap(m, now)?;
         let cap = m.params.deviation_cap_bps;
         let spike = core(deviation_exceeded(price, reference, cap))?;
-        let confirmed =
-            m.price.flagged && !core(deviation_exceeded(price, m.price.flagged_price, cap))?;
+        let wrong_units = spike
+            && match other_units {
+                Some(other) if m.price_units_fp > 0 => !core(deviation_exceeded(
+                    requote(price, other, m.price_units_fp)?,
+                    reference,
+                    cap,
+                ))?,
+                _ => false,
+            };
+        let confirmed = !wrong_units
+            && m.price.flagged
+            && !core(deviation_exceeded(price, m.price.flagged_price, cap))?;
         if spike && !confirmed {
             m.price.flagged = true;
             m.price.flagged_price = price;
@@ -378,6 +463,7 @@ pub fn liquidation_view(
     );
     let multiplier_fp = schedule.effective(now);
     market.observed_multiplier_fp = multiplier_fp;
+    sync_price_units(market, multiplier_fp)?;
     // Liquidation prices on the TWAP, never the last print: one bad tick must not seize anyone's collateral.
     let price = risk_price(market, now, PriceUse::Liquidate)?;
     let value = value_of(market, position.raw_collateral, multiplier_fp, price)?;
@@ -477,6 +563,40 @@ pub fn ramp_start_terms(current: LiquidationTerms, new: LiquidationTerms) -> Liq
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requoting_keeps_the_value_of_a_raw_unit_within_rounding() {
+        // Deterministic sweep over prices and split ratios (1:10 reverse to 10:1 forward) on top of
+        // the live AAPLx multiplier.
+        let base: u128 = 1_002_664_200_000;
+        let mut seed: u64 = 0x5AF0_C0DE;
+        for _ in 0..2_000 {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let price = 1 + seed % 1_000_000_000_000; // up to $10,000 at 8 decimals
+            let ratio_num = 1 + (seed >> 20) % 10;
+            let ratio_den = 1 + (seed >> 40) % 10;
+            let to = base * ratio_num as u128 / ratio_den as u128;
+            let out = requote(price, base, to).unwrap();
+            let before = price as u128 * base;
+            let after = out as u128 * to;
+            // Nearest rounding: off by at most half of one price unit, in value terms.
+            assert!(
+                before.abs_diff(after) <= to / 2 || out == 1,
+                "price {price} {base}->{to}: {before} vs {after}"
+            );
+        }
+    }
+
+    #[test]
+    fn requoting_never_turns_a_price_into_zero_and_leaves_empty_slots_empty() {
+        assert_eq!(requote(1, 1, 1_000_000).unwrap(), 1);
+        assert_eq!(requote(0, 1, 4).unwrap(), 0);
+        assert!(requote(5, 0, 4).is_err());
+        assert!(
+            requote(u64::MAX, 4, 1).is_err(),
+            "overflow is refused, never wrapped"
+        );
+    }
 
     #[test]
     fn fallback_opens_only_after_a_fresh_mark_has_aged_past_the_grace_period() {

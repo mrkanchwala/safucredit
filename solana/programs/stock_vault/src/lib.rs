@@ -154,6 +154,7 @@ pub mod stock_vault {
         );
         let previous = market.observed_multiplier_fp;
         let effective = schedule.effective(now);
+        sync_price_units(market, effective)?;
         market.observed_multiplier_fp = effective;
         emit!(MultiplierAcknowledged {
             market: market_key,
@@ -201,6 +202,7 @@ pub mod stock_vault {
         market.issuer_halt = false;
         market.liq_seq = 0;
         market.observed_multiplier_fp = schedule.effective(now);
+        market.price_units_fp = schedule.effective(now);
         market.ramp_from = params.liquidation_terms();
         market.ramp_start_ts = now;
         market.backer_interest_owed = 0;
@@ -248,13 +250,14 @@ pub mod stock_vault {
         last_close: u64,
     ) -> Result<()> {
         let now = Clock::get()?.unix_timestamp;
-        let accepted = apply_price(
-            &mut ctx.accounts.market,
-            price,
-            market_open,
-            last_close,
-            now,
-        )?;
+        let schedule = MultiplierSchedule::read(&ctx.accounts.collateral_mint.to_account_info())?;
+        let market = &mut ctx.accounts.market;
+        // Re-quote the history before comparing a new print against it: a correct post-split price must not
+        // look like a spike. Deliberately not gated on the unannounced-change hold -- that hold waits for a
+        // human, but the feed keeps publishing in post-split terms meanwhile.
+        sync_price_units(market, schedule.effective(now))?;
+        let other_units = other_price_units(market, &schedule, now);
+        let accepted = apply_price(market, price, market_open, last_close, other_units, now)?;
         emit!(PriceUpdated {
             market: ctx.accounts.market.key(),
             price,
@@ -482,6 +485,7 @@ pub mod stock_vault {
                 VaultError::CorporateActionHold
             );
             market.observed_multiplier_fp = schedule.effective(now);
+            sync_price_units(market, schedule.effective(now))?;
             let price = risk_price(market, now, PriceUse::Borrow)?;
             let remaining = position.raw_collateral - amount;
             let value_after = value_of(market, remaining, schedule.effective(now), price)?;
@@ -536,6 +540,7 @@ pub mod stock_vault {
             VaultError::CorporateActionHold
         );
         market.observed_multiplier_fp = schedule.effective(now);
+        sync_price_units(market, schedule.effective(now))?;
         let price = risk_price(market, now, PriceUse::Borrow)?;
 
         let position = &mut ctx.accounts.position;
@@ -1138,6 +1143,9 @@ pub struct PushPrice<'info> {
     pub config: Account<'info, VaultConfig>,
     #[account(mut, seeds = [MARKET_SEED, market.collateral_mint.as_ref()], bump = market.bump)]
     pub market: Box<Account<'info, Market>>,
+    /// Read for the live multiplier, so stored prices are re-quoted across a split before the new print.
+    #[account(address = market.collateral_mint)]
+    pub collateral_mint: Box<InterfaceAccount<'info, Mint>>,
 }
 
 #[derive(Accounts)]

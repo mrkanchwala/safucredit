@@ -1236,7 +1236,11 @@ pub mod backstop {
         let schedule = stock_vault::logic::MultiplierSchedule::read(&mint_info)?;
         require!(
             !stock_vault::logic::corporate_action_hold(market, &schedule, now)
-                && !stock_vault::logic::unobserved_multiplier_change(market, &schedule, now),
+                && !stock_vault::logic::unobserved_multiplier_change(market, &schedule, now)
+                // The market is read-only here, so a price history still quoted in a pre-split multiplier
+                // cannot be re-quoted; selling off it would misprice the pool's inventory by the split ratio.
+                // The next vault price update re-quotes it and resale resumes.
+                && stock_vault::logic::price_units_current(market, &schedule, now),
             VerdictError::ResaleBlocked
         );
         let multiplier_fp = schedule.effective(now);

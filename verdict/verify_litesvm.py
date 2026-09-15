@@ -177,7 +177,9 @@ def build_market(*, collateral_mint: Pubkey, usdc_mint: Pubkey, deviation_cap_bp
     b += _u64(0)  # backer_interest_owed (phase 3 addendum)
     b += _u64(0)  # backer_interest_cumulative
     b += _u64(0)  # backer_interest_paid_cumulative
-    b += bytes(12)  # reserved
+    b += _u64(0)  # issuer_loss_cumulative
+    b += _u128(MULT_SCALE)  # price_units_fp (split-adjusted price history, 2026-09-15)
+    b += bytes(4)  # reserved
     return bytes(b)
 
 

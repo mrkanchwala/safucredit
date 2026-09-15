@@ -239,6 +239,13 @@ pub struct Market {
     /// never covered (spec 14a) -- lenders carry this loss, as they carry it on every market holding this token.
     /// Taken from the old 12 reserved bytes, so the account size is unchanged (U4).
     pub issuer_loss_cumulative: u64,
+    /// Multiplier the stored price history (`price`) is quoted in, `MULT_SCALE` fixed point. Every price is per
+    /// whole token, and a split changes what one token is worth, so when the live multiplier moves away from this
+    /// value the history is re-quoted into it first (`logic::sync_price_units`). Kept apart from
+    /// `observed_multiplier_fp` on purpose: the price history must follow an unannounced change at once, while
+    /// the market's baseline waits for `acknowledge_multiplier`. Added before any deployment, so it grows the
+    /// account instead of taking reserved bytes (4 were not enough).
+    pub price_units_fp: u128,
     pub reserved: [u8; 4],
 }
 

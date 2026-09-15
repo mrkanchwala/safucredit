@@ -455,6 +455,7 @@ impl Env {
                 feed_authority: feed.pubkey(),
                 config: vpda(&[VCONFIG_SEED]),
                 market: self.market(),
+                collateral_mint: self.coll_mint,
             },
             stock_vault::instruction::PushPrice {
                 price,
@@ -2494,6 +2495,92 @@ fn buy_inventory_after_a_pool_liquidation_resells_at_the_current_price() {
 
     // The pause is lifted: a deposit now succeeds.
     env.back(USDC);
+}
+
+#[test]
+fn resale_waits_until_the_vault_has_requoted_its_prices_for_a_multiplier_change() {
+    // `buy_inventory` reads the vault market without writing it, so it cannot split-adjust the
+    // stored price history itself. Priced off a history still in the old multiplier, a reverse
+    // split would sell the pool's inventory at a fraction of its worth. It refuses until any vault
+    // instruction has re-quoted the history.
+    let mut env = with_loan();
+    let admin = env.admin.insecure_clone();
+    let market = env.market();
+    let alice = env.alice.pubkey();
+    let register = env.v_ix(
+        stock_vault::accounts::AdminOnly {
+            admin: admin.pubkey(),
+            config: vpda(&[VCONFIG_SEED]),
+        },
+        stock_vault::instruction::SetPoolLiquidator {
+            pool_liquidator: env.b_config(),
+        },
+    );
+    env.ok(&[register], &[&admin]);
+    env.back(100_000 * USDC);
+    let open_inv = env.open_inventory_ix(&admin.pubkey());
+    env.ok(&[open_inv], &[&admin]);
+    env.walk_price_to(PRICE * 75 / 100);
+    let (crank, crank_usdc) = env.new_funded(0);
+    let seq = env.market_state().liq_seq;
+    let ix = env.pool_liquidate_ix(&crank.pubkey(), &crank_usdc, seq, &alice, 50_000 * USDC);
+    env.ok(&[ix], &[&crank]);
+    env.warp(5 * 86_400);
+    env.push_price(PRICE * 75 / 100);
+
+    // A routine dividend step applied immediately: small enough that nothing holds the market.
+    let issuer = env.issuer.insecure_clone();
+    let step = scaled_ui_amount::instruction::update_multiplier(
+        &TOKEN_2022,
+        &env.coll_mint,
+        &issuer.pubkey(),
+        &[],
+        MULT * 1.0006,
+        env.now - 1,
+    )
+    .unwrap();
+    env.ok(&[step], &[&issuer]);
+
+    let (buyer, buyer_usdc) = env.new_funded(1_000_000 * USDC);
+    let buyer_coll = token_account(
+        &mut env.svm,
+        &buyer,
+        &env.coll_mint.clone(),
+        &buyer.pubkey(),
+        &TOKEN_2022,
+    );
+    let raw = env.inventory_state(&market).raw;
+    let buy = |env: &Env| {
+        env.b_ix(
+            backstop::accounts::BuyInventory {
+                buyer: buyer.pubkey(),
+                config: env.b_config(),
+                market,
+                inventory: env.inventory(&market),
+                collateral_mint: env.coll_mint,
+                usdc_mint: env.usdc_mint,
+                inventory_vault: env.inventory_vault(&market),
+                pool_usdc_vault: env.b_vault(),
+                buyer_usdc,
+                buyer_collateral: buyer_coll,
+                collateral_token_program: TOKEN_2022,
+                usdc_token_program: TOKEN_CLASSIC,
+            },
+            backstop::instruction::BuyInventory {
+                raw,
+                max_price_per_share: u64::MAX,
+            },
+        )
+    };
+    let ix = buy(&env);
+    assert_program_error(env.send(&[ix], &[&buyer]), VerdictError::ResaleBlocked);
+
+    // The next feed update re-quotes the history, and the same purchase goes through.
+    env.warp(60);
+    env.push_price(PRICE * 75 / 100);
+    let ix = buy(&env);
+    env.ok(&[ix], &[&buyer]);
+    assert_eq!(env.inventory_state(&market).raw, 0);
 }
 
 #[test]
