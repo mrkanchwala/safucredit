@@ -223,6 +223,10 @@ header .wrap {
 .field-input input::placeholder {
   color: var(--text-muted);
 }
+.field-input input:disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
 .field-input .unit {
   font-family: var(--font-mono);
   font-size: 12.5px;

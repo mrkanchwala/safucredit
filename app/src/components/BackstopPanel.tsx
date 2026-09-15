@@ -191,41 +191,50 @@ export function BackstopPanel() {
         <TxStatus action={requestWithdrawAction} />
         <TxStatus action={finalizeWithdrawAction} />
 
-        {hasInventory ? (
-          <div className="field-group" style={{ marginTop: 16 }}>
-            <div className="field-label">
-              <span>Buy seized collateral (unpauses the pool)</span>
-              <span>
-                Available: {fmtAaplx(inventoryRaw!)} AAPLx
-                {discountedPrice !== null ? ` at ~$${fmtPrice(discountedPrice)}` : ""}
-              </span>
-            </div>
-            <div className="field-input">
-              <input
-                placeholder="0.00"
-                value={buyInput}
-                onChange={(e) => {
-                  setBuyInput(e.target.value);
-                  buyInventoryAction.reset();
-                }}
-                inputMode="decimal"
-              />
-              <span className="unit">AAPLx</span>
+        <div className="field-group" style={{ marginTop: 16 }}>
+          <div className="field-label">
+            <span>Buy seized collateral (unpauses the pool)</span>
+            <span>
+              {hasInventory
+                ? `Available: ${fmtAaplx(inventoryRaw!)} AAPLx${discountedPrice !== null ? ` at ~$${fmtPrice(discountedPrice)}` : ""}`
+                : "Nothing to buy right now"}
+            </span>
+          </div>
+          <div className="field-input">
+            <input
+              placeholder="0.00"
+              value={buyInput}
+              onChange={(e) => {
+                setBuyInput(e.target.value);
+                buyInventoryAction.reset();
+              }}
+              inputMode="decimal"
+              disabled={!hasInventory}
+            />
+            <span className="unit">AAPLx</span>
+            {hasInventory ? (
               <button className="max" onClick={() => setBuyInput(fmtAaplx(inventoryRaw!))}>
                 MAX
               </button>
-            </div>
-            <button
-              className="secondary-action"
-              style={{ width: "100%", marginTop: 8 }}
-              disabled={!payer || buyInventoryAction.isRunning}
-              onClick={() => buyInventoryAction.dispatch()}
-            >
-              {buyInventoryAction.isRunning ? "Sending..." : "Buy"}
-            </button>
-            <TxStatus action={buyInventoryAction} />
+            ) : null}
           </div>
-        ) : null}
+          <button
+            className="secondary-action"
+            style={{ width: "100%", marginTop: 8 }}
+            disabled={!payer || !hasInventory || buyInventoryAction.isRunning}
+            onClick={() => buyInventoryAction.dispatch()}
+          >
+            {buyInventoryAction.isRunning ? "Sending..." : "Buy"}
+          </button>
+          {!hasInventory ? (
+            <div className="tx-status-hint" style={{ marginTop: 6 }}>
+              This fills whenever the pool liquidates a position and seizes collateral. Deposits and
+              withdrawals pause on the pool until it's resold, and anyone can buy it here at a discount
+              to clear that.
+            </div>
+          ) : null}
+          <TxStatus action={buyInventoryAction} />
+        </div>
       </div>
       <div>
         <div className="side-stat">
