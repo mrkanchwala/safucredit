@@ -36,15 +36,16 @@ body {
 
 .devnet-badge {
   position: fixed;
-  top: 12px;
-  right: 12px;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: 8px 12px calc(8px + env(safe-area-inset-bottom, 0px));
   background: var(--brand-warn);
   color: #000;
   font-family: var(--font-mono);
   font-size: 11px;
   font-weight: 700;
-  padding: 4px 10px;
-  border-radius: 3px;
+  text-align: center;
   z-index: 99;
 }
 
@@ -504,6 +505,7 @@ body {
   min-height: 100svh;
   display: flex;
   flex-direction: column;
+  padding-bottom: calc(36px + env(safe-area-inset-bottom, 0px));
 }
 #root {
   display: flex;
