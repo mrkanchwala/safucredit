@@ -1,3 +1,5 @@
+import { toFriendlyError } from "../lib/friendly-error";
+
 type Action = {
   isError: boolean;
   isSuccess?: boolean;
@@ -7,8 +9,17 @@ type Action = {
 
 export function TxStatus({ action }: { action: Action }) {
   if (action.isError) {
-    const msg = action.error instanceof Error ? action.error.message : String(action.error);
-    return <div className="tx-status error">{msg}</div>;
+    const friendly = toFriendlyError(action.error);
+    return (
+      <div className="tx-status error">
+        <div>{friendly.message}</div>
+        {friendly.action ? <div className="tx-status-hint">{friendly.action}</div> : null}
+        <details className="tx-status-details">
+          <summary>Technical details</summary>
+          <div>{friendly.raw}</div>
+        </details>
+      </div>
+    );
   }
   if (action.data && typeof action.data === "string") {
     return (

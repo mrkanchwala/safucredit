@@ -27,6 +27,7 @@ export function BorrowPanel() {
   const [usdcBalance, setUsdcBalance] = useState<bigint | null>(null);
   const [price, setPrice] = useState<bigint | null>(null);
   const [debtRaw, setDebtRaw] = useState<bigint | null>(null);
+  const [collateralRaw, setCollateralRaw] = useState<bigint | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
 
   useEffect(() => {
@@ -44,6 +45,7 @@ export function BorrowPanel() {
       setUsdcBalance(usdc);
       setPrice(market?.price.lastPrice ?? null);
       setDebtRaw(position && market ? debtForShares(position.debtShares, market.borrowIndex) : 0n);
+      setCollateralRaw(position?.rawCollateral ?? 0n);
     })();
     return () => {
       cancelled = true;
@@ -168,7 +170,7 @@ export function BorrowPanel() {
           <div className="field-group" style={{ marginBottom: 0 }}>
             <div className="field-label">
               <span>Withdraw collateral</span>
-              <span>&nbsp;</span>
+              <span>Deposited: {collateralRaw !== null ? fmtAaplx(collateralRaw) : "..."} AAPLx</span>
             </div>
             <div className="field-input">
               <input
@@ -181,6 +183,11 @@ export function BorrowPanel() {
                 inputMode="decimal"
               />
               <span className="unit">AAPLx</span>
+              {collateralRaw !== null && collateralRaw > 0n ? (
+                <button className="max" onClick={() => setWithdrawInput(fmtAaplx(collateralRaw))}>
+                  MAX
+                </button>
+              ) : null}
             </div>
             <button
               className="secondary-action"
