@@ -17,6 +17,7 @@ import {
   getFinalizeWithdrawInstructionAsync,
   getOpenBackerInstructionAsync,
   getClaimStreamInstructionAsync,
+  getBuyInventoryInstructionAsync,
 } from "../generated/backstop";
 import { AAPLX_MINT, MARKET, TOKEN_2022_PROGRAM, TOKEN_PROGRAM, USDC_MINT } from "./market";
 import { aaplxAta, ensureAaplxAtaIx, ensureUsdcAtaIx, usdcAta } from "./ata";
@@ -181,6 +182,34 @@ export async function backerRequestWithdraw(
 ): Promise<string> {
   const ix = await getRequestWithdrawInstructionAsync({ owner, shares: sharesRaw });
   return send(client, [ix]);
+}
+
+/** Fully permissionless -- any wallet with USDC may buy seized collateral off the backstop pool at
+ *  a discount (BackstopConfig.resale_discount_bps). This is what actually clears
+ *  PausedForInventory: deposits/withdrawals on the pool stay blocked until its inventory is fully
+ *  resold. maxPricePerShare is the buyer's own slippage guard -- the instruction rejects a fill
+ *  above it (PriceAboveMax). */
+export async function buyInventory(
+  client: AppClient,
+  buyer: Signer,
+  rawAmount: bigint,
+  maxPricePerShareRaw: bigint,
+): Promise<string> {
+  const buyerUsdc = await usdcAta(buyer.address);
+  const buyerCollateral = await aaplxAta(buyer.address);
+  const ix = await getBuyInventoryInstructionAsync({
+    buyer,
+    market: MARKET,
+    collateralMint: AAPLX_MINT,
+    usdcMint: USDC_MINT,
+    buyerUsdc,
+    buyerCollateral,
+    collateralTokenProgram: TOKEN_2022_PROGRAM,
+    usdcTokenProgram: TOKEN_PROGRAM,
+    raw: rawAmount,
+    maxPricePerShare: maxPricePerShareRaw,
+  });
+  return send(client, [await ensureUsdcAtaIx(buyer, buyer.address), await ensureAaplxAtaIx(buyer, buyer.address), ix]);
 }
 
 /** Owner-only. Defaults to the owner at open_position; call this only to redirect it elsewhere. */

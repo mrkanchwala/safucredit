@@ -3,10 +3,12 @@ import { useAction, useClient, usePayer } from "@solana/react";
 import type { AppClient } from "../lib/client";
 import { depositAndBorrow, repay, withdrawCollateral } from "../lib/actions";
 import {
+  collateralValueRaw,
   debtForShares,
   fmtAaplx,
   fmtPrice,
   fmtUsdc,
+  maxBorrowRaw,
   readAaplxBalance,
   readMarket,
   readPosition,
@@ -87,6 +89,28 @@ export function BorrowPanel() {
 
   const priceUsd = price !== null && price > 0n ? Number(fmtPrice(price)) : null;
 
+  // Reactive to the Collateral field too: depositAndBorrow does both in one transaction, so "max
+  // borrow" should account for new collateral being typed in right now, not just what's already
+  // on-chain.
+  const maxAdditionalBorrow =
+    price !== null && collateralRaw !== null && debtRaw !== null
+      ? (() => {
+          const typed = Number(collateralInput || "0");
+          const newCollateral = Number.isFinite(typed) && typed > 0 ? toRaw(typed, 8) : 0n;
+          const totalCollateral = collateralRaw + newCollateral;
+          const value = collateralValueRaw(totalCollateral, price);
+          const cap = maxBorrowRaw(value, MAX_LTV_BPS);
+          const available = cap - debtRaw;
+          return available > 0n ? available : 0n;
+        })()
+      : null;
+
+  // Small buffer above displayed debt so a MAX repay clears it fully even if a sliver of interest
+  // accrues between this read and the transaction landing -- the contract caps the actual pull at
+  // real debt regardless (repay(): `pay = amount.min(debt)`), so padding here can never overpay.
+  const repayMaxInput =
+    debtRaw !== null && debtRaw > 0n ? fmtUsdc(debtRaw + debtRaw / 500n + 10_000n) : null;
+
   return (
     <div className="panel">
       <div>
@@ -129,6 +153,11 @@ export function BorrowPanel() {
               inputMode="decimal"
             />
             <span className="unit">USDC</span>
+            {maxAdditionalBorrow !== null && maxAdditionalBorrow > 0n ? (
+              <button className="max" onClick={() => setBorrowInput(fmtUsdc(maxAdditionalBorrow))}>
+                MAX
+              </button>
+            ) : null}
           </div>
         </div>
         <button
@@ -157,6 +186,11 @@ export function BorrowPanel() {
                 inputMode="decimal"
               />
               <span className="unit">USDC</span>
+              {repayMaxInput !== null ? (
+                <button className="max" onClick={() => setRepayInput(repayMaxInput)}>
+                  MAX
+                </button>
+              ) : null}
             </div>
             <button
               className="secondary-action"

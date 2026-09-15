@@ -9,11 +9,15 @@ import {
 } from "../generated/stock_vault";
 import {
   fetchMaybeBacker,
+  fetchMaybeBackstopConfig,
   fetchMaybeBorrowerClaims,
   fetchMaybeClaim,
+  fetchMaybeInventory,
   findBackerPda,
   findBorrowerClaimsPda,
   findClaimPda,
+  findConfigPda,
+  findInventoryPda,
   ClaimStatus,
 } from "../generated/backstop";
 import { AAPLX_DECIMALS, MARKET, USDC_DECIMALS } from "./market";
@@ -68,6 +72,20 @@ export async function readBacker(rpc: RpcClient, owner: Address) {
 
 const ZERO_ADDRESS = "11111111111111111111111111111111" as Address;
 
+/** Seized collateral the backstop pool is holding from a liquidation, still to be resold.
+ *  Deposits/withdrawals pause on the pool while this is non-zero (see PausedForInventory). */
+export async function readInventory(rpc: RpcClient) {
+  const [inventoryPda] = await findInventoryPda({ market: MARKET });
+  const acc = await fetchMaybeInventory(rpc, inventoryPda);
+  return acc.exists ? { address: inventoryPda, data: acc.data } : null;
+}
+
+export async function readBackstopConfig(rpc: RpcClient) {
+  const [configPda] = await findConfigPda();
+  const acc = await fetchMaybeBackstopConfig(rpc, configPda);
+  return acc.exists ? acc.data : null;
+}
+
 /** Returns null when the borrower has never had a claim on this market. */
 export async function readActiveClaim(rpc: RpcClient, owner: Address) {
   const [borrowerClaimsPda] = await findBorrowerClaimsPda({ market: MARKET, borrower: owner });
@@ -101,6 +119,27 @@ const INDEX_SCALE = 1_000_000_000_000n;
 export function debtForShares(shares: bigint, borrowIndex: bigint): bigint {
   const num = shares * borrowIndex;
   return num === 0n ? 0n : (num + INDEX_SCALE - 1n) / INDEX_SCALE;
+}
+
+/** Mirrors safu_core::collateral::collateral_value (crates/safu-core/src/collateral.rs:29), for
+ *  multiplier_fp == MULT_SCALE (no active stock split -- true for this market today). General
+ *  form: floor(raw * price_fp * multiplier_fp / (MULT_SCALE * 10^(PRICE_DECIMALS-USD_DECIMALS) *
+ *  10^AAPLX_DECIMALS)); with multiplier_fp == MULT_SCALE the MULT_SCALE terms cancel, leaving
+ *  floor(raw * price_fp / 10^(PRICE_DECIMALS-USD_DECIMALS+AAPLX_DECIMALS)) = floor(raw * price_fp
+ *  / 1e10) for PRICE_DECIMALS=8, USD_DECIMALS=6, AAPLX_DECIMALS=8. Verified: 10 AAPLx at $330 ->
+ *  collateral_value = 1_000_000_000 * 33_000_000_000 / 1e10 = 3_300_000_000 (raw USDC, $3,300). */
+export function collateralValueRaw(rawCollateral: bigint, priceLast: bigint): bigint {
+  return (rawCollateral * priceLast) / 10_000_000_000n;
+}
+
+/** Mirrors safu_core::lending::max_borrow -- collateral_value * ltv_bps / 10_000, floor. A 0.1%
+ *  safety margin is subtracted so a MAX-borrow doesn't get rejected by ExceedsLtv if a sliver of
+ *  interest accrues on existing debt between this read and the transaction landing -- the same
+ *  class of timing gap that can leave a "repay everything shown" transaction a fraction of a cent
+ *  short, found live 2026-09-15. */
+export function maxBorrowRaw(collateralValue: bigint, ltvBps: number): bigint {
+  const raw = (collateralValue * BigInt(ltvBps)) / 10_000n;
+  return (raw * 999n) / 1_000n;
 }
 
 function totalBorrows(market: { totalBorrowShares: bigint; borrowIndex: bigint }): bigint {

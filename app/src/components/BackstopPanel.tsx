@@ -1,8 +1,20 @@
 import { useEffect, useState } from "react";
 import { useAction, useClient, usePayer } from "@solana/react";
 import type { AppClient } from "../lib/client";
-import { backerDeposit, backerFinalizeWithdraw, backerRequestWithdraw } from "../lib/actions";
-import { fmtShares, fmtUsdc, readBacker, readUsdcBalance, toRaw } from "../lib/reads";
+import { backerDeposit, backerFinalizeWithdraw, backerRequestWithdraw, buyInventory } from "../lib/actions";
+import {
+  fmtAaplx,
+  fmtPrice,
+  fmtShares,
+  fmtUsdc,
+  readAaplxBalance,
+  readBacker,
+  readBackstopConfig,
+  readInventory,
+  readMarket,
+  readUsdcBalance,
+  toRaw,
+} from "../lib/reads";
 import { TxStatus } from "./TxStatus";
 
 export function BackstopPanel() {
@@ -11,20 +23,27 @@ export function BackstopPanel() {
   const [depositInput, setDepositInput] = useState("");
   const [withdrawInput, setWithdrawInput] = useState("");
   const [usdcBalance, setUsdcBalance] = useState<bigint | null>(null);
+  const [aaplxBalance, setAaplxBalance] = useState<bigint | null>(null);
   const [shares, setShares] = useState<bigint | null>(null);
   const [withdrawShares, setWithdrawShares] = useState<bigint | null>(null);
+  const [inventoryRaw, setInventoryRaw] = useState<bigint | null>(null);
+  const [resaleDiscountBps, setResaleDiscountBps] = useState<number | null>(null);
+  const [marketPrice, setMarketPrice] = useState<bigint | null>(null);
+  const [buyInput, setBuyInput] = useState("");
   const [refreshKey, setRefreshKey] = useState(0);
 
   useEffect(() => {
     if (!payer) return;
     let cancelled = false;
     (async () => {
-      const [usdc, backer] = await Promise.all([
+      const [usdc, aaplx, backer] = await Promise.all([
         readUsdcBalance(client.rpc, payer.address),
+        readAaplxBalance(client.rpc, payer.address),
         readBacker(client.rpc, payer.address),
       ]);
       if (cancelled) return;
       setUsdcBalance(usdc);
+      setAaplxBalance(aaplx);
       setShares(backer?.shares ?? 0n);
       setWithdrawShares(backer?.withdrawShares ?? 0n);
     })();
@@ -32,6 +51,26 @@ export function BackstopPanel() {
       cancelled = true;
     };
   }, [client, payer, refreshKey]);
+
+  // Inventory / resale state is public -- anyone should see it, connected or not, since
+  // buyInventory is permissionless and not limited to existing backers.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const [inventory, config, market] = await Promise.all([
+        readInventory(client.rpc),
+        readBackstopConfig(client.rpc),
+        readMarket(client.rpc),
+      ]);
+      if (cancelled) return;
+      setInventoryRaw(inventory?.data.raw ?? 0n);
+      setResaleDiscountBps(config?.resaleDiscountBps ?? null);
+      setMarketPrice(market?.price.lastPrice ?? null);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [client, refreshKey]);
 
   const depositAction = useAction(async () => {
     if (!payer) throw new Error("connect a wallet first");
@@ -62,7 +101,26 @@ export function BackstopPanel() {
     return sig;
   });
 
+  const buyInventoryAction = useAction(async () => {
+    if (!payer) throw new Error("connect a wallet first");
+    if (!marketPrice) throw new Error("no live price yet");
+    const amt = toRaw(Number(buyInput || "0"), 8);
+    if (amt === 0n) throw new Error("enter an amount");
+    // Slippage guard: the live market price as a ceiling. The actual fill is always at a
+    // discount below this (or floor-protected near the pool's original cost), so this never
+    // blocks a normal buy -- it only protects against the price moving up before confirmation.
+    const sig = await buyInventory(client, payer, amt, marketPrice);
+    setBuyInput("");
+    setRefreshKey((k) => k + 1);
+    return sig;
+  });
+
   const hasPendingWithdraw = withdrawShares !== null && withdrawShares > 0n;
+  const hasInventory = inventoryRaw !== null && inventoryRaw > 0n;
+  const discountedPrice =
+    marketPrice !== null && resaleDiscountBps !== null
+      ? (marketPrice * BigInt(10_000 - resaleDiscountBps)) / 10_000n
+      : null;
 
   return (
     <div className="panel">
@@ -132,6 +190,42 @@ export function BackstopPanel() {
         </div>
         <TxStatus action={requestWithdrawAction} />
         <TxStatus action={finalizeWithdrawAction} />
+
+        {hasInventory ? (
+          <div className="field-group" style={{ marginTop: 16 }}>
+            <div className="field-label">
+              <span>Buy seized collateral (unpauses the pool)</span>
+              <span>
+                Available: {fmtAaplx(inventoryRaw!)} AAPLx
+                {discountedPrice !== null ? ` at ~$${fmtPrice(discountedPrice)}` : ""}
+              </span>
+            </div>
+            <div className="field-input">
+              <input
+                placeholder="0.00"
+                value={buyInput}
+                onChange={(e) => {
+                  setBuyInput(e.target.value);
+                  buyInventoryAction.reset();
+                }}
+                inputMode="decimal"
+              />
+              <span className="unit">AAPLx</span>
+              <button className="max" onClick={() => setBuyInput(fmtAaplx(inventoryRaw!))}>
+                MAX
+              </button>
+            </div>
+            <button
+              className="secondary-action"
+              style={{ width: "100%", marginTop: 8 }}
+              disabled={!payer || buyInventoryAction.isRunning}
+              onClick={() => buyInventoryAction.dispatch()}
+            >
+              {buyInventoryAction.isRunning ? "Sending..." : "Buy"}
+            </button>
+            <TxStatus action={buyInventoryAction} />
+          </div>
+        ) : null}
       </div>
       <div>
         <div className="side-stat">
@@ -150,6 +244,12 @@ export function BackstopPanel() {
           <div className="side-stat">
             <div className="k">Pending withdraw</div>
             <div className="v">{fmtShares(withdrawShares!)} shares queued</div>
+          </div>
+        ) : null}
+        {hasInventory ? (
+          <div className="side-stat">
+            <div className="k">Your AAPLx wallet</div>
+            <div className="v">{aaplxBalance !== null ? fmtAaplx(aaplxBalance) : "..."} AAPLx</div>
           </div>
         ) : null}
       </div>
