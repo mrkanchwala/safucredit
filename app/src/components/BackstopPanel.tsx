@@ -262,6 +262,12 @@ export function BackstopPanel() {
           </div>
         ) : null}
       </div>
+      <div className="panel-note" style={{ gridColumn: "1 / -1" }}>
+        You can back this pool and borrow from it with the same wallet, but if that wallet is
+        wrongfully liquidated, it will not receive the payout while it still holds backer shares
+        here. Withdraw fully from the backstop, or borrow from a different wallet, if you want
+        wrongful-liquidation protection.
+      </div>
     </div>
   );
 }
