@@ -15,7 +15,6 @@ function short(addr: string): string {
 
 function WalletButtonInner({ client }: { client: AppClient }) {
   const [open, setOpen] = useState(false);
-  const [confirmingDisconnect, setConfirmingDisconnect] = useState(false);
   const wallets = useWallets(client);
   const connected = useConnectedWallet(client);
   const { dispatch: connect } = useConnect(client);
@@ -28,19 +27,8 @@ function WalletButtonInner({ client }: { client: AppClient }) {
   if (connected) {
     return (
       <div className="wallet-menu">
-        <button
-          className="connect-btn"
-          onClick={() => {
-            if (confirmingDisconnect) {
-              setConfirmingDisconnect(false);
-              disconnect();
-            } else {
-              setConfirmingDisconnect(true);
-            }
-          }}
-          onBlur={() => setConfirmingDisconnect(false)}
-        >
-          {confirmingDisconnect ? "Click again to disconnect" : `${short(connected.account.address)} — Disconnect`}
+        <button className="connect-btn" onClick={() => disconnect()}>
+          {short(connected.account.address)} — Disconnect
         </button>
       </div>
     );
