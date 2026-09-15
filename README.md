@@ -103,7 +103,6 @@ Wallets: Phantom, Solflare, Backpack.
 
 ## Known issues
 
-- **Wallet auto-reconnect after disconnect.** Disconnecting a wallet on the site, then refreshing the page, currently reconnects Solflare without a fresh approval prompt. Every transaction still needs its own wallet approval, so funds stay safe either way, but disconnect should stop the session from resuming on its own and right now it doesn't. Flagged 2026-09-15, fix in progress.
 - **Devnet price source is a mock replay of recorded prices.** The reference price the verdict engine checks liquidations against replays real recorded AAPLx prices, through the same oracle-adapter interface the mainnet design targets (the Chainlink xStocks oracle). This is the documented demo setup, disclosed here so it's clear the devnet build pulls no live third-party feed.
 
 ## Roadmap
