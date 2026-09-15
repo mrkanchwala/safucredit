@@ -587,6 +587,41 @@ mod tests {
         }
     }
 
+    proptest::proptest! {
+        // Two splits in a row (e.g. a 4:1 reverse followed later by a 2:1 forward) are not covered
+        // by the deterministic sweep above, which only checks one hop. Composing two hops must land
+        // within the same rounding tolerance as a single direct hop from the original multiplier to
+        // the final one — otherwise a market with more than one split in its lifetime could drift.
+        #[test]
+        fn chained_requotes_match_a_single_direct_requote_within_rounding(
+            price in 1u64..=1_000_000_000_000u64,
+            base in 1_000_000_000u128..=2_000_000_000_000u128,
+            ratio1_num in 1u128..=20, ratio1_den in 1u128..=20,
+            ratio2_num in 1u128..=20, ratio2_den in 1u128..=20,
+        ) {
+            let mid = base * ratio1_num / ratio1_den;
+            let end = mid * ratio2_num / ratio2_den;
+            if mid == 0 || end == 0 { return Ok(()); }
+
+            let chained = requote(requote(price, base, mid).unwrap(), mid, end).unwrap();
+            let direct = requote(price, base, end).unwrap();
+
+            if chained == 1 || direct == 1 { return Ok(()); } // floor clamp, same escape as the single-hop sweep above
+
+            let value_chained = chained as u128 * end;
+            let value_direct = direct as u128 * end;
+            // Each requote's own rounding error is bounded by half a unit of its OUTPUT scale (proven
+            // by the single-hop sweep above: |price*base - out*to| <= to/2). Chaining two hops and
+            // comparing both against the same original value bounds the total drift by mid/2 (hop 1,
+            // still in mid's units) plus end/2 (hop 2) plus end/2 (the direct single-hop's own error) =
+            // mid/2 + end.
+            proptest::prop_assert!(
+                value_chained.abs_diff(value_direct) <= mid / 2 + end,
+                "price={price} base={base} mid={mid} end={end}: chained={chained} direct={direct}"
+            );
+        }
+    }
+
     #[test]
     fn requoting_never_turns_a_price_into_zero_and_leaves_empty_slots_empty() {
         assert_eq!(requote(1, 1, 1_000_000).unwrap(), 1);

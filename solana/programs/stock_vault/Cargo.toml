@@ -35,6 +35,7 @@ solana-keypair = "3.0.1"
 spl-token-2022-interface = "=2.1.0"
 spl-token-interface = "=2.0.0"
 solana-system-interface = { version = "2.0.0", features = ["bincode"] }
+proptest = "1"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
