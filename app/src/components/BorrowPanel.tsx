@@ -169,8 +169,8 @@ export function BorrowPanel() {
           </div>
           <div className="field-group" style={{ marginBottom: 0 }}>
             <div className="field-label">
-              <span>Withdraw collateral</span>
-              <span>Deposited: {collateralRaw !== null ? fmtAaplx(collateralRaw) : "..."} AAPLx</span>
+              <span>Withdraw</span>
+              <span>{collateralRaw !== null ? fmtAaplx(collateralRaw) : "..."} AAPLx</span>
             </div>
             <div className="field-input">
               <input
