@@ -1,4 +1,10 @@
-"""Push one fresh AAPLx price to the SHARED devnet market (app/src/devnet-market.json) that the
+"""SUPERSEDED 2026-09-15 by scripts/push_live_price_kms.py -- kept only as a manual/emergency
+fallback. VaultConfig.feed_authority was repointed to an AWS KMS-backed signer the same day
+(alias/safu-credit-price-feed, eu-north-1), so this script's deployer-key signature is no longer
+authorized and will fail with an on-chain `Unauthorized` error. It would only work again if
+`set_feed_authority` were called to point back at the deployer key.
+
+Push one fresh AAPLx price to the SHARED devnet market (app/src/devnet-market.json) that the
 live front end (credit.safustaking.com) reads from.
 
 Standalone gap this fills: `verdict/cmc_recorder.py` (cron, every 5 min on the VPS) only *records*
