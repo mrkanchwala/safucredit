@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import json
 import time
+import urllib.error
 import urllib.request
 
 from solders.hash import Hash
@@ -32,8 +33,17 @@ class Rpc:
         self._id += 1
         body = json.dumps({"jsonrpc": "2.0", "id": self._id, "method": method, "params": params or []}).encode()
         req = urllib.request.Request(self.url, data=body, headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            out = json.loads(resp.read())
+        backoff = 1.0
+        for attempt in range(6):
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    out = json.loads(resp.read())
+                break
+            except urllib.error.HTTPError as e:
+                if e.code != 429 or attempt == 5:
+                    raise
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 16.0)
         if "error" in out:
             raise RpcError(f"{method}: {out['error']}")
         return out["result"]
