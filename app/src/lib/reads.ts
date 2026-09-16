@@ -15,7 +15,6 @@ import {
   fetchMaybeInventory,
   findBackerPda,
   findBorrowerClaimsPda,
-  findClaimPda,
   findConfigPda,
   findInventoryPda,
   ClaimStatus,
@@ -91,9 +90,12 @@ export async function readActiveClaim(rpc: RpcClient, owner: Address) {
   const [borrowerClaimsPda] = await findBorrowerClaimsPda({ market: MARKET, borrower: owner });
   const bc = await fetchMaybeBorrowerClaims(rpc, borrowerClaimsPda);
   if (!bc.exists || bc.data.open === ZERO_ADDRESS) return null;
-  const [claimPda] = await findClaimPda({ liquidationRecord: bc.data.open });
-  const claim = await fetchMaybeClaim(rpc, claimPda);
-  return claim.exists ? { address: claimPda, data: claim.data } : null;
+  // BorrowerClaims.open already stores the Claim account's own address (set on-chain as
+  // `borrower_claims.open = claim.key()` in submit_facts) -- it is not a liquidation_record to
+  // re-derive a PDA from. findClaimPda is for deriving a claim address FROM a liquidation_record
+  // elsewhere; using it here double-derives and always misses.
+  const claim = await fetchMaybeClaim(rpc, bc.data.open);
+  return claim.exists ? { address: bc.data.open, data: claim.data } : null;
 }
 
 export function fromRaw(raw: bigint | number, decimals: number): number {
