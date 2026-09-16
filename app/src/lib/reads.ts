@@ -197,6 +197,24 @@ export function maxBorrowRaw(collateralValue: bigint, ltvBps: number): bigint {
   return (raw * 999n) / 1_000n;
 }
 
+/** The inverse of maxBorrowRaw: the most collateral that can be withdrawn while the REMAINING
+ *  collateral still covers existing debt within ltvBps -- mirrors the same risk check
+ *  withdraw_collateral enforces on-chain (PriceUse::Borrow, i.e. min(TWAP, last_price), same as
+ *  borrowing). Withdraw MAX must be health-aware, not "withdraw everything": with debt open,
+ *  withdrawing 100% of collateral is guaranteed to breach LTV and get rejected -- the withdraw-side
+ *  half of the same bug class fixed for Borrow MAX (marketTwap/borrowRiskPrice). Debt is padded 0.1%
+ *  up (mirrors maxBorrowRaw's margin) so a sliver of accrued interest between this read and the
+ *  transaction landing can't push the actual withdrawal over the edge. */
+export function maxSafeWithdrawRaw(collateralRaw: bigint, debtRaw: bigint, riskPrice: bigint, ltvBps: number): bigint {
+  if (debtRaw === 0n) return collateralRaw;
+  if (riskPrice === 0n || ltvBps === 0) return 0n;
+  const paddedDebt = (debtRaw * 1_001n) / 1_000n;
+  const requiredValue = (paddedDebt * 10_000n) / BigInt(ltvBps);
+  const requiredCollateral = (requiredValue * 10_000_000_000n) / riskPrice;
+  const maxWithdraw = collateralRaw - requiredCollateral;
+  return maxWithdraw > 0n ? maxWithdraw : 0n;
+}
+
 function totalBorrows(market: { totalBorrowShares: bigint; borrowIndex: bigint }): bigint {
   return debtForShares(market.totalBorrowShares, market.borrowIndex);
 }

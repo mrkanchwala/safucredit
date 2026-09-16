@@ -11,6 +11,7 @@ import {
   fmtUsdc,
   fmtUsdcMax,
   maxBorrowRaw,
+  maxSafeWithdrawRaw,
   readAaplxBalance,
   readMarket,
   readPosition,
@@ -121,6 +122,14 @@ export function BorrowPanel() {
   // real debt regardless (repay(): `pay = amount.min(debt)`), so padding here can never overpay.
   const repayMaxInput =
     debtRaw !== null && debtRaw > 0n ? fmtUsdc(debtRaw + debtRaw / 500n + 10_000n) : null;
+
+  // Withdraw MAX must be health-aware, not "withdraw everything" -- with debt open, withdrawing
+  // 100% of collateral is guaranteed to breach LTV and get rejected. Same risk price as borrowing
+  // (min(TWAP, last_price)); falls back to the full balance only when there's no debt to protect.
+  const maxSafeWithdraw =
+    collateralRaw !== null && debtRaw !== null && borrowPrice !== null
+      ? maxSafeWithdrawRaw(collateralRaw, debtRaw, borrowPrice, MAX_LTV_BPS)
+      : null;
 
   return (
     <div className="panel">
@@ -236,12 +245,12 @@ export function BorrowPanel() {
                 inputMode="decimal"
               />
               <span className="unit">AAPLx</span>
-              {collateralRaw !== null && collateralRaw > 0n ? (
+              {maxSafeWithdraw !== null && maxSafeWithdraw > 0n ? (
                 <button
                   className="max"
                   onClick={() => {
-                    setWithdrawInput(fmtAaplx(collateralRaw));
-                    setWithdrawMaxRaw(collateralRaw);
+                    setWithdrawInput(fmtAaplx(maxSafeWithdraw));
+                    setWithdrawMaxRaw(maxSafeWithdraw);
                   }}
                 >
                   MAX
