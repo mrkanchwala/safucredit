@@ -4,9 +4,11 @@ import type { AppClient } from "../lib/client";
 import { backerDeposit, backerFinalizeWithdraw, backerRequestWithdraw, buyInventory } from "../lib/actions";
 import {
   fmtAaplx,
+  fmtAaplxMax,
   fmtPrice,
   fmtShares,
   fmtUsdc,
+  fmtUsdcMax,
   readAaplxBalance,
   readBacker,
   readBackstopConfig,
@@ -139,7 +141,7 @@ export function BackstopPanel() {
             />
             <span className="unit">USDC</span>
             {usdcBalance !== null ? (
-              <button className="max" onClick={() => setDepositInput(fmtUsdc(usdcBalance))}>
+              <button className="max" onClick={() => setDepositInput(fmtUsdcMax(usdcBalance))}>
                 MAX
               </button>
             ) : null}
@@ -213,7 +215,7 @@ export function BackstopPanel() {
             />
             <span className="unit">AAPLx</span>
             {hasInventory ? (
-              <button className="max" onClick={() => setBuyInput(fmtAaplx(inventoryRaw!))}>
+              <button className="max" onClick={() => setBuyInput(fmtAaplxMax(inventoryRaw!))}>
                 MAX
               </button>
             ) : null}

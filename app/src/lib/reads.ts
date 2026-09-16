@@ -108,6 +108,20 @@ export function toRaw(ui: number, decimals: number): bigint {
 
 export const fmtAaplx = (raw: bigint) => fromRaw(raw, AAPLX_DECIMALS).toFixed(4);
 export const fmtUsdc = (raw: bigint) => fromRaw(raw, USDC_DECIMALS).toFixed(2);
+
+/** Floors instead of rounding, for MAX-button prefills only. `fmtAaplx`/`fmtUsdc` round to their
+ *  display precision, so a MAX button that prefills from them can show a value slightly ABOVE the
+ *  true raw balance (e.g. 0.00856043 AAPLx displays as "0.0086") -- re-parsed via `toRaw` for the
+ *  actual transaction, that overshoots the real on-chain amount and gets rejected. Flooring
+ *  guarantees the prefilled amount is always <= what's actually available. */
+function floorFixed(raw: bigint, rawDecimals: number, displayDecimals: number): string {
+  const scale = 10n ** BigInt(rawDecimals - displayDecimals);
+  const truncated = raw / scale; // bigint division floors for non-negative values
+  return (Number(truncated) / 10 ** displayDecimals).toFixed(displayDecimals);
+}
+
+export const fmtAaplxMax = (raw: bigint) => floorFixed(raw, AAPLX_DECIMALS, 4);
+export const fmtUsdcMax = (raw: bigint) => floorFixed(raw, USDC_DECIMALS, 2);
 /** Backer shares are minted 1:1 with raw USDC units on first deposit (backstop/src/lib.rs
  *  `deposit`: `shares = amount as u128` when `total_shares == 0`) and only drift from that with
  *  pool P&L thereafter, so the same 6-decimal scaling as USDC applies -- this is a display fix,

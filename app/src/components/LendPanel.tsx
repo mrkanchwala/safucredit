@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useAction, useClient, usePayer } from "@solana/react";
 import type { AppClient } from "../lib/client";
 import { supply, withdrawSupply } from "../lib/actions";
-import { fmtUsdc, readMarket, readSupplier, readUsdcBalance, supplierValueRaw, toRaw } from "../lib/reads";
+import { fmtUsdc, fmtUsdcMax, readMarket, readSupplier, readUsdcBalance, supplierValueRaw, toRaw } from "../lib/reads";
 import { TxStatus } from "./TxStatus";
 
 export function LendPanel() {
@@ -73,7 +73,7 @@ export function LendPanel() {
             />
             <span className="unit">USDC</span>
             {usdcBalance !== null ? (
-              <button className="max" onClick={() => setSupplyInput(fmtUsdc(usdcBalance))}>
+              <button className="max" onClick={() => setSupplyInput(fmtUsdcMax(usdcBalance))}>
                 MAX
               </button>
             ) : null}

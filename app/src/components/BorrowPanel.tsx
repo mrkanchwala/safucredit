@@ -6,8 +6,10 @@ import {
   collateralValueRaw,
   debtForShares,
   fmtAaplx,
+  fmtAaplxMax,
   fmtPrice,
   fmtUsdc,
+  fmtUsdcMax,
   maxBorrowRaw,
   readAaplxBalance,
   readMarket,
@@ -131,7 +133,7 @@ export function BorrowPanel() {
             />
             <span className="unit">AAPLx</span>
             {aaplxBalance !== null ? (
-              <button className="max" onClick={() => setCollateralInput(fmtAaplx(aaplxBalance))}>
+              <button className="max" onClick={() => setCollateralInput(fmtAaplxMax(aaplxBalance))}>
                 MAX
               </button>
             ) : null}
@@ -154,7 +156,7 @@ export function BorrowPanel() {
             />
             <span className="unit">USDC</span>
             {maxAdditionalBorrow !== null && maxAdditionalBorrow > 0n ? (
-              <button className="max" onClick={() => setBorrowInput(fmtUsdc(maxAdditionalBorrow))}>
+              <button className="max" onClick={() => setBorrowInput(fmtUsdcMax(maxAdditionalBorrow))}>
                 MAX
               </button>
             ) : null}
@@ -218,7 +220,7 @@ export function BorrowPanel() {
               />
               <span className="unit">AAPLx</span>
               {collateralRaw !== null && collateralRaw > 0n ? (
-                <button className="max" onClick={() => setWithdrawInput(fmtAaplx(collateralRaw))}>
+                <button className="max" onClick={() => setWithdrawInput(fmtAaplxMax(collateralRaw))}>
                   MAX
                 </button>
               ) : null}
