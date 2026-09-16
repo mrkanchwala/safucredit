@@ -51,6 +51,42 @@ export async function readMarket(rpc: RpcClient) {
   return acc.data;
 }
 
+/** Mirrors `stock_vault::logic::market_twap` (time-weighted average over the 16-slot price ring:
+ *  each sample holds from its own timestamp until the next sample's, the last holds until `now`).
+ *  Must match exactly -- the on-chain `borrow` instruction risks against `min(twap, last_price)`,
+ *  never `last_price` alone, so any UI that computes a "MAX borrow" from `last_price` only can
+ *  suggest an amount the contract will reject the moment the two diverge (any real price move,
+ *  not just a manipulated one -- a genuine rally makes last_price run ahead of TWAP by design). */
+export function marketTwap(market: NonNullable<Awaited<ReturnType<typeof readMarket>>>, nowUnixSeconds: bigint): bigint {
+  const { prices, timestamps, head, count } = market.price;
+  const n = prices.length; // 16
+  const c = Math.min(count, n);
+  if (c === 0) return market.price.lastPrice;
+  const start = (head + n - c) % n;
+  const samples: Array<{ price: bigint; ts: bigint }> = [];
+  for (let i = 0; i < c; i++) {
+    const idx = (start + i) % n;
+    samples.push({ price: prices[idx], ts: timestamps[idx] });
+  }
+  let weighted = 0n;
+  let total = 0n;
+  for (let i = 0; i < samples.length; i++) {
+    const end = i + 1 < samples.length ? samples[i + 1].ts : nowUnixSeconds;
+    const dt = end - samples[i].ts;
+    weighted += samples[i].price * dt;
+    total += dt;
+  }
+  return total === 0n ? samples[samples.length - 1].price : weighted / total;
+}
+
+/** The exact risk price `PriceUse::Borrow` enforces on-chain -- always use this, never
+ *  `market.price.lastPrice` alone, for anything that computes a borrow-side maximum. */
+export function borrowRiskPrice(market: NonNullable<Awaited<ReturnType<typeof readMarket>>>, nowUnixSeconds: bigint): bigint {
+  const twap = marketTwap(market, nowUnixSeconds);
+  const last = market.price.lastPrice;
+  return twap < last ? twap : last;
+}
+
 export async function readPosition(rpc: RpcClient, owner: Address) {
   const [positionPda] = await findPositionPda({ market: MARKET, owner });
   const acc = await fetchMaybePosition(rpc, positionPda);

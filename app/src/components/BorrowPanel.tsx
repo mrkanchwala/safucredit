@@ -3,6 +3,7 @@ import { useAction, useClient, usePayer } from "@solana/react";
 import type { AppClient } from "../lib/client";
 import { depositAndBorrow, repay, withdrawCollateral } from "../lib/actions";
 import {
+  borrowRiskPrice,
   collateralValueRaw,
   debtForShares,
   fmtAaplx,
@@ -30,6 +31,7 @@ export function BorrowPanel() {
   const [aaplxBalance, setAaplxBalance] = useState<bigint | null>(null);
   const [usdcBalance, setUsdcBalance] = useState<bigint | null>(null);
   const [price, setPrice] = useState<bigint | null>(null);
+  const [borrowPrice, setBorrowPrice] = useState<bigint | null>(null);
   const [debtRaw, setDebtRaw] = useState<bigint | null>(null);
   const [collateralRaw, setCollateralRaw] = useState<bigint | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -48,6 +50,7 @@ export function BorrowPanel() {
       setAaplxBalance(aaplx);
       setUsdcBalance(usdc);
       setPrice(market?.price.lastPrice ?? null);
+      setBorrowPrice(market ? borrowRiskPrice(market, BigInt(Math.floor(Date.now() / 1000))) : null);
       setDebtRaw(position && market ? debtForShares(position.debtShares, market.borrowIndex) : 0n);
       setCollateralRaw(position?.rawCollateral ?? 0n);
     })();
@@ -93,14 +96,17 @@ export function BorrowPanel() {
 
   // Reactive to the Collateral field too: depositAndBorrow does both in one transaction, so "max
   // borrow" should account for new collateral being typed in right now, not just what's already
-  // on-chain.
+  // on-chain. Uses borrowPrice (min(TWAP, last_price), mirroring the contract's own risk price for
+  // PriceUse::Borrow) rather than the display-only last_price -- using last_price alone lets this
+  // suggest more than the contract will actually allow the moment TWAP and last_price diverge
+  // (any real price move, not just a manipulated one).
   const maxAdditionalBorrow =
-    price !== null && collateralRaw !== null && debtRaw !== null
+    borrowPrice !== null && collateralRaw !== null && debtRaw !== null
       ? (() => {
           const typed = Number(collateralInput || "0");
           const newCollateral = Number.isFinite(typed) && typed > 0 ? toRaw(typed, 8) : 0n;
           const totalCollateral = collateralRaw + newCollateral;
-          const value = collateralValueRaw(totalCollateral, price);
+          const value = collateralValueRaw(totalCollateral, borrowPrice);
           const cap = maxBorrowRaw(value, MAX_LTV_BPS);
           const available = cap - debtRaw;
           return available > 0n ? available : 0n;
