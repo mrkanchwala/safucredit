@@ -7,7 +7,6 @@ import {
   collateralValueRaw,
   debtForShares,
   fmtAaplx,
-  fmtAaplxMax,
   fmtPrice,
   fmtUsdc,
   fmtUsdcMax,
@@ -25,9 +24,11 @@ export function BorrowPanel() {
   const client = useClient<AppClient>();
   const payer = usePayer(client);
   const [collateralInput, setCollateralInput] = useState("");
+  const [collateralMaxRaw, setCollateralMaxRaw] = useState<bigint | null>(null);
   const [borrowInput, setBorrowInput] = useState("");
   const [repayInput, setRepayInput] = useState("");
   const [withdrawInput, setWithdrawInput] = useState("");
+  const [withdrawMaxRaw, setWithdrawMaxRaw] = useState<bigint | null>(null);
   const [aaplxBalance, setAaplxBalance] = useState<bigint | null>(null);
   const [usdcBalance, setUsdcBalance] = useState<bigint | null>(null);
   const [price, setPrice] = useState<bigint | null>(null);
@@ -61,12 +62,13 @@ export function BorrowPanel() {
 
   const depositBorrowAction = useAction(async (signal: AbortSignal) => {
     if (!payer) throw new Error("connect a wallet first");
-    const c = toRaw(Number(collateralInput || "0"), 8);
+    const c = collateralMaxRaw ?? toRaw(Number(collateralInput || "0"), 8);
     const b = toRaw(Number(borrowInput || "0"), 6);
     if (c === 0n && b === 0n) throw new Error("enter a collateral or borrow amount");
     const sig = await depositAndBorrow(client, payer, c, b);
     void signal;
     setCollateralInput("");
+    setCollateralMaxRaw(null);
     setBorrowInput("");
     setRefreshKey((k) => k + 1);
     return sig;
@@ -84,10 +86,11 @@ export function BorrowPanel() {
 
   const withdrawAction = useAction(async () => {
     if (!payer) throw new Error("connect a wallet first");
-    const amt = toRaw(Number(withdrawInput || "0"), 8);
+    const amt = withdrawMaxRaw ?? toRaw(Number(withdrawInput || "0"), 8);
     if (amt === 0n) throw new Error("enter a withdraw amount");
     const sig = await withdrawCollateral(client, payer, amt);
     setWithdrawInput("");
+    setWithdrawMaxRaw(null);
     setRefreshKey((k) => k + 1);
     return sig;
   });
@@ -133,13 +136,20 @@ export function BorrowPanel() {
               value={collateralInput}
               onChange={(e) => {
                 setCollateralInput(e.target.value);
+                setCollateralMaxRaw(null);
                 depositBorrowAction.reset();
               }}
               inputMode="decimal"
             />
             <span className="unit">AAPLx</span>
             {aaplxBalance !== null ? (
-              <button className="max" onClick={() => setCollateralInput(fmtAaplxMax(aaplxBalance))}>
+              <button
+                className="max"
+                onClick={() => {
+                  setCollateralInput(fmtAaplx(aaplxBalance));
+                  setCollateralMaxRaw(aaplxBalance);
+                }}
+              >
                 MAX
               </button>
             ) : null}
@@ -220,13 +230,20 @@ export function BorrowPanel() {
                 value={withdrawInput}
                 onChange={(e) => {
                   setWithdrawInput(e.target.value);
+                  setWithdrawMaxRaw(null);
                   depositBorrowAction.reset();
                 }}
                 inputMode="decimal"
               />
               <span className="unit">AAPLx</span>
               {collateralRaw !== null && collateralRaw > 0n ? (
-                <button className="max" onClick={() => setWithdrawInput(fmtAaplxMax(collateralRaw))}>
+                <button
+                  className="max"
+                  onClick={() => {
+                    setWithdrawInput(fmtAaplx(collateralRaw));
+                    setWithdrawMaxRaw(collateralRaw);
+                  }}
+                >
                   MAX
                 </button>
               ) : null}

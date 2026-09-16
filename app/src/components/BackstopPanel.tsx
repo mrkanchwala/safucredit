@@ -4,11 +4,9 @@ import type { AppClient } from "../lib/client";
 import { backerDeposit, backerFinalizeWithdraw, backerRequestWithdraw, buyInventory } from "../lib/actions";
 import {
   fmtAaplx,
-  fmtAaplxMax,
   fmtPrice,
   fmtShares,
   fmtUsdc,
-  fmtUsdcMax,
   readAaplxBalance,
   readBacker,
   readBackstopConfig,
@@ -23,6 +21,7 @@ export function BackstopPanel() {
   const client = useClient<AppClient>();
   const payer = usePayer(client);
   const [depositInput, setDepositInput] = useState("");
+  const [depositMaxRaw, setDepositMaxRaw] = useState<bigint | null>(null);
   const [withdrawInput, setWithdrawInput] = useState("");
   const [usdcBalance, setUsdcBalance] = useState<bigint | null>(null);
   const [aaplxBalance, setAaplxBalance] = useState<bigint | null>(null);
@@ -32,6 +31,7 @@ export function BackstopPanel() {
   const [resaleDiscountBps, setResaleDiscountBps] = useState<number | null>(null);
   const [marketPrice, setMarketPrice] = useState<bigint | null>(null);
   const [buyInput, setBuyInput] = useState("");
+  const [buyMaxRaw, setBuyMaxRaw] = useState<bigint | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
 
   useEffect(() => {
@@ -76,10 +76,11 @@ export function BackstopPanel() {
 
   const depositAction = useAction(async () => {
     if (!payer) throw new Error("connect a wallet first");
-    const amt = toRaw(Number(depositInput || "0"), 6);
+    const amt = depositMaxRaw ?? toRaw(Number(depositInput || "0"), 6);
     if (amt === 0n) throw new Error("enter a deposit amount");
     const sig = await backerDeposit(client, payer, amt);
     setDepositInput("");
+    setDepositMaxRaw(null);
     setRefreshKey((k) => k + 1);
     return sig;
   });
@@ -106,13 +107,18 @@ export function BackstopPanel() {
   const buyInventoryAction = useAction(async () => {
     if (!payer) throw new Error("connect a wallet first");
     if (!marketPrice) throw new Error("no live price yet");
-    const amt = toRaw(Number(buyInput || "0"), 8);
+    // MAX sets buyMaxRaw to the exact on-chain amount, bypassing the decimal string entirely --
+    // a true remainder below 4 decimals (e.g. dust left by a partial liquidation) can never be
+    // expressed as a nonzero display string, so re-parsing the string would floor it to zero and
+    // strand it permanently. Manually editing the input clears buyMaxRaw (see onChange below).
+    const amt = buyMaxRaw ?? toRaw(Number(buyInput || "0"), 8);
     if (amt === 0n) throw new Error("enter an amount");
     // Slippage guard: the live market price as a ceiling. The actual fill is always at a
     // discount below this (or floor-protected near the pool's original cost), so this never
     // blocks a normal buy -- it only protects against the price moving up before confirmation.
     const sig = await buyInventory(client, payer, amt, marketPrice);
     setBuyInput("");
+    setBuyMaxRaw(null);
     setRefreshKey((k) => k + 1);
     return sig;
   });
@@ -136,12 +142,21 @@ export function BackstopPanel() {
             <input
               placeholder="0.00"
               value={depositInput}
-              onChange={(e) => setDepositInput(e.target.value)}
+              onChange={(e) => {
+                setDepositInput(e.target.value);
+                setDepositMaxRaw(null);
+              }}
               inputMode="decimal"
             />
             <span className="unit">USDC</span>
             {usdcBalance !== null ? (
-              <button className="max" onClick={() => setDepositInput(fmtUsdcMax(usdcBalance))}>
+              <button
+                className="max"
+                onClick={() => {
+                  setDepositInput(fmtUsdc(usdcBalance));
+                  setDepositMaxRaw(usdcBalance);
+                }}
+              >
                 MAX
               </button>
             ) : null}
@@ -208,6 +223,7 @@ export function BackstopPanel() {
               value={buyInput}
               onChange={(e) => {
                 setBuyInput(e.target.value);
+                setBuyMaxRaw(null);
                 buyInventoryAction.reset();
               }}
               inputMode="decimal"
@@ -215,7 +231,13 @@ export function BackstopPanel() {
             />
             <span className="unit">AAPLx</span>
             {hasInventory ? (
-              <button className="max" onClick={() => setBuyInput(fmtAaplxMax(inventoryRaw!))}>
+              <button
+                className="max"
+                onClick={() => {
+                  setBuyInput(fmtAaplx(inventoryRaw!));
+                  setBuyMaxRaw(inventoryRaw!);
+                }}
+              >
                 MAX
               </button>
             ) : null}

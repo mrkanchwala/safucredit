@@ -2,13 +2,14 @@ import { useEffect, useState } from "react";
 import { useAction, useClient, usePayer } from "@solana/react";
 import type { AppClient } from "../lib/client";
 import { supply, withdrawSupply } from "../lib/actions";
-import { fmtUsdc, fmtUsdcMax, readMarket, readSupplier, readUsdcBalance, supplierValueRaw, toRaw } from "../lib/reads";
+import { fmtUsdc, readMarket, readSupplier, readUsdcBalance, supplierValueRaw, toRaw } from "../lib/reads";
 import { TxStatus } from "./TxStatus";
 
 export function LendPanel() {
   const client = useClient<AppClient>();
   const payer = usePayer(client);
   const [supplyInput, setSupplyInput] = useState("");
+  const [supplyMaxRaw, setSupplyMaxRaw] = useState<bigint | null>(null);
   const [withdrawInput, setWithdrawInput] = useState("");
   const [usdcBalance, setUsdcBalance] = useState<bigint | null>(null);
   const [supplierShares, setSupplierShares] = useState<bigint | null>(null);
@@ -36,10 +37,11 @@ export function LendPanel() {
 
   const supplyAction = useAction(async () => {
     if (!payer) throw new Error("connect a wallet first");
-    const amt = toRaw(Number(supplyInput || "0"), 6);
+    const amt = supplyMaxRaw ?? toRaw(Number(supplyInput || "0"), 6);
     if (amt === 0n) throw new Error("enter a supply amount");
     const sig = await supply(client, payer, amt);
     setSupplyInput("");
+    setSupplyMaxRaw(null);
     setRefreshKey((k) => k + 1);
     return sig;
   });
@@ -68,12 +70,21 @@ export function LendPanel() {
             <input
               placeholder="0.00"
               value={supplyInput}
-              onChange={(e) => setSupplyInput(e.target.value)}
+              onChange={(e) => {
+                setSupplyInput(e.target.value);
+                setSupplyMaxRaw(null);
+              }}
               inputMode="decimal"
             />
             <span className="unit">USDC</span>
             {usdcBalance !== null ? (
-              <button className="max" onClick={() => setSupplyInput(fmtUsdcMax(usdcBalance))}>
+              <button
+                className="max"
+                onClick={() => {
+                  setSupplyInput(fmtUsdc(usdcBalance));
+                  setSupplyMaxRaw(usdcBalance);
+                }}
+              >
                 MAX
               </button>
             ) : null}
